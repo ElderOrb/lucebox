@@ -260,25 +260,15 @@ static std::vector<MoeStreamedMailbox::Job> ds4_fused_stream_jobs(
 // the launch.
 static enum ggml_status ds4_fused_graph_compute(
         const DeepSeek4Weights & w, DeepSeek4FusedDecodeGraph & fg, ggml_backend_t backend,
-        MoeHybridStorage * hybrid, const char * who,
-        const std::function<void()> & while_running = {}) {
+        MoeHybridStorage * hybrid, const char * who) {
     MoeStreamedMailbox * mailbox =
         hybrid && hybrid->expert_cache ? hybrid->expert_cache->mailbox() : nullptr;
     const std::vector<MoeStreamedMailbox::Job> jobs =
         mailbox ? ds4_fused_stream_jobs(fg) : std::vector<MoeStreamedMailbox::Job>{};
     if (!jobs.empty()) mailbox->begin(jobs, ds4_fused_invalid_route());
-    enum ggml_status status;
-    if (fg.sched && jobs.empty() && while_running) {
-        // Host work that needs no device result (building the next shape)
-        // runs while the GPUs execute this graph.
-        status = ggml_backend_sched_graph_compute_async(fg.sched, fg.sg.gf);
-        if (status == GGML_STATUS_SUCCESS) while_running();
-        ggml_backend_sched_synchronize(fg.sched);
-    } else {
-        status = fg.sched
-            ? ggml_backend_sched_graph_compute(fg.sched, fg.sg.gf)
-            : ggml_backend_graph_compute(backend, fg.sg.gf);
-    }
+    enum ggml_status status = fg.sched
+        ? ggml_backend_sched_graph_compute(fg.sched, fg.sg.gf)
+        : ggml_backend_graph_compute(backend, fg.sg.gf);
     if (!jobs.empty()) {
         std::string error;
         if (!mailbox->end(&error)) {
@@ -2223,36 +2213,6 @@ static int ds4_try_fused_verify_step(
                 ((int64_t) padded << 4) | (int64_t) (b_idx + 1));
         }
     }
-    // The key a step at (kv, qq) would look up: the rules above.
-    auto key_for = [&](int kv, int qq) {
-        std::vector<int64_t> k;
-        k.reserve(key.size());
-        k.push_back(w.n_swa);
-        k.push_back(qq);
-        k.push_back(token_ids ? 1 : 0);
-        k.push_back(hybrid ? 1 : 0);
-        k.push_back((int64_t) hooks->capture_layer_ids->size());
-        for (int layer : *hooks->capture_layer_ids) k.push_back(layer);
-        k.push_back(vocab_split ? 1 : 0);
-        const int nl = ds4_fused_attention_lanes(w, qq);
-        const int alq = qq / nl;
-        for (int il = 0; il < w.n_layer; ++il) {
-            const int ratio = (int) w.compress_ratios[il];
-            DeepSeek4LayerCache & lc = ds4_comp_cache(cache, w, il);
-            for (int lane = 0; lane < nl; ++lane) {
-                const int lks = kv + lane * alq;
-                const int padded = ds4_fused_lane_padded(w, lc, il, lks + alq - 1);
-                int b_idx = -1;
-                if (ratio > 0) {
-                    for (int t = 0; t < alq; ++t) {
-                        if (((lks + t + 1) % ratio) == 0) { b_idx = t; break; }
-                    }
-                }
-                k.push_back(((int64_t) padded << 4) | (int64_t) (b_idx + 1));
-            }
-        }
-        return k;
-    };
 
     vc.counter++;
     const size_t slot_limit = hybrid
@@ -2355,15 +2315,6 @@ static int ds4_try_fused_verify_step(
         ~EngramJoin() { finish(); }
     } engram_join{engram_async ? vc.engram_async.get() : nullptr, telemetry};
     const auto set_t0 = Ds4TimingClock::now();
-    // LUCE_DS4_STAGE_BATCH=1: the step's pinned uploads leave as one copy
-    // kernel before the single wait below, instead of a dozen copies of
-    // which the larger ones wait for a copy engine to start.
-    static const bool stage_batch_env = [] {
-        const char * v = std::getenv("LUCE_DS4_STAGE_BATCH");
-        return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    const bool stage_batch = stage_batch_env && pinned_io && ggml_backend_is_cuda(backend);
-    if (stage_batch) vc.stage.begin_batch();
     ds4_fv_set(fg->inp_embed, embed, sizeof(float) * (size_t) w.n_embd * q);
     std::vector<int32_t> iv(q);
     std::vector<int64_t> lv(q);
@@ -2579,16 +2530,6 @@ static int ds4_try_fused_verify_step(
     // GPU for the worker, not on the host.
     const auto st_t3 = st_now();
     st_hash += st_us(st_t2, st_t3);
-    if (stage_batch) {
-        const auto & pending = vc.stage.batch();
-        if (!pending.empty()) {
-            std::vector<ggml_cuda_copy_desc> descs;
-            descs.reserve(pending.size());
-            for (const auto & p : pending) descs.push_back({p.src, p.dst, p.bytes});
-            ggml_backend_cuda_copy_batch_async(backend, descs.data(), (int) descs.size());
-        }
-        vc.stage.end_batch();
-    }
     if (pinned_io) ggml_backend_synchronize(backend);
     st_sync += st_us(st_t3, st_now());
     if (set_timing && ++st_n % 64 == 0) {
@@ -2647,60 +2588,8 @@ static int ds4_try_fused_verify_step(
         /*skip_property_check=*/force_verify_graph_replay,
         /*ds4_mix_mmv_max_tokens=*/0,
         /*mmvq_batch_invariant=*/n_lanes > 1);
-    // Experimental, off by default: on the two-box code run it filled the slot
-    // cache and the graphs thrashed through HIP-graph warmup (verify 42 -> 82 ms).
-    // LUCE_DS4_VERIFY_PREBUILD=<n> (hybrid): while this graph runs, build up
-    // to n slots for the shapes the next step will most likely look up (this
-    // width, the next start after a full or one-short acceptance) when a free
-    // slot is left. A miss costs a ~15 ms rebuild on the critical path; here
-    // the host would only wait for the GPUs.
-    static const int prebuild_max = [] {
-        const char * v = std::getenv("LUCE_DS4_VERIFY_PREBUILD");
-        return v && *v ? std::max(0, std::atoi(v)) : 0;
-    }();
-    std::function<void()> prebuild;
-    if (prebuild_max > 0 && hybrid && q > 1) {
-        prebuild = [&]() {
-            int built = 0;
-            for (int a = q; a >= 1 && built < prebuild_max; --a) {
-                std::vector<int64_t> k = key_for(kv_start + a, q);
-                bool have = false;
-                for (size_t i = 0; i < slot_limit && !have; ++i) {
-                    have = vc.slots[i].built() && vc.slots[i].shape_key == k;
-                }
-                if (have) continue;
-                size_t free_slot = slot_limit;
-                for (size_t i = 0; i < slot_limit; ++i) {
-                    if (!vc.slots[i].built() && &vc.slots[i] != fg) { free_slot = i; break; }
-                }
-                if (free_slot == slot_limit) return;   // never evict under a running graph
-                DeepSeek4FusedDecodeGraph & pf = vc.slots[free_slot];
-                Ds4FusedVerifyCache::Extra & pe = vc.extra[free_slot];
-                pf.destroy(vc.backend, vc.peer_backend);
-                pe.reset();
-                pe.vocab_split = vocab_split;
-                const auto pb_t0 = Ds4TimingClock::now();
-                if (!ds4_build_fused_verify_graph(mc, pf, pe, backend, w, &cache,
-                                                  hc_weights, hc_out_weights, hash_tables,
-                                                  kv_start + a, q, token_ids != nullptr,
-                                                  *hooks->capture_layer_ids, hybrid,
-                                                  std::move(k))) {
-                    pf.destroy(vc.backend, vc.peer_backend);
-                    pe.reset();
-                    return;
-                }
-                pf.last_use = 0;   // unused prebuilt slots are the first to go
-                ++built;
-                static int reported = 0;
-                if (reported++ < 32) {
-                    std::fprintf(stderr, "[ds4-fused-verify] prebuilt q=%d kv=%d in %.1f ms\n", q,
-                                 kv_start + a, ds4_elapsed_us(pb_t0, Ds4TimingClock::now()) / 1000.0);
-                }
-            }
-        };
-    }
     const enum ggml_status compute_status =
-        ds4_fused_graph_compute(w, *fg, backend, hybrid, "ds4-fused-verify", prebuild);
+        ds4_fused_graph_compute(w, *fg, backend, hybrid, "ds4-fused-verify");
     if (broadcast_hook.rt) {
         broadcast_hook.rt->before_broadcast = nullptr;
         broadcast_hook.rt = nullptr;

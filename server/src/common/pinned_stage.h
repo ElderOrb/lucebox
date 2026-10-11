@@ -19,7 +19,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <vector>
 
 namespace luce::common {
 
@@ -59,20 +58,6 @@ public:
 
     void reset() { used_ = 0; }
 
-    // Batched mode: set() collects its device uploads instead of queueing
-    // one copy each, and the caller sends batch() as a single launch (one
-    // kernel reading the pinned slices; a copy engine adds a start latency
-    // of 0.03-1 ms to every step on a discrete GPU). end_batch() before the
-    // next reset; the slices stay valid until then.
-    struct Pending {
-        const void * src;
-        void *       dst;
-        size_t       bytes;
-    };
-    void begin_batch() { batching_ = true; pending_.clear(); }
-    const std::vector<Pending> & batch() const { return pending_; }
-    void end_batch() { batching_ = false; pending_.clear(); }
-
     // A 64-byte aligned slice, or nullptr when the stage is missing or full
     // (the caller then takes its synchronous path).
     void * take(size_t bytes) {
@@ -94,10 +79,6 @@ public:
             return;
         }
         std::memcpy(slice, data, bytes);
-        if (batching_) {
-            pending_.push_back({slice, static_cast<uint8_t *>(t->data) + offset, bytes});
-            return;
-        }
         ggml_backend_tensor_set_async(backend, t, slice, offset, bytes);
     }
 
@@ -144,8 +125,6 @@ private:
     size_t size_ = 0;
     size_t used_ = 0;
     ggml_backend_t backend_ = nullptr;
-    bool batching_ = false;
-    std::vector<Pending> pending_;
 };
 
 }  // namespace luce::common
