@@ -31,7 +31,6 @@ inline constexpr uint32_t kClusterDefaultTimeoutMs = 30000;
 enum class SharedExpertMode {
     Replicate,  // every rank computes it; all-reduce covers routed experts only
     Shard,      // n_ff/N slice per rank, summed inside the same all-reduce
-    Rank0,      // only rank 0 computes it and adds it after the all-reduce
 };
 
 // Wire precision of the per-layer partial-sum reduction.
@@ -70,7 +69,7 @@ struct ClusterConfig {
     PlacementSource placement_source = PlacementSource::Uniform;
     std::string     placement_file;      // when placement_source == File
     int             replicate_hot = 0;   // --cluster-replicate-hot <k>
-    SharedExpertMode shared_expert = SharedExpertMode::Replicate;
+    SharedExpertMode shared_expert = SharedExpertMode::Shard;
 
     // Reduction and robustness knobs.
     AllreduceDType allreduce_dtype = AllreduceDType::Auto;

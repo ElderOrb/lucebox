@@ -197,7 +197,7 @@ static void print_usage(const char * prog) {
         "  --cluster-gid-index <n>      RoCE v2 GID index -> NCCL_IB_GID_INDEX\n"
         "  --cluster-expert-placement uniform|balanced|<file.json>\n"
         "                               Rank of every routed expert (same file on every rank)\n"
-        "  --cluster-shared-expert replicate|shard  (default: replicate)\n"
+        "  --cluster-shared-expert replicate|shard  (default: shard)\n"
         "  --cluster-allreduce-dtype f32|bf16|auto  (default: auto = f32)\n"
         "  --cluster-timeout-ms <ms>    Collective/control watchdog (default: 30000)\n"
         "  --cluster-replicate-hot <k>  Replicate each layer's k hottest experts on every rank\n"

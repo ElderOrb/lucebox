@@ -168,11 +168,7 @@ bool parse_shared_expert_mode(const std::string & text, SharedExpertMode & out, 
         out = SharedExpertMode::Shard;
         return true;
     }
-    if (text == "rank0") {
-        out = SharedExpertMode::Rank0;
-        return true;
-    }
-    set_err(err, "--cluster-shared-expert expects replicate, shard, or rank0, got '" + text + "'");
+    set_err(err, "--cluster-shared-expert expects replicate or shard, got '" + text + "'");
     return false;
 }
 
@@ -221,7 +217,6 @@ const char * shared_expert_mode_name(SharedExpertMode mode) {
     switch (mode) {
         case SharedExpertMode::Replicate: return "replicate";
         case SharedExpertMode::Shard:     return "shard";
-        case SharedExpertMode::Rank0:     return "rank0";
     }
     return "unknown";
 }

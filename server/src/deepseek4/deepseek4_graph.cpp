@@ -8424,13 +8424,6 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     // Slot = token index inside this batch (identical on all ranks).
     const MoeLayerDesc shared_desc = desc;
     if (cluster_rt) {
-        if (cluster_rt->cfg &&
-            cluster_rt->cfg->shared_expert == cluster::SharedExpertMode::Rank0) {
-            std::fprintf(stderr,
-                         "[deepseek4-cluster] layer %d: shared expert mode %s not implemented\n",
-                         layer, cluster::shared_expert_mode_name(cluster_rt->cfg->shared_expert));
-            return false;
-        }
         ds4_cluster_mask_routes(*cluster_rt, layer, selected.data(), weights.data(),
                                 route_width, n_tokens);
         // Device join: rank 0's hot owner carries the shared expert, so the

@@ -1,12 +1,13 @@
 // deepseek4_cluster.h - DeepSeek4 expert-parallel cluster runtime.
 //
-// Every rank loads the full dense model and only its shard of routed experts
-// (owned + replicated, see cluster_expert_placement.h). Per MoE layer the
-// rank evaluates its resident experts as an owner partial sum through the
-// existing hybrid machinery with cold owner MoeHybridColdBackend::None, then
-// ONE all-reduce (IClusterComm::allreduce_sum_f32 on the backend stream)
-// makes the routed partial identical on every rank before the shared expert
-// is added and HC-post runs.
+// Every rank loads the dense model (with LUCE_CLUSTER_SLICE_WEIGHTS, only the
+// attention heads and shared-expert slice it computes) and only its shard of
+// routed experts (owned + replicated, see cluster_expert_placement.h). Per MoE
+// layer the rank evaluates its resident experts as an owner partial sum
+// through the existing hybrid machinery with cold owner
+// MoeHybridColdBackend::None, then ONE all-reduce (IClusterComm::
+// allreduce_sum_f32 on the backend stream) makes the layer's output identical
+// on every rank before HC-post runs.
 //
 // By default the all-reduce is a node of the fused whole-model verify/decode
 // graph (ggml_cluster_allreduce, one per MoE layer). With the fused graph
@@ -14,9 +15,11 @@
 // call between per-layer graph computes inside
 // deepseek4_step_layer_range / eval_ds4_layer_range_hybrid_ffn.
 //
-// Shared expert: SharedExpertMode::Replicate only. Every rank computes it
-// locally from the same normalized input and adds it after the all-reduce;
-// the routed partial is evaluated with the shared-expert tensors removed
+// Shared expert: with SharedExpertMode::Shard (the default) each rank owns a
+// slice of its intermediate axis, so its down projection is a partial sum
+// that rides in the routed all-reduce. With Replicate every rank computes it
+// from the same normalized input and adds it after the all-reduce; the
+// routed partial is then evaluated with the shared-expert tensors removed
 // from the MoeLayerDesc (the per-layer equivalent of include_shared=false).
 //
 // Replicated experts: expert e at batch slot t is evaluated only by rank

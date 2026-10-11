@@ -608,7 +608,7 @@ TEST_CASE(ClusterUnitFixture, ClusterConfigParsers) {
     SharedExpertMode se;
     REQUIRE(parse_shared_expert_mode("replicate", se, &err)); CHECK(se == SharedExpertMode::Replicate);
     REQUIRE(parse_shared_expert_mode("shard", se, &err));     CHECK(se == SharedExpertMode::Shard);
-    REQUIRE(parse_shared_expert_mode("rank0", se, &err));     CHECK(se == SharedExpertMode::Rank0);
+    CHECK_FALSE(parse_shared_expert_mode("rank0", se, &err));
     CHECK_FALSE(parse_shared_expert_mode("bogus", se, &err));
     CHECK_FALSE(parse_shared_expert_mode("", se, &err));
     CHECK_EQUAL(std::string(shared_expert_mode_name(SharedExpertMode::Shard)), std::string("shard"));

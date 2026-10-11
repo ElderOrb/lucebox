@@ -251,12 +251,6 @@ bool ds4_cluster_build_placement(const cluster::ClusterConfig & cfg,
         set_err(err, "cluster config is not enabled or rank is out of range");
         return false;
     }
-    if (cfg.shared_expert == cluster::SharedExpertMode::Rank0) {
-        set_err(err, std::string("shared expert mode '") +
-                     cluster::shared_expert_mode_name(cfg.shared_expert) +
-                     "' is not implemented yet; use replicate or shard");
-        return false;
-    }
 
     const MoeHybridConfig mcfg = ds4_cluster_moe_config(w);
     MoeHybridRoutingStats stats;
@@ -508,9 +502,6 @@ bool ds4_cluster_attention_parallel_enabled() {
 bool ds4_cluster_fused_graph_available(const Ds4ClusterRuntime * rt) {
     if (!rt || !rt->comm || rt->comm->size() <= 1) return false;
     if (!ds4_cluster_ingraph_allreduce_enabled()) return false;
-    if (rt->cfg && rt->cfg->shared_expert == cluster::SharedExpertMode::Rank0) {
-        return false;
-    }
     for (int32_t owner : rt->placement.owner) {
         if (owner == cluster::kReplicated) {
             static bool warned = false;
