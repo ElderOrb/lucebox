@@ -290,10 +290,11 @@ inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
         {"LUCE_DS4_TP_CAPTURE_CACHE_SLOTS", "64"},
         {"LUCE_DS4_TP_FUSED_CACHE_SLOTS", "64"},
         // Expert products: q8_1 inputs handed to the expert owners, grouped
-        // MUL_MAT_ID, the ROCmFP2 prefetch loop and one peer-copy kernel per
-        // layer.
+        // MUL_MAT_ID (in prefill on both owners: the R9700's hot experts too),
+        // the ROCmFP2 prefetch loop and one peer-copy kernel per layer.
         {"LUCE_MOE_Q8_HANDOFF", "1"},
         {"LUCE_MMID_GROUPED", "1"},
+        {"LUCE_DS4_GROUPED_HYBRID_PREFILL", "2"},
         {"LUCE_MMID_GROUPED_TYPES", "79"},
         {"LUCE_CUDA_MMVQ_MOE_FP2_PREFETCH", "1"},
         {"GGML_CUDA_PEER_COPY_KERNEL", "1"},
