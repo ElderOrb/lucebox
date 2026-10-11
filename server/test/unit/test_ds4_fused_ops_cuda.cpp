@@ -15,6 +15,7 @@
 #include "ggml-cuda.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -465,6 +466,71 @@ bool run_glu_q8(ggml_backend_t backend, int n_ff, int n_used, int tokens, uint32
             if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
                 std::fprintf(stderr, "glu q8 mismatch n_ff=%d n_used=%d tokens=%d at %zu: ref %.9g fused %.9g\n",
                              n_ff, n_used, tokens, i, a[i], b[i]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return ok;
+}
+
+// A prefill band's HC mix: RMS_NORM read only by a product against 24 F16
+// rows runs as ggml_cuda_ds4_rms_norm_mix, F32 throughout. Checked against a
+// double-precision host reference: the unfused GEMM path rounds its input to
+// 16 bits on some GPUs, so it is no reference for an F32 kernel. A wrong row
+// or token is off by O(1); float accumulation over K stays far inside 1e-4.
+bool run_rms_norm_mix(ggml_backend_t backend, int k, int tokens, uint32_t seed) {
+    const int m = 24;
+    const float eps = 1e-6f;
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, m);
+    for (ggml_tensor * t : {x, w}) ggml_set_input(t);
+    ggml_tensor * fus = ggml_mul_mat(ctx, w, ggml_rms_norm(ctx, x, eps));
+    ggml_set_output(fus);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, fus);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> h_x((size_t) k * tokens);
+    std::vector<ggml_fp16_t> h_w((size_t) k * m);
+    for (float & v : h_x) v = normal(rng);
+    for (ggml_fp16_t & v : h_w) v = ggml_fp32_to_fp16(normal(rng) * 0.02f);
+    ggml_backend_tensor_set(x, h_x.data(), 0, sizeof(float) * h_x.size());
+    ggml_backend_tensor_set(w, h_w.data(), 0, sizeof(ggml_fp16_t) * h_w.size());
+    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    const size_t n = (size_t) m * tokens;
+    std::vector<float> got(n);
+    if (ok) {
+        ggml_backend_tensor_get(fus, got.data(), 0, sizeof(float) * n);
+        std::vector<double> want(n);
+        double peak = 0.0;
+        for (int t = 0; t < tokens; ++t) {
+            const float * xr = h_x.data() + (size_t) t * k;
+            double ss = 0.0;
+            for (int i = 0; i < k; ++i) ss += (double) xr[i] * xr[i];
+            const double scale = 1.0 / std::sqrt(ss / k + eps);
+            for (int r = 0; r < m; ++r) {
+                double dot = 0.0;
+                for (int i = 0; i < k; ++i) dot += (double) ggml_fp16_to_fp32(h_w[(size_t) r * k + i]) * xr[i];
+                want[(size_t) t * m + r] = dot * scale;
+                peak = std::max(peak, std::fabs(dot * scale));
+            }
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (!(std::fabs(got[i] - want[i]) <= 1e-4 * peak)) {
+                std::fprintf(stderr, "rms norm mix mismatch k=%d tokens=%d at %zu: want %.9g got %.9g (peak %.6g)\n",
+                             k, tokens, i, want[i], got[i], peak);
                 ok = false;
                 break;
             }
@@ -926,6 +992,10 @@ int main() {
     {
         // Verify-shaped products: batch-invariant MMVQ, as the DS4 verify runs them.
         const bool prev = ggml_backend_cuda_set_mmvq_batch_invariant(true);
+        const int norm_mix_cases[][2] = {{20480, 64}, {20480, 130}, {1024, 67}};
+        for (const auto & nc : norm_mix_cases) {
+            if (!run_rms_norm_mix(backend, nc[0], nc[1], seed++)) ++failures;
+        }
         const int pair_cases[][5] = {{1024, 64, 32, 0, 5}, {1024, 64, 32, 32, 4}, {5120, 96, 48, 48, 2}, {1024, 64, 32, 32, 8},
                                      {1024, 64, 32, 32, 1}};
         for (const auto & pc : pair_cases) {

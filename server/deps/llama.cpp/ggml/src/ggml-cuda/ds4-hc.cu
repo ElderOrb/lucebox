@@ -1,5 +1,7 @@
 #include "ds4-hc.cuh"
 
+#include <climits>
+
 // Fused DeepSeek4 hyper-connection ops.
 //
 // mode 0 (pre):  src0 = mix [mix_dim,n_tokens] (f32, from fn @ rms_norm(hc_state))
@@ -1398,4 +1400,78 @@ void ggml_cuda_op_ds4_hc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         default:
             GGML_ABORT("ds4_hc: unknown mode");
     }
+}
+
+// ── RMS norm + HC mix product for prefill bands ─────────────────────────
+// Each block handles kRnmTokens tokens: the mix rows are read once per block
+// for all of them, and each thread keeps the partial sums of its K slice.
+static constexpr int kRnmThreads = 256;
+static constexpr int kRnmTokens = 4;
+static constexpr int kRnmMaxM = 32;
+
+template <int M>
+static __global__ void __launch_bounds__(kRnmThreads) ds4_rms_norm_mix_kernel(
+        const float * __restrict__ x, const int64_t x_stride, const half * __restrict__ w, const int64_t w_stride,
+        float * __restrict__ out, const int64_t out_stride, const int k, const int n_tokens, const float eps) {
+    const int t0 = blockIdx.x * kRnmTokens;
+    const int nt = min(kRnmTokens, n_tokens - t0);
+    float acc[kRnmTokens][M];
+    float ss[kRnmTokens];
+#pragma unroll
+    for (int j = 0; j < kRnmTokens; ++j) {
+        ss[j] = 0.0f;
+#pragma unroll
+        for (int r = 0; r < M; ++r) acc[j][r] = 0.0f;
+    }
+    for (int i = threadIdx.x; i < k; i += kRnmThreads) {
+        float wv[M];
+#pragma unroll
+        for (int r = 0; r < M; ++r) wv[r] = __half2float(w[(int64_t) r * w_stride + i]);
+#pragma unroll
+        for (int j = 0; j < kRnmTokens; ++j) {
+            if (j >= nt) break;
+            const float v = x[(int64_t) (t0 + j) * x_stride + i];
+            ss[j] += v * v;
+#pragma unroll
+            for (int r = 0; r < M; ++r) acc[j][r] += wv[r] * v;
+        }
+    }
+    __shared__ float s_part[kRnmThreads / WARP_SIZE][kRnmTokens][M + 1];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+#pragma unroll
+    for (int j = 0; j < kRnmTokens; ++j) {
+        const float s = warp_reduce_sum(ss[j]);
+        if (lane == 0) s_part[warp][j][M] = s;
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            const float a = warp_reduce_sum(acc[j][r]);
+            if (lane == 0) s_part[warp][j][r] = a;
+        }
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < nt * M; idx += kRnmThreads) {
+        const int j = idx / M, r = idx % M;
+        float a = 0.0f, s = 0.0f;
+#pragma unroll
+        for (int q = 0; q < kRnmThreads / WARP_SIZE; ++q) {
+            a += s_part[q][j][r];
+            s += s_part[q][j][M];
+        }
+        out[(int64_t) (t0 + j) * out_stride + r] = a * rsqrtf(s / (float) k + eps);
+    }
+}
+
+bool ggml_cuda_ds4_rms_norm_mix_supported(int64_t k, int64_t m) {
+    return k > 0 && k <= INT_MAX && m == 24;
+}
+
+void ggml_cuda_ds4_rms_norm_mix(ggml_backend_cuda_context & ctx, const float * x, int64_t x_stride,
+                                const half * w, int64_t w_stride, float * out, int64_t out_stride,
+                                int64_t k, int64_t m, int64_t n_tokens, float eps) {
+    GGML_ASSERT(ggml_cuda_ds4_rms_norm_mix_supported(k, m));
+    const int blocks = (int) ((n_tokens + kRnmTokens - 1) / kRnmTokens);
+    ds4_rms_norm_mix_kernel<24><<<blocks, kRnmThreads, 0, ctx.stream()>>>(
+        x, x_stride, w, w_stride, out, out_stride, (int) k, (int) n_tokens, eps);
+    CUDA_CHECK(cudaGetLastError());
 }

@@ -5611,6 +5611,35 @@ static int ggml_cuda_try_rms_norm_rope_f16(ggml_backend_cuda_context & ctx, ggml
     return i_cpy;
 }
 
+// A prefill band's HC mix: RMS_NORM read only by a MUL_MAT against the 24
+// F16 mix rows, in one pass over the residual (ggml_cuda_ds4_rms_norm_mix)
+// instead of a norm, an F16 copy and a GEMM of 24 rows. Only for bands of 64
+// tokens or more: decode and verify keep their batch-invariant products.
+static int ggml_cuda_try_ds4_rms_norm_mix(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * norm = cgraph->nodes[i];
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_node_is_noop(cgraph->nodes[j])) ++j;
+    if (j >= cgraph->n_nodes) return -1;
+    ggml_tensor * mm = cgraph->nodes[j];
+    const ggml_tensor * x = norm->src[0];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != norm || mm->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(mm)) return -1;
+    const ggml_tensor * w = mm->src[0];
+    if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || x->ne[2] != 1 || x->ne[3] != 1 ||
+        x->ne[1] < 64 || !ggml_is_contiguous(norm) ||
+        w->type != GGML_TYPE_F16 || w->nb[0] != sizeof(half) || w->ne[0] != x->ne[0] ||
+        w->ne[2] != 1 || w->ne[3] != 1 || mm->ne[1] != x->ne[1] ||
+        !ggml_cuda_ds4_rms_norm_mix_supported(x->ne[0], w->ne[1]) ||
+        !ggml_cuda_elidable(cgraph, norm, 1)) return -1;
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    ggml_cuda_ds4_rms_norm_mix(ctx, (const float *) x->data, (int64_t) (x->nb[1] / sizeof(float)),
+                               (const half *) w->data, (int64_t) (w->nb[1] / sizeof(half)),
+                               (float *) mm->data, (int64_t) (mm->nb[1] / sizeof(float)),
+                               x->ne[0], w->ne[1], x->ne[1], eps);
+    return j;
+}
+
 // A CONT of a strided F32 view read only by a quantized matmul that takes
 // MMVQ: MMVQ would quantize the contiguous copy, so quantize the view itself
 // into its memo entry (the same q8_1 bytes: rows of whole, unpadded blocks in
@@ -6097,6 +6126,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (node->op == GGML_OP_RMS_NORM) {
                         int last = ggml_cuda_try_ds4_hc_boundary(*cuda_ctx, cgraph, i);
                         if (last < 0) last = ggml_cuda_try_rms_norm_rope_f16(*cuda_ctx, cgraph, i);
+                        if (last < 0) last = ggml_cuda_try_ds4_rms_norm_mix(*cuda_ctx, cgraph, i);
                         if (last > i) {
                             i = last;
                             continue;
