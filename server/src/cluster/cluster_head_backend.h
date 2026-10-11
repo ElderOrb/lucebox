@@ -161,7 +161,8 @@ private:
     // grace period so the HTTP response is written before the supervisor
     // takes over. Idempotent.
     void request_fatal_exit(const std::string & reason, int code, uint64_t request_id);
-    // Broadcast Abort, abort the communicator, mark fatal, maybe exit.
+    // Broadcast Abort, abort the communicator, mark fatal, maybe exit at once.
+    // For start-up failures; a request thread uses request_fatal_exit.
     void fail_cluster(const std::string & reason, int code, uint64_t request_id);
     bool spec_available() const;
 

@@ -407,9 +407,11 @@ GenerateResult ClusterHeadBackend::run_request(const GenerateRequest & req, cons
     last_report_.request_id = request_id;
     last_report_.size = cfg_.size;
 
+    // A failure from here on ends the cluster through request_fatal_exit, which
+    // exits only after the HTTP layer has written this request's error.
     std::string err;
     if (!control_.broadcast(make_frame(msg), &err)) {
-        fail_cluster("request broadcast: " + err, kAbortCodeControl, request_id);
+        request_fatal_exit("request broadcast: " + err, kAbortCodeControl, request_id);
         result.fail(GenerateErrorCode::DecodeFailed, "cluster: request broadcast failed: " + err);
         return result;
     }
@@ -437,9 +439,9 @@ GenerateResult ClusterHeadBackend::run_request(const GenerateRequest & req, cons
     // The decode loop reports channel failures as DecodeFailed with the
     // message already logged; a dead worker also shows up here.
     if (!result.ok() && (!control_.all_alive() || (comm_ && comm_->async_error(&err)))) {
-        fail_cluster("request " + std::to_string(request_id) + " failed: " +
-                     std::string(result.error_detail()) + (err.empty() ? "" : " / " + err),
-                     kAbortCodeRequest, request_id);
+        request_fatal_exit("request " + std::to_string(request_id) + " failed: " +
+                           std::string(result.error_detail()) + (err.empty() ? "" : " / " + err),
+                           kAbortCodeRequest, request_id);
         return result;
     }
 
@@ -448,12 +450,13 @@ GenerateResult ClusterHeadBackend::run_request(const GenerateRequest & req, cons
     end.steps = (uint32_t) result.tokens.size();
     end.status = result.ok() ? 0 : (int32_t) result.error->code;
     if (!control_.broadcast(make_frame(end), &err)) {
-        fail_cluster("RequestEnd broadcast: " + err, kAbortCodeControl, request_id);
+        request_fatal_exit("RequestEnd broadcast: " + err, kAbortCodeControl, request_id);
         if (result.ok()) result.fail(GenerateErrorCode::DecodeFailed, "cluster: RequestEnd failed");
         return result;
     }
     if (!gather_reports(request_id, end.steps)) {
-        fail_cluster("RequestReport gather: " + last_report_.error, kAbortCodeControl, request_id);
+        request_fatal_exit("RequestReport gather: " + last_report_.error, kAbortCodeControl,
+                           request_id);
         if (result.ok()) result.fail(GenerateErrorCode::DecodeFailed, "cluster: report gather failed");
         return result;
     }
@@ -531,7 +534,7 @@ bool ClusterHeadBackend::broadcast_op(BackendOpKind kind, std::vector<int64_t> a
     op.args = std::move(args);
     std::string err;
     if (!hooks_->backend_op(op, &err)) {
-        fail_cluster("BackendOp broadcast: " + err, kAbortCodeControl, 0);
+        request_fatal_exit("BackendOp broadcast: " + err, kAbortCodeControl, 0);
         return false;
     }
     return true;

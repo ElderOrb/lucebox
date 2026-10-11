@@ -5,24 +5,10 @@
 
 #include <cstdio>
 #include <cstring>
-#include <random>
 
 namespace luce::cluster {
 
 namespace {
-
-int32_t greedy_argmax(const float * logits, int n_vocab) {
-    if (!logits || n_vocab <= 0) return -1;
-    int32_t best = 0;
-    float best_v = logits[0];
-    for (int i = 1; i < n_vocab; i++) {
-        if (logits[i] > best_v) {
-            best_v = logits[i];
-            best = i;
-        }
-    }
-    return best;
-}
 
 void set_err(std::string * err, const std::string & msg) {
     if (err) *err = msg;
@@ -51,24 +37,14 @@ void HeadHooks::reset_counters() {
     first_mismatch_step_ = 0;
 }
 
-bool HeadHooks::decide_next_token(uint64_t req, uint32_t step, const float * logits, int n_vocab,
-                                  const common::SamplerCfg & cfg, bool /*is_eos_candidate_unused*/,
+bool HeadHooks::decide_next_token(uint64_t req, uint32_t step, const float * /*logits*/,
+                                  int /*n_vocab*/, const common::SamplerCfg & /*cfg*/,
+                                  bool /*is_eos_candidate_unused*/,
                                   int32_t & token, uint8_t & flags, std::string * err) {
+    // Rank 0 samples in its decode loop, with the request's sampler and RNG.
     if (token < 0) {
-        // Caller did not sample host-side. Only rank 0 owns an RNG.
-        if (sampler_) {
-            token = sampler_(logits, n_vocab, cfg);
-        } else if (cfg.temp > 0.0f) {
-            static thread_local std::mt19937_64 rng{cfg.seed != 0 ? cfg.seed : 0x5eedULL};
-            std::vector<int32_t> no_history;
-            token = common::sample_logits(logits, n_vocab, cfg, no_history, rng);
-        } else {
-            token = greedy_argmax(logits, n_vocab);
-        }
-        if (token < 0) {
-            set_err(err, "head: sampling produced no token");
-            return false;
-        }
+        set_err(err, "head: no token to broadcast");
+        return false;
     }
 
     DecisionMsg msg;

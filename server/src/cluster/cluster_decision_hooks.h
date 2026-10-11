@@ -34,7 +34,6 @@
 #include "common/sampler.h"
 
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <vector>
 
@@ -79,11 +78,8 @@ struct Ds4ClusterHooks {
     // AR decode, one call per step on every rank.
     //
     // Head / local: `token` and `flags` are INPUTS. The caller sampled
-    // `token` from `logits` with `cfg` (including any budget-hook override)
-    // and computed `flags` with make_decision_flags. If the caller passes
-    // token < 0 the head hook samples itself (greedy argmax, or `cfg` via
-    // common::sample_logits with an internal RNG when cfg.temp > 0); this
-    // path exists for callers that do not sample host-side.
+    // `token` from `logits` with `cfg` (after the thinking budget) and
+    // computed `flags` with make_decision_flags; the head refuses token < 0.
     // Worker: `logits`/`cfg` are ignored; `token` and `flags` are OUTPUTS
     // taken from the head's DecisionMsg for (req, step).
     // `is_eos_candidate_unused` is reserved (kept for signature stability).
@@ -165,13 +161,8 @@ struct HeadHooksConfig {
 
 class HeadHooks final : public Ds4ClusterHooks {
 public:
-    // `control` must outlive the hooks. Optional sampler used only when the
-    // caller passes token < 0.
+    // `control` must outlive the hooks.
     HeadHooks(ClusterHeadControl & control, const HeadHooksConfig & cfg);
-
-    using Sampler = std::function<int32_t(const float * logits, int n_vocab,
-                                          const common::SamplerCfg & cfg)>;
-    void set_sampler(Sampler s) { sampler_ = std::move(s); }
 
     bool decide_next_token(uint64_t req, uint32_t step, const float * logits, int n_vocab,
                            const common::SamplerCfg & cfg, bool is_eos_candidate_unused,
@@ -195,7 +186,6 @@ public:
 private:
     ClusterHeadControl & control_;
     HeadHooksConfig      cfg_;
-    Sampler              sampler_;
     int                  first_mismatch_rank_ = -1;
     uint32_t             first_mismatch_step_ = 0;
 };

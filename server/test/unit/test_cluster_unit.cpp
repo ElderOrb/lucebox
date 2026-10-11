@@ -1088,15 +1088,13 @@ TEST_CASE(ClusterUnitFixture, HeadAndWorkerHooksOverLoopback) {
         CHECK(worker.backend_op(got, &w_err));
         CHECK_EQUAL(head.counters().backend_ops, 1u);
 
-        // Head samples itself when the caller passes token < 0 (greedy).
-        int32_t sampled = -1; uint8_t sflags = 0;
-        std::thread wt2([&] {
-            int32_t t = -1; uint8_t fl = 0; std::string e;
-            worker.decide_next_token(req, 1, nullptr, 0, scfg, false, t, fl, &e);
-        });
-        REQUIRE(head.decide_next_token(req, 1, logits, 4, scfg, false, sampled, sflags, &h_err));
-        CHECK_EQUAL(sampled, 1);
-        wt2.join();
+        // Rank 0 samples in its decode loop: without a token the head
+        // broadcasts nothing.
+        int32_t none = -1; uint8_t sflags = 0;
+        h_err.clear();
+        CHECK_FALSE(head.decide_next_token(req, 1, logits, 4, scfg, false, none, sflags, &h_err));
+        CHECK_FALSE(h_err.empty());
+        CHECK_EQUAL(head.counters().decisions, 1u);
     }
 
     SECTION("worker rejects wrong request or step") {
