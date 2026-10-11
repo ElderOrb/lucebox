@@ -2338,8 +2338,9 @@ static ggml_tensor * build_mla_output_projection(
     }
     ggml_tensor * attn_low = ds4_mul_mat_columns(ctx, out_a_3d, attn_out, projection_columns);
     // attn_low is group-major over ne[0] (n_lora_o is the fast axis), so a
-    // contiguous group range is a contiguous column range of wo_b.
-    ggml_tensor * out_b_w = head_split
+    // contiguous group range is a contiguous column range of wo_b; a sliced
+    // load already holds just these columns.
+    ggml_tensor * out_b_w = head_split && stored_groups != n_groups
         ? ggml_view_2d(ctx, L.attn_output_b, (int64_t) w.n_lora_o * n_groups,
                        L.attn_output_b->ne[1], L.attn_output_b->nb[1],
                        ggml_row_size(L.attn_output_b->type, (int64_t) group_first * w.n_lora_o))

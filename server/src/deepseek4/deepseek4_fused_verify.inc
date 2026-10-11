@@ -2277,8 +2277,9 @@ static int ds4_try_fused_verify_step(
         vc.stage.reserve(backend, ds4_fused_stage_bytes(w, *fg, *ex, q, hooks));
     vc.stage.reset();
     // The async read needs a place in the stream right before its consumer:
-    // the cluster's Engram broadcast callback (after layer 0's attention).
-    Ds4ClusterRuntime * engram_rt = cache.cluster_rt && cache.cluster_rt->size() > 1
+    // the cluster's Engram broadcast callback (after layer 0's attention),
+    // which the graph has only when it was built for the hybrid cluster path.
+    Ds4ClusterRuntime * engram_rt = hybrid && cache.cluster_rt && cache.cluster_rt->size() > 1
         ? cache.cluster_rt : nullptr;
     bool engram_async = false;
     if (ex->engram_keys) {

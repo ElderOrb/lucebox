@@ -61,7 +61,11 @@ struct Ds4ClusterRuntime {
     // Decode-path all-reduces over raw RDMA (LUCE_CLUSTER_FAST_REDUCE=1); RCCL keeps
     // whatever it declines (prefill-sized payloads).
     std::unique_ptr<cluster::FastReduce> fast;
-    // Hybrid exchange call counters: the k-th export/combine/import call of each kind belongs to exchange k.
+    // Hybrid exchange call counters: the k-th export/combine/import call of
+    // each kind belongs to exchange k. Like FastReduce's sequence numbers they
+    // assume every rank runs every exchange for the life of the process: a
+    // step that fails on one rank leaves its peer waiting, and the stall
+    // watchdog then ends both ranks.
     uint64_t hyb_export0 = 0, hyb_export1 = 0, hyb_combine = 0, hyb_import = 0;
     cluster::ClusterExpertPlacement placement;
     // Rank-local hot set (owned + replicated experts) for the hybrid storage.
@@ -81,11 +85,12 @@ struct Ds4ClusterRuntime {
     // Attention head parallelism: this rank builds only heads
     // [attn_head_begin, attn_head_begin + attn_head_count) and the ranks
     // all-reduce the attention output, which is a partial sum over the
-    // grouped output projection. count 0 = attention stays replicated.
+    // grouped output projection. count 0 = attention stays replicated. The
+    // range indexes the loaded tensors: 0 when they hold only this slice.
     int attn_head_begin = 0;
     int attn_head_count = 0;
-    // Shared-expert sharding (--cluster-shared-expert shard): this rank's
-    // slice of the intermediate axis. count 0 = the shared expert is
+    // Shared-expert sharding (--cluster-shared-expert shard, the default):
+    // this rank's slice of the intermediate axis. count 0 = the shared expert is
     // replicated and added once after the reduction.
     int shexp_ff_begin = 0;
     int shexp_ff_count = 0;
