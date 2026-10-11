@@ -10706,10 +10706,13 @@ bool deepseek4_step_layer_range(
     const auto step_t0 = Ds4TimingClock::now();
     // This band's HC graph slot may still hold an earlier band's pending
     // join: complete it before the slot's graphs are reused.
-    if (cache.layer_major_band && cache.layer_major_band->pipeline &&
-        !ds4_pipeline_finish(cache.layer_major_band->pipeline->slots[cache.layer_major_band->graph_slot],
-                             backend)) {
-        return false;
+    if (cache.layer_major_band && cache.layer_major_band->pipeline) {
+        const auto join_t0 = Ds4TimingClock::now();
+        if (!ds4_pipeline_finish(cache.layer_major_band->pipeline->slots[cache.layer_major_band->graph_slot],
+                                 backend)) {
+            return false;
+        }
+        if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(join_t0, Ds4TimingClock::now());
     }
 
     bool image_batch = false;
@@ -11257,8 +11260,12 @@ bool deepseek4_step_layer_range(
     }
     std::vector<float> & engram_keys_mut =
         band_engram_keys && range_has_engram ? *band_engram_keys : engram_keys_local;
-    if (cache.cluster_rt && range_has_engram) {
+    // The band's keys hold every Engram layer's rows: one broadcast per band.
+    uint8_t * keys_shared = band_engram_keys && range_has_engram && layer_major_band
+        ? layer_major_band->engram_keys_shared : nullptr;
+    if (cache.cluster_rt && range_has_engram && !(keys_shared && *keys_shared)) {
         // Engram tables live on rank 0: its rows replace every other rank's.
+        const auto bcast_t0 = Ds4TimingClock::now();
         std::string bcast_err;
         if (!ds4_cluster_broadcast_host(*cache.cluster_rt, backend, engram_keys_mut.data(),
                                         engram_keys_mut.size(), &bcast_err)) {
@@ -11266,6 +11273,8 @@ bool deepseek4_step_layer_range(
                          bcast_err.c_str());
             return false;
         }
+        if (keys_shared) *keys_shared = 1;
+        if (telemetry) telemetry->engram_read_us += ds4_elapsed_us(bcast_t0, Ds4TimingClock::now());
     }
     const std::vector<float> & engram_keys = engram_keys_mut;
     if (!layer_range_cache.index_selection.ensure(
@@ -12805,6 +12814,7 @@ bool deepseek4_prefill_layer_major(
     // pass, and reused by the band's second Engram layer.
     Ds4EngramReadAhead engram_ahead;
     std::vector<std::vector<float>> & band_keys = engram_ahead.keys;
+    std::vector<uint8_t> band_keys_shared(run_bands.size(), 0);
     if (ds4_engram_on_device() && w.engram_runtime && token_ids) {
         engram_ahead.start(w, context_before, token_ids, kv_start, run_bands);
     }
@@ -12830,6 +12840,7 @@ bool deepseek4_prefill_layer_major(
             band.staggered_pre = &band_pre;
             band.selection_first = first;
             band.engram_keys = band_keys.empty() ? nullptr : &band_keys[bi];
+            band.engram_keys_shared = band_keys.empty() ? nullptr : &band_keys_shared[bi];
             cache.layer_major_band = &band;
             const float * input = il == 0 ? embed + (size_t) first * n_embd
                                 : device_residual ? nullptr

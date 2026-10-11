@@ -501,6 +501,9 @@ struct DeepSeek4LayerMajorBand {
     // Optional per-band Engram keys: read at the band's first Engram layer,
     // reused at the next (they depend only on the band's tokens).
     std::vector<float> * engram_keys = nullptr;
+    // Cluster ranks: set once the band's keys (every Engram layer's rows)
+    // came from rank 0, so later Engram layers of the band skip the broadcast.
+    uint8_t * engram_keys_shared = nullptr;
     // Pipelined prefill (LUCE_DS4_PREFILL_PIPELINE): which set of prefill HC
     // graphs this band uses (bands alternate, so a band's deferred FFN join
     // keeps its own tensors), and the pass's pipeline state.
