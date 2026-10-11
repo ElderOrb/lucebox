@@ -407,6 +407,10 @@ static __global__ void moe_combine_masked_kernel(
     float sum = 0.0f;
     for (int e = 0; e < n_used; ++e) {
         const int32_t id = *(const int32_t *)(ids + (size_t)e * sizeof(int32_t) + (size_t)t * ids_nb1);
+        // A route masked to -1 (another rank's expert) has no validity row.
+        if (id < 0) {
+            continue;
+        }
         const float valid_w = *(const float *)(valid + (size_t)id * valid_nb1 + (size_t)t * valid_nb2);
         const float w = *(const float *)(weights + (size_t)e * sizeof(float) + (size_t)t * weights_nb1) * valid_w;
         if (w == 0.0f) {

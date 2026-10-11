@@ -5362,11 +5362,12 @@ static void ggml_compute_forward_soft_max_f32(
 
     // sinks
     const float * sk = src2 ? (float *)((char *) src2->data) : nullptr;
-    // Lucebox sink-as-virtual-column mode (see ggml_soft_max_ext_sink_col)
+    // Lucebox sink-as-virtual-column mode (see ggml_soft_max_ext_sink_col and
+    // its _mask form: the mask is added below like any other).
     int32_t sink_col = 0;
     memcpy(&sink_col, (int32_t *) dst->op_params + 2, sizeof(int32_t));
     if (sink_col) {
-        GGML_ASSERT(sk && !src1);
+        GGML_ASSERT(sk);
     }
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {

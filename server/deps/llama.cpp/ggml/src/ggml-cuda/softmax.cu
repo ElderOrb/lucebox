@@ -59,8 +59,10 @@ struct soft_max_params {
 // as separate launches round them: the scaled score is rounded before the
 // mask is added (no FMA).
 static __device__ __forceinline__ float soft_max_sink_col_value(float x, float scale, float m) {
+    // __fmul_rn keeps the product its own rounding on CUDA, where nvcc ignores
+    // the clang pragma and builds with fast math; the pragma covers HIP.
 #pragma clang fp contract(off)
-    return x*scale + m;
+    return __fmul_rn(x, scale) + m;
 }
 
 template <bool use_shared, int ncols_template, int block_size_template, typename T>

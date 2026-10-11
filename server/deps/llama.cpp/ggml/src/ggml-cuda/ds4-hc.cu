@@ -1104,6 +1104,34 @@ static __global__ void __launch_bounds__(1024) ds4_hc_boundary_split_kernel(
     }
 }
 
+// Blocks of the split boundary kernel for `mmv_block` that `device` holds at
+// once. Its finishing blocks wait for each other at the output barrier, so a
+// grid wider than this would never finish. Cached per device and block size.
+static int ds4_hc_split_resident_blocks(int device, int mmv_block, size_t shmem) {
+    struct Entry { size_t shmem; int blocks; };
+    static Entry cache[GGML_CUDA_MAX_DEVICES][3] = {};
+    const int b = mmv_block == 64 ? 0 : mmv_block == 128 ? 1 : 2;
+    Entry & e = cache[device][b];
+    if (e.shmem != shmem) {
+        int per_cu = 0;
+        cudaError_t err;
+        switch (b) {
+            case 0:  err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                         &per_cu, ds4_hc_boundary_split_kernel<4, 64, 2>, 1024, shmem); break;
+            case 1:  err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                         &per_cu, ds4_hc_boundary_split_kernel<4, 128, 3>, 1024, shmem); break;
+            default: err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                         &per_cu, ds4_hc_boundary_split_kernel<4, 256, 6>, 1024, shmem); break;
+        }
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            per_cu = 0;
+        }
+        e = { shmem, per_cu * ggml_cuda_info().devices[device].nsm };
+    }
+    return e.blocks;
+}
+
 bool ggml_cuda_ds4_hc_boundary_supported(int n_hc, int n_embd, int mmv_block) {
     // n_embd % 1024: every warp's columns are one whole q8_1 block of out.
     return n_hc == 4 && n_embd >= 1024 && n_embd % 1024 == 0 &&
@@ -1135,12 +1163,15 @@ void ggml_cuda_ds4_hc_boundary(
     // LUCE_DS4_HC_BOUNDARY_SPLIT=1: the mix over several blocks per token
     // (one token's block reads the whole fn matrix alone otherwise). Only
     // while every block fits at once beside the others, since the finishing
-    // blocks wait for each other at the output barrier.
+    // blocks wait for each other at the output barrier. The unsplit grid is
+    // one block per token, at most MMVF_MAX_BATCH_SIZE of them.
     static const bool split_mix = [] {
         const char * v = getenv("LUCE_DS4_HC_BOUNDARY_SPLIT");
         return v && *v && strcmp(v, "0") != 0;
     }();
-    if (split_mix && n_tokens * 6 <= 48) {
+    const int n_split = mmv_block == 64 ? 2 : mmv_block == 128 ? 3 : 6;
+    if (split_mix && n_tokens * n_split <= 48 &&
+        n_tokens * n_split <= ds4_hc_split_resident_blocks(ctx.device, mmv_block, shmem)) {
         if (!ctx.ds4_hc_split_scratch) {
             ggml_cuda_set_device(ctx.device);
             CUDA_CHECK(cudaMalloc(&ctx.ds4_hc_split_scratch, 64 * 32 * sizeof(float) + 64 * sizeof(unsigned int)));

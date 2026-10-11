@@ -2792,7 +2792,8 @@ extern "C" {
     // sum rounded as mul(weights, get_rows(valid, ids)), mul and repeat_back
     // round them (routes with a zero masked weight add nothing).
     // experts [n_embd, n_used, T], weights [n_used, T] F32, valid [1, n_expert, T]
-    // F32, ids [n_used, T] I32 (global expert ids).
+    // F32, ids [n_used, T] I32 (global expert ids; a route masked to -1 adds
+    // nothing).
     GGML_API struct ggml_tensor * ggml_moe_combine_masked(
             struct ggml_context * ctx,
             struct ggml_tensor  * experts,
