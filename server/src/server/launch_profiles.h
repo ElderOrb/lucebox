@@ -263,7 +263,9 @@ inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
         {"LUCE_CLUSTER_FAST_REDUCE_STALL_S", "15"},
         {"LUCE_CLUSTER_HYBRID_EXCHANGE", "1"},
         {"LUCE_CLUSTER_HYBRID_ONE_EXPORT", "1"},
-        // Prefill-sized reductions stay on RCCL, in bf16.
+        // Prefill-sized reductions stay on RCCL: 8-bit blocks, or bf16 with
+        // LUCE_CLUSTER_PREFILL_Q8=0.
+        {"LUCE_CLUSTER_PREFILL_Q8", "1"},
         {"LUCE_CLUSTER_PREFILL_BF16", "1"},
         // Work split: attention heads, the greedy verify head and the DSpark
         // draft head are halved across the ranks; each rank loads only its
