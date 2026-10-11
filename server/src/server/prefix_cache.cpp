@@ -240,6 +240,19 @@ int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> &
         }
         return false;
     };
+    auto has_ancestor = [&](int i) {
+        for (int j = 0; j < n; j++) {
+            if (j == i) continue;
+            if (is_strict_prefix(*ids_lru[j], *ids_lru[i])) return true;
+        }
+        return false;
+    };
+    // A turn kept between a conversation's head and its newest snapshot only
+    // serves an edit of the last message: it goes first.
+    for (int i = 0; i < n; i++) {
+        if (i == skip_index || is_protected(i)) continue;
+        if (is_ancestor(i) && has_ancestor(i)) return i;
+    }
     // Oldest-first scan: prefer an unprotected leaf so sticky tools pins
     // survive. skip_index (the in-flight restore source) is never a victim.
     int oldest_protected_leaf = -1;
@@ -286,25 +299,21 @@ int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru
 
 int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
                                     int restored_prefix_len,
-                                    bool prefer_tools_boundary,
-                                    bool include_last_message,
+                                    bool prefer_head,
                                     int reachable_from) {
     if (boundaries.empty()) return 0;
     const auto usable = [&](int cut) {
         return cut > restored_prefix_len && cut >= reachable_from;
     };
-    // Tool-heavy cold path: pin the system+tools head (first marker) before
-    // deepening into conversation turns. Matches Python thin-pin semantics.
-    // A head the backend cannot save is skipped: it is cheap to prefill, and
-    // waiting for it would keep the cache from ever saving a deeper cut.
-    if (prefer_tools_boundary) {
-        const int tools_cut = boundaries.front();
-        if (usable(tools_cut)) return tools_cut;
+    // Save the system/tools head (first marker) before deepening into
+    // conversation turns. A head the backend cannot save is skipped: it is
+    // cheap to prefill, and waiting for it would keep the cache from ever
+    // saving a deeper cut.
+    if (prefer_head) {
+        const int head = boundaries.front();
+        if (usable(head)) return head;
     }
-    const int target = boundaries.size() >= 2 && !include_last_message
-        ? boundaries[boundaries.size() - 2]
-        : boundaries.back();
-    return usable(target) ? target : 0;
+    return usable(boundaries.back()) ? boundaries.back() : 0;
 }
 
 std::vector<int> spaced_restore_points(const std::vector<int> & boundaries, int min_gap) {
@@ -589,11 +598,27 @@ void PrefixCache::InlineReservation::take(InlineReservation && other) {
 }
 
 bool PrefixCache::inline_reservation_active(uint64_t id) const {
-    return id != 0 && active_inline_reservation_ == id;
+    if (id == 0) return false;
+    for (const auto & active : active_reservations_) {
+        if (active.id == id) return true;
+    }
+    return false;
 }
 
 void PrefixCache::release_inline_reservation(uint64_t id) {
-    if (inline_reservation_active(id)) active_inline_reservation_ = 0;
+    for (size_t i = 0; i < active_reservations_.size(); ++i) {
+        if (active_reservations_[i].id == id) {
+            active_reservations_.erase(active_reservations_.begin() + (std::ptrdiff_t)i);
+            return;
+        }
+    }
+}
+
+bool PrefixCache::slot_reserved(int slot) const {
+    for (const auto & active : active_reservations_) {
+        if (active.slot == slot) return true;
+    }
+    return false;
 }
 
 namespace {
@@ -620,27 +645,29 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         int forced_cut,
         int restore_source_slot,
         InlineSnapshotSize estimate_bytes,
-        bool include_last_message,
         int reachable_from,
         int restore_point_spacing) {
-    if (disabled_ || active_inline_reservation_ != 0) return {};
+    if (disabled_) return {};
 
     const auto candidates = find_all_boundaries(prompt_ids, markers_);
-    // A long tail past a short system/tools head (an agent's first turn, cold
-    // or with only the shared head restored): snapshot at the last message
-    // boundary instead of the head, or the first follow-up re-prefills the
-    // whole turn. That boundary is the end of the prompt unless the template
-    // appends tokens after it. Only a short head gives up its own pin this
-    // way, so a new conversation that shares it re-prefills at most
-    // LUCE_PC_DEEP_FIRST_MAX_HEAD tokens (default 2048).
-    // LUCE_PC_DEEP_FIRST_MIN is the tail length that triggers it (default
-    // 4096 tokens; 0 keeps the head pin). Values that are not a whole
-    // non-negative integer keep the defaults.
-    // Only the tool-request path pins the head, so only it changes. A forced
-    // pin still ahead of the restored prefix (an explicit pin_end, or PPP's
-    // pin of a head seen before) wins and keeps its protection, and a prompt
-    // the resident budget could never hold keeps the head pin instead of
-    // saving nothing.
+    // A conversation's first turn (one message past a head it did not
+    // restore) saves its system head, which every new conversation on that
+    // head restores; each later turn saves its end. Tool requests keep their
+    // system/tools head pinned until it is restored (prefer_tools_boundary).
+    bool prefer_head = prefer_tools_boundary ||
+        (candidates.size() == 2 && restored_prefix_len < candidates.front());
+    // A long tail past a short head (a first turn, cold or with only the
+    // shared head restored): snapshot at the last message boundary instead of
+    // the head, or the first follow-up re-prefills the whole turn. Only a
+    // short head gives up its own pin this way, so a new conversation that
+    // shares it re-prefills at most LUCE_PC_DEEP_FIRST_MAX_HEAD tokens
+    // (default 2048). LUCE_PC_DEEP_FIRST_MIN is the tail length that triggers
+    // it (default 4096 tokens; 0 keeps the head pin). Values that are not a
+    // whole non-negative integer keep the defaults.
+    // A forced pin still ahead of the restored prefix (an explicit pin_end, or
+    // PPP's pin of a head seen before) wins and keeps its protection, and a
+    // prompt the resident budget could never hold keeps the head pin instead
+    // of saving nothing.
     static const int deep_first_min = env_nonneg_int("LUCE_PC_DEEP_FIRST_MIN", 4096);
     static const int deep_first_max_head = env_nonneg_int("LUCE_PC_DEEP_FIRST_MAX_HEAD", 2048);
     const auto whole_prompt_fits = [&]() {
@@ -648,14 +675,14 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         const size_t bytes = estimate_bytes ? estimate_bytes((int) prompt_ids.size()) : 0;
         return bytes != 0 && bytes <= max_resident_bytes_;
     };
-    if (deep_first_min > 0 && prefer_tools_boundary && !candidates.empty() &&
+    if (deep_first_min > 0 && prefer_head && !candidates.empty() &&
         restored_prefix_len <= candidates.front() &&
         forced_cut <= restored_prefix_len &&
         candidates.front() <= deep_first_max_head &&
         (int) prompt_ids.size() - candidates.front() >= deep_first_min &&
         whole_prompt_fits()) {
+        prefer_head = false;
         prefer_tools_boundary = false;
-        include_last_message = true;
     }
     int target_cut = 0;
     bool forced = false;
@@ -666,10 +693,10 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         forced = true;
     } else {
         target_cut = select_inline_snapshot_boundary(
-            candidates, restored_prefix_len, prefer_tools_boundary,
-            include_last_message, reachable_from);
+            candidates, restored_prefix_len, prefer_head, reachable_from);
     }
-    if (restore_point_spacing > 0 && target_cut > 0) {
+    if (restore_point_spacing > 0 && target_cut > 0 &&
+        target_cut != candidates.back()) {
         int point = 0;
         for (int p : spaced_restore_points(candidates, restore_point_spacing))
             if (p <= target_cut) point = p;
@@ -695,13 +722,23 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
 
     const auto key = hash_prefix(prompt_ids.data(), target_cut);
     if (find_entry(key) >= 0) return {};
+    for (const auto & active : active_reservations_) {
+        if (active.key == key) return {};
+    }
 
     const bool protect = prefer_tools_boundary &&
         (forced || (!candidates.empty() && target_cut == candidates.front()));
     PrefixHash victim_key{};
     bool has_victim = false;
     int slot = -1;
-    if ((int)entries_.size() >= cap_) {
+    // Captures in flight hold their slots and budget until they resolve.
+    int reserved_free_slots = 0;
+    size_t pending_bytes = 0;
+    for (const auto & active : active_reservations_) {
+        if (!active.has_victim) ++reserved_free_slots;
+        pending_bytes += active.bytes;
+    }
+    if ((int)entries_.size() + reserved_free_slots >= cap_) {
         // At capacity — reserve a slot without evicting yet. Prefix-aware: prefer
         // the oldest leaf so shared ancestor prefixes (reused by later branches)
         // stay resident. Skip protected tools pins when an unprotected leaf
@@ -734,20 +771,20 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         // Skip the in-flight restore source too, so the new snapshot lands
         // in a different slot (the http_server/agent-replay guards would
         // cancel an unlucky collision, leaving the restore point pinned).
-        slot = next_slot_;
         for (int step = 0; step < cap_; ++step) {
             const int candidate = (next_slot_ + step) % cap_;
             if (candidate == restore_source_slot && cap_ > 1) continue;
-            if (find_slot_entry(candidate) >= 0) continue;
+            if (find_slot_entry(candidate) >= 0 || slot_reserved(candidate)) continue;
             slot = candidate;
             break;
         }
+        if (slot < 0) return {};
         next_slot_ = (slot + 1) % cap_;
     }
 
+    size_t estimated_bytes = 0;
     if (max_resident_bytes_ > 0) {
-        const size_t estimated_bytes = estimate_bytes
-            ? estimate_bytes(target_cut) : 0;
+        estimated_bytes = estimate_bytes ? estimate_bytes(target_cut) : 0;
         // When the caller prunes after every commit, the entries this
         // capture supersedes (including its restore source) are freed as it
         // lands, so they do not compete with it for the budget. A failed
@@ -759,6 +796,7 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         if (prunes_superseded_) {
             for (const int i : superseded_entries(
                      prompt_ids.data(), (size_t)target_cut)) {
+                if (slot_reserved(entries_[(size_t)i].slot)) continue;
                 reclaimed[(size_t)i] = true;
                 reclaimed_bytes += entries_[(size_t)i].resident_bytes;
             }
@@ -770,8 +808,8 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
             if (victim_idx >= 0 && !reclaimed[(size_t)victim_idx]) {
                 freed += entries_[(size_t)victim_idx].resident_bytes;
             }
-            const size_t after_free = freed <= resident_bytes_
-                ? resident_bytes_ - freed : 0;
+            const size_t held = resident_bytes_ + pending_bytes;
+            const size_t after_free = freed <= held ? held - freed : 0;
             return after_free <= max_resident_bytes_ &&
                 estimated_bytes <= max_resident_bytes_ - after_free;
         };
@@ -789,15 +827,32 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
                 }
                 return true;
             };
+            const auto is_middle = [&](int candidate) {
+                if (is_leaf(candidate)) return false;
+                for (int i = 0; i < (int)entries_.size(); ++i) {
+                    if (i != candidate &&
+                        is_strict_prefix(entries_[(size_t)i].ids,
+                                         entries_[(size_t)candidate].ids)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            // A turn kept behind a conversation's newest snapshot first (see
+            // select_inline_evict_victim), then leaves, then the rest;
+            // unprotected entries before protected ones.
             int victim = -1;
-            for (int pass = 0; pass < 4 && victim < 0; ++pass) {
-                const bool require_leaf = pass < 2;
-                const bool allow_protected = pass == 1 || pass == 3;
+            for (int pass = 0; pass < 5 && victim < 0; ++pass) {
+                const bool require_middle = pass == 0;
+                const bool require_leaf = pass == 1 || pass == 2;
+                const bool allow_protected = pass == 2 || pass == 4;
                 for (int i = 0; i < (int)entries_.size(); ++i) {
                     if (restore_source_slot >= 0 &&
                         entries_[(size_t)i].slot == restore_source_slot)
                         continue;
+                    if (slot_reserved(entries_[(size_t)i].slot)) continue;
                     if (!fits(i)) continue;
+                    if (require_middle && !is_middle(i)) continue;
                     if (require_leaf && !is_leaf(i)) continue;
                     if (!allow_protected && entries_[(size_t)i].protect)
                         continue;
@@ -832,7 +887,8 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
 
     uint64_t id = next_inline_reservation_++;
     if (id == 0) id = next_inline_reservation_++;
-    active_inline_reservation_ = id;
+    active_reservations_.push_back(
+        {id, slot, key, victim_key, has_victim, estimated_bytes});
     return InlineReservation(
         this, id, slot, target_cut, victim_key, has_victim, protect);
 }
@@ -907,7 +963,7 @@ void PrefixCache::confirm_inline_snap(
         bool protect, size_t resident_bytes) {
     if (disabled_ || slot < 0 || target_cut <= 0 ||
         target_cut > (int)prompt_ids.size()) return;
-    if (active_inline_reservation_ != 0) {
+    if (!active_reservations_.empty()) {
         std::fprintf(stderr,
             "[pc] direct commit refused while a reservation is active\n");
         return;
@@ -924,24 +980,31 @@ void PrefixCache::invalidate_inline_snap(int slot) {
 }
 
 int PrefixCache::pick_evict_victim(int skip_index) const {
+    // Every slot can be held by captures in flight, with nothing committed yet.
+    if (entries_.empty()) return -1;
     std::vector<const std::vector<int32_t> *> ids_lru;
     std::vector<bool> protected_lru;
     ids_lru.reserve(entries_.size());
     protected_lru.reserve(entries_.size());
     for (const auto & entry : entries_) {
         ids_lru.push_back(&entry.ids);
-        protected_lru.push_back(entry.protect);
+        // A capture in flight writes over its victim's slot: never a second victim.
+        protected_lru.push_back(entry.protect || slot_reserved(entry.slot));
     }
-    return select_inline_evict_victim(ids_lru, &protected_lru, skip_index);
+    const int victim = select_inline_evict_victim(ids_lru, &protected_lru, skip_index);
+    return victim >= 0 && victim < (int)entries_.size() &&
+        slot_reserved(entries_[(size_t)victim].slot) ? -1 : victim;
 }
 
 std::vector<int> PrefixCache::superseded_entries(
         const int32_t * ids, size_t len) const {
-    // An agent conversation saves one snapshot per turn, each a strict
-    // prefix of the next. Restores only ever use the deepest one, so the
-    // intermediate turns are dead weight. Keep the shallowest ancestor (the
-    // system/tools head that a compacted or sibling conversation reuses)
-    // and any protected pin.
+    // A conversation saves one snapshot per turn, each a strict prefix of the
+    // next. Restores use the deepest one, or the one before it when a person
+    // edits their last message; the turns before those are dead weight. Keep
+    // the shallowest ancestor (the system/tools head that a compacted or
+    // sibling conversation reuses) and any protected pin. The previous turn
+    // is in the list: prune_superseded_ancestors keeps it while the budget
+    // holds it, and a capture's budget counts it as freed.
     std::vector<int> out;
     int shallowest = -1;
     for (int i = 0; i < (int)entries_.size(); ++i) {
@@ -957,20 +1020,38 @@ std::vector<int> PrefixCache::superseded_entries(
     return out;
 }
 
-std::vector<int> PrefixCache::prune_superseded_ancestors(int slot) {
+std::vector<int> PrefixCache::prune_superseded_ancestors(
+        int slot, std::vector<int> * pruned_tokens) {
     std::vector<int> pruned;
     if (disabled_) return pruned;
     const int newest = find_slot_entry(slot);
     if (newest < 0) return pruned;
     const auto & newest_ids = entries_[(size_t)newest].ids;
     const size_t newest_len = newest_ids.size();
-    const auto superseded = superseded_entries(newest_ids.data(), newest_len);
+    auto superseded = superseded_entries(newest_ids.data(), newest_len);
+    // Keep the previous turn, the deepest of them, if the budget holds it
+    // once the others are gone.
+    int previous = -1;
+    size_t others = 0;
+    for (const int i : superseded) {
+        if (previous < 0 ||
+            entries_[(size_t)i].ids.size() > entries_[(size_t)previous].ids.size()) {
+            previous = i;
+        }
+        others += entries_[(size_t)i].resident_bytes;
+    }
+    if (previous >= 0) others -= entries_[(size_t)previous].resident_bytes;
+    if (previous >= 0 &&
+        (max_resident_bytes_ == 0 || resident_bytes_ - others <= max_resident_bytes_)) {
+        superseded.erase(std::find(superseded.begin(), superseded.end(), previous));
+    }
     size_t freed = 0;
     // Erase from the back so earlier indices stay valid.
     for (auto it = superseded.rbegin(); it != superseded.rend(); ++it) {
         const auto & entry = entries_[(size_t)*it];
         freed += entry.resident_bytes;
         pruned.push_back(entry.slot);
+        if (pruned_tokens) pruned_tokens->push_back((int)entry.ids.size());
         erase_inline_entry(*it);
     }
     if (!pruned.empty()) {
@@ -1040,7 +1121,7 @@ void PrefixCache::mark_all_cleared() {
     resident_bytes_ = 0;
     resident_bytes_count_.store(0, std::memory_order_relaxed);
     next_slot_ = 0;
-    active_inline_reservation_ = 0;
+    active_reservations_.clear();
     std::fprintf(stderr, "[pc] all-cleared — dropped %d LRU entries\n", n);
 }
 

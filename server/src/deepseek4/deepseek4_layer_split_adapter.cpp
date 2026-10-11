@@ -613,7 +613,7 @@ bool DeepSeek4LayerSplitAdapter::prefill(
 bool DeepSeek4LayerSplitAdapter::decode_ar(
         int last_tok_in,
         int committed,
-        int n_gen,
+        ThinkingBudget & budget,
         const std::vector<int32_t> & history_prefix,
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
@@ -635,7 +635,7 @@ bool DeepSeek4LayerSplitAdapter::decode_ar(
     };
 
     return run_layer_split_ar_decode(
-        last_tok_in, committed, n_gen, vocab,
+        last_tok_in, committed, budget, vocab,
         prefill_last_logits_, sampler_, sampler_rng_,
         history_prefix,
         forward_one, is_eos, out_tokens, io);

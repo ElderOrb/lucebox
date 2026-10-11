@@ -1942,12 +1942,12 @@ if(LUCE_TESTS)
             target_link_libraries(test_ds4_mix_registry_teardown PRIVATE hip::host)
         endif()
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_budget_hook.cpp")
-        # Thinking-budget force-close rule. Header-only logic, so unlike the other ds4 tests
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_thinking_budget.cpp")
+        # Thinking-budget force-close rule (common/thinking_budget.h). Header-only logic, so
         # this needs no backend, no ggml and no CUDA/HIP link at all.
-        add_executable(test_ds4_budget_hook test/unit/test_ds4_budget_hook.cpp test/unit/test_unit_main.cpp)
-        target_include_directories(test_ds4_budget_hook PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
-        add_test(NAME ds4_budget_hook COMMAND test_ds4_budget_hook)
+        add_executable(test_thinking_budget test/unit/test_thinking_budget.cpp test/unit/test_unit_main.cpp)
+        target_include_directories(test_thinking_budget PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        add_test(NAME thinking_budget COMMAND test_thinking_budget)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_ds4_dmix_entry_validation.cpp")
         # Pure validation logic against the loader's shared rule function: no model, no GPU.
@@ -2612,6 +2612,7 @@ if(LUCE_TESTS)
         target_sources(test_feature_gate PRIVATE
             test/unit/test_backend_plan.cpp
             test/unit/test_launch_policy.cpp
+            test/unit/test_kfd_topology.cpp
             src/common/backend_plan.cpp
             src/common/feature_gate.cpp
             src/kv_quant.cpp

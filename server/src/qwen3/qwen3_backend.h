@@ -137,9 +137,9 @@ private:
                    int kv_offset = 0);
 
     // Autoregressive decode loop.
-    bool do_decode(int committed, int n_gen,
+    bool do_decode(int committed, ThinkingBudget & budget,
                    std::vector<int32_t> & out_tokens,
-                   const DaemonIO & io);
+                   const DaemonIO & io, bool & forced_close);
 
     std::vector<float> last_logits_;  // logits from last prefill chunk
 };

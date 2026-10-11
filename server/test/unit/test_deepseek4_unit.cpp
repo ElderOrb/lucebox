@@ -2954,8 +2954,9 @@ static void test_layer_split_sampler_uses_prompt_history() {
     const std::vector<int32_t> prompt_history = {1};
     std::vector<int32_t> out_tokens;
     std::mt19937_64 rng(42);
+    ThinkingBudget budget(nullptr, 1);
     const bool ok = run_layer_split_ar_decode(
-        /*last_tok=*/1, /*committed=*/1, /*n_gen=*/1, /*vocab=*/3,
+        /*last_tok=*/1, /*committed=*/1, budget, /*vocab=*/3,
         logits, sampler, rng, prompt_history,
         [](const std::vector<int32_t> &, int, int &,
            std::vector<float> *) { return false; },
@@ -2979,8 +2980,9 @@ static void test_layer_split_sampler_appends_generated_tokens() {
     const std::vector<float> logits = {0.0f, 4.0f, 3.0f};
     std::vector<int32_t> out_tokens;
     std::mt19937_64 rng(42);
+    ThinkingBudget budget(nullptr, 2);
     const bool ok = run_layer_split_ar_decode(
-        /*last_tok=*/0, /*committed=*/0, /*n_gen=*/2, /*vocab=*/3,
+        /*last_tok=*/0, /*committed=*/0, budget, /*vocab=*/3,
         logits, sampler, rng, /*history_prefix=*/{},
         [&logits](const std::vector<int32_t> &, int, int &,
                   std::vector<float> * logits_out) {
@@ -2998,6 +3000,117 @@ static void test_layer_split_sampler_appends_generated_tokens() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_layer_split_thinking_budget_commits_replacements() {
+    std::fprintf(stderr, "  test_layer_split_thinking_budget_commits_replacements ...");
+    BudgetHook hook;
+    hook.close_token_ids = {5, 6};
+    hook.marker_token_ids = {6};
+    hook.hard_limit_remaining = 4;
+    ThinkingBudget budget(hook, 7);
+    std::vector<int32_t> out, forwarded, positions;
+    std::mt19937_64 rng(42);
+    const bool ok = run_layer_split_ar_decode(
+        /*last_tok=*/1, /*committed=*/100, budget, /*vocab=*/7,
+        {}, SamplerCfg{}, rng, {},
+        [&](const std::vector<int32_t> & tokens, int pos, int & next,
+            std::vector<float> *) {
+            forwarded.push_back(tokens.front());
+            positions.push_back(pos);
+            next = 2;
+            return true;
+        },
+        [](int) { return false; }, out, DaemonIO{});
+    TEST_ASSERT(ok);
+    TEST_ASSERT(out == std::vector<int32_t>({1, 2, 2, 5, 6, 2, 2}));
+    TEST_ASSERT(forwarded == std::vector<int32_t>({1, 2, 2, 5, 6, 2}));
+    TEST_ASSERT(positions == std::vector<int32_t>({101, 102, 103, 104, 105, 106}));
+    TEST_ASSERT(budget.forced_close());
+    TEST_ASSERT(budget.remaining() == 0);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_layer_split_thinking_budget_natural_seed_and_cancellation() {
+    std::fprintf(stderr, "  test_layer_split_thinking_budget_natural_seed_and_cancellation ...");
+    BudgetHook hook;
+    hook.close_token_ids = {5, 6};
+    hook.marker_token_ids = {6};
+    hook.hard_limit_remaining = 4;
+    std::mt19937_64 rng(42);
+    std::vector<int32_t> out;
+    ThinkingBudget natural(hook, 5);
+    const bool ok = run_layer_split_ar_decode(
+        /*last_tok=*/6, /*committed=*/100, natural, /*vocab=*/7,
+        {}, SamplerCfg{}, rng, {},
+        [](const std::vector<int32_t> &, int, int & next,
+           std::vector<float> *) { next = 2; return true; },
+        [](int) { return false; }, out, DaemonIO{});
+    TEST_ASSERT(ok);
+    TEST_ASSERT(out == std::vector<int32_t>({6, 2, 2, 2, 2}));
+    TEST_ASSERT(natural.naturally_closed());
+    TEST_ASSERT(!natural.forced_close());
+    TEST_ASSERT(natural.remaining() == 0);
+
+    ThinkingBudget cancelled(hook, 4);
+    DaemonIO io;
+    io.on_token = [](int32_t) { return false; };
+    int forwards = 0;
+    out.clear();
+    const bool stopped = run_layer_split_ar_decode(
+        /*last_tok=*/1, /*committed=*/100, cancelled, /*vocab=*/7,
+        {}, SamplerCfg{}, rng, {},
+        [&](const std::vector<int32_t> &, int, int &, std::vector<float> *) {
+            ++forwards;
+            return false;
+        },
+        [](int) { return false; }, out, io);
+    TEST_ASSERT(stopped);
+    TEST_ASSERT(out == std::vector<int32_t>({5}));
+    TEST_ASSERT(cancelled.forced_close());
+    TEST_ASSERT(cancelled.remaining() == 3);
+    TEST_ASSERT(forwards == 0);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_layer_split_thinking_budget_external_cancellation() {
+    std::fprintf(stderr, "  test_layer_split_thinking_budget_external_cancellation ...");
+    for (const bool cancel_seed : {true, false}) {
+        BudgetHook hook;
+        hook.close_token_ids = {5, 6};
+        hook.marker_token_ids = {6};
+        hook.hard_limit_remaining = 4;
+        ThinkingBudget budget(hook, cancel_seed ? 4 : 5);
+        std::mt19937_64 rng(42);
+        bool cancel = cancel_seed;
+        std::vector<int32_t> out, delivered, forwarded;
+        DaemonIO io;
+        io.should_cancel = [&] { return cancel; };
+        io.on_token = [&](int32_t token) {
+            delivered.push_back(token);
+            return true;
+        };
+        const bool ok = run_layer_split_ar_decode(
+            /*last_tok=*/1, /*committed=*/100, budget, /*vocab=*/7,
+            {}, SamplerCfg{}, rng, {},
+            [&](const std::vector<int32_t> & tokens, int, int & next,
+                std::vector<float> *) {
+                forwarded.push_back(tokens.front());
+                next = 2;
+                cancel = true;
+                return true;
+            },
+            [](int) { return false; }, out, io);
+        const std::vector<int32_t> expected = cancel_seed
+            ? std::vector<int32_t>{} : std::vector<int32_t>{1};
+        TEST_ASSERT(ok);
+        TEST_ASSERT(out == expected);
+        TEST_ASSERT(delivered == expected);
+        TEST_ASSERT(forwarded == expected);
+        TEST_ASSERT(budget.remaining() == 4);
+        TEST_ASSERT(!budget.forced_close());
+    }
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 class TestLayerSplitHistoryAdapter final : public LayerSplitAdapter {
 public:
     const char * name() const override { return "test-history"; }
@@ -3010,12 +3123,12 @@ public:
         last_tok = 2;
         return true;
     }
-    bool decode_ar(int, int, int,
+    bool decode_ar(int, int, ThinkingBudget & budget,
                    const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO &) override {
         decoded_history = history_prefix;
-        out_tokens.push_back(2);
+        out_tokens.push_back(budget.apply(2).token);
         return true;
     }
     bool supports_cpu_sampling() const override { return true; }
@@ -3076,12 +3189,13 @@ static void test_backend_sampling_penalizes_prompt_history() {
         backend.sampler_ = sampler;
         emitted.clear();
         std::vector<int32_t> generated;
+        ThinkingBudget budget(nullptr, 1);
         const bool ok = backend.do_decode(
             /*committed=*/1,
             /*n_gen=*/1,
             /*history_prefix=*/{1},
             generated,
-            io);
+            io, budget);
         TEST_ASSERT(ok);
         TEST_ASSERT(emitted == generated);
         return generated.empty() ? int32_t{-1} : generated.front();
@@ -5175,7 +5289,8 @@ static void test_adapter_guard_paths() {
     adapter.remote_target_shard_.active_ = false;
 
     std::vector<int32_t> out_tokens;
-    TEST_ASSERT(!adapter.decode_ar(1, 0, 1, {}, out_tokens, DaemonIO{}));
+    ThinkingBudget budget(nullptr, 1);
+    TEST_ASSERT(!adapter.decode_ar(1, 0, budget, {}, out_tokens, DaemonIO{}));
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -9234,6 +9349,9 @@ int main(int argc, char ** argv) {
     test_layer_split_request_propagates_sampler();
     test_layer_split_sampler_uses_prompt_history();
     test_layer_split_sampler_appends_generated_tokens();
+    test_layer_split_thinking_budget_commits_replacements();
+    test_layer_split_thinking_budget_natural_seed_and_cancellation();
+    test_layer_split_thinking_budget_external_cancellation();
     test_layer_split_restore_preserves_full_sampling_history();
     test_backend_sampling_penalizes_prompt_history();
     test_loader_rejects_missing_required_metadata(backend);

@@ -62,10 +62,14 @@
 #include <cstring>
 #include <random>
 #include <stdexcept>
+#include <map>
 #include <string>
 #include <unordered_set>
 #include <type_traits>
+#include <array>
+#include <mutex>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include <limits>
 #if !defined(_WIN32)
@@ -304,6 +308,27 @@ TEST_CASE(ServerUnitFixture, test_pflash_scorer_uses_user_query_before_chat_suff
     TEST_ASSERT(window.tokens == 8);
     TEST_ASSERT(window.end == 10);
     TEST_ASSERT((int)rendered.size() - window.end == 10);
+}
+
+// Claude Code sends its environment as a system message after the user's
+// first one; a template that takes a system message only first gets it as a
+// user turn in place, and one that takes it anywhere keeps it.
+TEST_CASE(ServerUnitFixture, test_template_gets_late_system_message_as_user_turn) {
+    const std::string strict =
+        "{%- for m in messages -%}"
+        "{%- if m.role == 'system' and not loop.first -%}"
+        "{{- raise_exception('System message must be at the beginning.') -}}"
+        "{%- endif -%}"
+        "[{{ m.role }}:{{ m.content }}]"
+        "{%- endfor -%}";
+    const std::string permissive =
+        "{%- for m in messages -%}[{{ m.role }}:{{ m.content }}]{%- endfor -%}";
+    const std::vector<ChatMessage> msgs = {
+        {"system", "agent"}, {"user", "hi"}, {"system", "env"}, {"developer", "brief"}};
+    TEST_ASSERT(render_chat_template_jinja(strict, msgs, "", "", false, false, "") ==
+                "[system:agent][user:hi][user:env][user:brief]");
+    TEST_ASSERT(render_chat_template_jinja(permissive, msgs, "", "", false, false, "") ==
+                "[system:agent][user:hi][system:env][developer:brief]");
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_scorer_accepts_responses_string_input) {
@@ -2748,7 +2773,8 @@ TEST_CASE(ServerUnitFixture, test_emitter_funcname_tool_buffer_detection) {
         TEST_ASSERT(args["path"] == "/tmp/tool-input.md");
     }
     TEST_ASSERT(em.accumulated_text().find("<funcname>") == std::string::npos);
-    TEST_ASSERT(em.accumulated_text() == "\n\n");
+    // The newlines before the call are not reply text.
+    TEST_ASSERT(em.accumulated_text().empty());
     TEST_ASSERT(wire.find("\"finish_reason\":\"tool_calls\"") !=
                 std::string::npos);
 }
@@ -2937,6 +2963,227 @@ TEST_CASE(ServerUnitFixture, test_emitter_responses_bare_function_tool_call) {
     }
     TEST_ASSERT(finish_str.find("\"type\":\"function_call\"") != std::string::npos);
     TEST_ASSERT(finish_str.find("response.function_call_arguments.done") != std::string::npos);
+}
+
+// The OpenAI Responses stream contract for a tool call, as clients parse it
+// (Pi's openai-responses provider builds a call only from an item that
+// response.output_item.added opened): the message item is closed at
+// output_index 0, then the function_call item is added, its arguments
+// streamed and done, the item done, and response.completed lists both items.
+namespace {
+// One streamed Responses turn: the events' data payloads, in order.
+struct ResponsesTurn {
+    std::vector<json> events;
+    json completed_output;
+    std::vector<ToolCall> calls;
+};
+
+json responses_turn_tools() {
+    return json::array({
+        {{"type", "function"}, {"name", "ls"},
+         {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}}},
+        {{"type", "function"}, {"name", "read"},
+         {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}}}});
+}
+
+ResponsesTurn stream_responses_turn(const std::string & generated, ToolMemory * memory) {
+    const json tools = responses_turn_tools();
+    SseEmitter em(ApiFormat::RESPONSES, "resp_rt", "test-model", 10, tools, memory);
+    std::vector<std::string> raw = em.emit_start();
+    for (const auto & e : em.emit_token(generated)) raw.push_back(e);
+    for (const auto & e : em.emit_finish(12)) raw.push_back(e);
+    ResponsesTurn turn;
+    for (const auto & e : raw) {
+        const size_t at = e.find("data: ");
+        if (at == std::string::npos) continue;
+        const size_t end = e.find('\n', at);
+        turn.events.push_back(json::parse(e.substr(at + 6, end - at - 6)));
+    }
+    turn.completed_output = turn.events.back()["response"]["output"];
+    turn.calls = em.tool_calls();
+    return turn;
+}
+
+// A client replaying the turn (Pi, OMP): the completed output items as
+// input, then one function_call_output per call.
+json responses_replay(const json & output) {
+    json input = json::array({{{"role", "user"}, {"content", "go"}}});
+    for (const auto & item : output) input.push_back(item);
+    for (const auto & item : output) {
+        if (item["type"] == "function_call") {
+            input.push_back({{"type", "function_call_output"}, {"call_id", item["call_id"]}, {"output", "ok"}});
+        }
+    }
+    return input;
+}
+
+size_t count_of(const std::string & hay, const std::string & needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + needle.size())) ++n;
+    return n;
+}
+
+}  // namespace
+
+// Round trips: the completed turn, replayed, normalises to ONE assistant
+// turn -- the remembered raw generation once on a tool-memory hit, the prose
+// plus the calls' native rendering on a miss -- with no duplicated prose and
+// no extra assistant boundary.
+TEST_CASE(ServerUnitFixture, test_responses_turn_round_trip_one_assistant_turn) {
+    const std::string call_ls = "<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+    const std::string call_read = "<tool_call>\n<function=read>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>";
+    struct Case { std::string generated; std::string prose; size_t calls; };
+    const std::vector<Case> cases = {
+        {call_ls, "", 1},                                   // empty message
+        {"Listing.\n" + call_ls, "Listing.", 1},             // text + tool
+        {"Two.\n" + call_ls + "\n" + call_read, "Two.", 2}, // text + two calls
+    };
+    for (const auto & c : cases) {
+        for (const bool hit : {true, false}) {
+            ToolMemory memory;
+            const auto turn = stream_responses_turn(c.generated, hit ? &memory : nullptr);
+            TEST_ASSERT(turn.calls.size() == c.calls);
+            ToolMemory replay_memory;
+            ToolMemory & used = hit ? memory : replay_memory;
+            const auto chat = normalize_chat_messages(
+                responses_replay(turn.completed_output), ApiFormat::RESPONSES, used);
+            TEST_ASSERT(chat.size() == 2 + c.calls);     // user, ONE assistant, the tool results
+            if (chat.size() != 2 + c.calls) continue;
+            TEST_ASSERT(chat[0].role == "user");
+            TEST_ASSERT(chat[1].role == "assistant");
+            for (size_t k = 0; k < c.calls; ++k) TEST_ASSERT(chat[2 + k].role == "tool");
+            TEST_ASSERT(chat[1].tool_calls.size() == c.calls);
+            TEST_ASSERT(chat[1].tool_calls_replayed == hit);
+            const std::string & content = chat[1].content;
+            if (hit) {
+                TEST_ASSERT(content == c.generated);    // the remembered raw turn, exactly once
+            } else {
+                TEST_ASSERT(chat[1].tool_calls.at(0).name == "ls");
+                TEST_ASSERT(chat[1].tool_calls.at(0).arguments == json({{"path", "."}}));
+                const std::string rendered = render_chat_template(
+                    {chat[1]}, ChatFormat::QWEN3, false);
+                TEST_ASSERT(count_of(rendered, "<tool_call>") == c.calls);
+                if (!c.prose.empty()) {
+                    TEST_ASSERT(content.rfind(c.prose, 0) == 0);
+                    TEST_ASSERT(count_of(content, c.prose) == 1);
+                } else {
+                    TEST_ASSERT(content.empty());
+                }
+            }
+        }
+    }
+}
+
+// Several calls: unique, ordered output indices; the arguments of each call
+// equal across delta, arguments done, item done and the completed output.
+TEST_CASE(ServerUnitFixture, test_responses_multiple_calls_indices_and_arguments) {
+    const auto turn = stream_responses_turn(
+        "Two.\n<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=read>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>",
+        nullptr);
+    TEST_ASSERT(turn.calls.size() == 2);
+    std::vector<int> added, done;
+    std::map<int, std::string> delta, args_done, item_done;
+    for (const auto & e : turn.events) {
+        const std::string type = e.value("type", "");
+        const int index = e.value("output_index", -1);
+        if (type == "response.output_item.added") added.push_back(index);
+        if (type == "response.output_item.done") {
+            done.push_back(index);
+            if (e["item"]["type"] == "function_call") item_done[index] = e["item"]["arguments"];
+        }
+        if (type == "response.function_call_arguments.delta") delta[index] += e["delta"].get<std::string>();
+        if (type == "response.function_call_arguments.done") args_done[index] = e["arguments"];
+    }
+    TEST_ASSERT(added == std::vector<int>({0, 1, 2}));
+    TEST_ASSERT(done == std::vector<int>({0, 1, 2}));
+    const json & out = turn.completed_output;
+    TEST_ASSERT(out.size() == 3);
+    for (int index : {1, 2}) {
+        TEST_ASSERT(delta[index] == args_done[index]);
+        TEST_ASSERT(args_done[index] == item_done[index]);
+        TEST_ASSERT(item_done[index] == out[(size_t) index]["arguments"].get<std::string>());
+    }
+    TEST_ASSERT(out[1]["id"] != out[2]["id"]);
+}
+
+TEST_CASE(ServerUnitFixture, test_responses_replay_preserves_turn_boundaries) {
+    ToolMemory memory;
+    const json call = {{"type", "function_call"}, {"call_id", "call_boundary"},
+                       {"name", "ls"}, {"arguments", R"({"path":"."})"}};
+    const json result = {{"type", "function_call_output"},
+                         {"call_id", "call_boundary"}, {"output", "ok"}};
+    const json input = json::array({
+        {{"role", "assistant"}, {"content", "Earlier answer."}},
+        {{"role", "user"}, {"content", "List files."}},
+        {{"type", "message"}, {"role", "assistant"},
+         {"content", json::array({{{"type", "output_text"}, {"text", "Listing."}}})}},
+        call, result,
+        {{"role", "assistant"}, {"content", "Finished."}},
+    });
+    const auto chat = normalize_chat_messages(input, ApiFormat::RESPONSES, memory);
+    TEST_ASSERT(chat.size() == 5);
+    TEST_ASSERT(chat.at(0).role == "assistant" && chat.at(0).content == "Earlier answer.");
+    TEST_ASSERT(chat.at(1).role == "user" && chat.at(1).content == "List files.");
+    TEST_ASSERT(chat.at(2).role == "assistant");
+    TEST_ASSERT(chat.at(2).content == "Listing.");
+    TEST_ASSERT(chat.at(2).tool_calls.size() == 1);
+    TEST_ASSERT(chat.at(2).tool_calls.at(0).name == "ls");
+    TEST_ASSERT(chat.at(2).tool_calls.at(0).arguments == json({{"path", "."}}));
+    TEST_ASSERT(chat.at(3).role == "tool" && chat.at(3).content == "ok");
+    TEST_ASSERT(chat.at(3).tool_call_id == "call_boundary");
+    TEST_ASSERT(chat.at(4).role == "assistant" && chat.at(4).content == "Finished.");
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_responses_function_call_item_lifecycle) {
+    json tools = json::array({{
+        {"type", "function"}, {"name", "ls"},
+        {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}}
+    }});
+    SseEmitter em(ApiFormat::RESPONSES, "resp_test_002", "test-model", 10, tools, nullptr);
+    std::vector<std::string> events = em.emit_start();
+    for (const auto & e : em.emit_token("Listing.\n<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n"))
+        events.push_back(e);
+    for (const auto & e : em.emit_token("</function>\n</tool_call>")) events.push_back(e);
+    for (const auto & e : em.emit_finish(12)) events.push_back(e);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    // Parse the SSE "data:" payloads in order.
+    std::vector<json> data;
+    for (const auto & e : events) {
+        const size_t at = e.find("data: ");
+        if (at == std::string::npos) continue;
+        const size_t end = e.find('\n', at);
+        data.push_back(json::parse(e.substr(at + 6, end - at - 6)));
+    }
+    std::vector<std::string> types;
+    for (const auto & d : data) types.push_back(d.value("type", ""));
+    const auto pos = [&](const std::string & type, int output_index) {
+        for (size_t i = 0; i < data.size(); ++i) {
+            if (types[i] == type && data[i].value("output_index", -1) == output_index) return (int) i;
+        }
+        return -1;
+    };
+    const int msg_added = pos("response.output_item.added", 0);
+    const int msg_done = pos("response.output_item.done", 0);
+    const int fc_added = pos("response.output_item.added", 1);
+    const int fc_delta = pos("response.function_call_arguments.delta", 1);
+    const int fc_args_done = pos("response.function_call_arguments.done", 1);
+    const int fc_done = pos("response.output_item.done", 1);
+    TEST_ASSERT(msg_added >= 0 && msg_done > msg_added);
+    TEST_ASSERT(fc_added > msg_done && fc_delta > fc_added && fc_args_done > fc_delta && fc_done > fc_args_done);
+    if (fc_added >= 0 && fc_done >= 0) {
+        const json & added = data[(size_t) fc_added]["item"];
+        TEST_ASSERT(added["type"] == "function_call" && added["name"] == "ls" && added["status"] == "in_progress");
+        const json & done = data[(size_t) fc_done]["item"];
+        TEST_ASSERT(done["status"] == "completed" && done["call_id"] == added["call_id"]);
+        TEST_ASSERT(json::parse(done["arguments"].get<std::string>())["path"] == ".");
+        TEST_ASSERT(data[(size_t) fc_delta]["item_id"] == added["id"]);
+    }
+    const json & completed = data.back();
+    TEST_ASSERT(completed["type"] == "response.completed");
+    const json & output = completed["response"]["output"];
+    TEST_ASSERT(output.size() == 2 && output[0]["type"] == "message" && output[1]["type"] == "function_call");
+    TEST_ASSERT(output[0]["content"][0]["text"] == "Listing.\n");
 }
 
 TEST_CASE(ServerUnitFixture, test_emitter_streaming_openai_has_done) {
@@ -3173,17 +3420,18 @@ TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     };
     TEST_ASSERT(find_all_boundaries(prompt, markers) ==
                 std::vector<int>({3, 5, 8, 10}));
-    // The default snapshot cut stays before the current user turn.
+    // The snapshot cut is the end of the last message, which the next turn
+    // extends.
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    find_all_boundaries(prompt, markers)) == 8);
+                    find_all_boundaries(prompt, markers)) == 10);
 
-    // A first turn snapshots its system text, so a new session on the same
+    // A first turn prefers its system text, so a new session on the same
     // system prompt restores it instead of prefilling it again.
     const std::vector<int32_t> first_turn = {1, 100, 3, 101, 4};
     TEST_ASSERT(find_all_boundaries(first_turn, markers) ==
                 std::vector<int>({3, 5}));
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    find_all_boundaries(first_turn, markers)) == 3);
+                    find_all_boundaries(first_turn, markers), 0, true) == 3);
     // Tool-heavy requests pin the same system head.
     TEST_ASSERT(select_inline_snapshot_boundary(
                     find_all_boundaries(prompt, markers), 0, true) == 3);
@@ -3302,13 +3550,17 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_long_first_turn_snapshots_whole_p
         r.cancel();
     }
 
-    // A request without tools never pinned the head; it keeps its usual cut
-    // (the start of the last message) rather than a whole-prompt snapshot.
+    // A first turn without tools saves the same way: its long message whole,
+    // and the head when the message is short.
     {
         PrefixCache cache(2, tokenizer);
         auto r = cache.reserve_inline_snap(
             short_head, /*restored_prefix_len=*/0,
             /*prefer_tools_boundary=*/false);
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.target_cut() == (int) short_head.size());
+        r.cancel();
+        r = cache.reserve_inline_snap(short_tail);
         TEST_ASSERT(r.active());
         TEST_ASSERT(r.target_cut() == 3);
         r.cancel();
@@ -3390,10 +3642,12 @@ TEST_CASE(ServerUnitFixture, test_restore_invalidation_preserves_pending_pin) {
         /*prefer_tools_boundary=*/true, /*forced_cut=*/2);
     TEST_ASSERT(prepared.slot() == 0);
     TEST_ASSERT(prepared.target_cut() == 2);
-    auto blocked = cache.reserve_inline_snap(
+    // Another request's capture can run beside it, never in its slot.
+    auto beside = cache.reserve_inline_snap(
         next, /*restored_prefix_len=*/0,
         /*prefer_tools_boundary=*/false, /*forced_cut=*/2);
-    TEST_ASSERT(!blocked.active());
+    TEST_ASSERT(beside.active() && beside.slot() == 1);
+    beside.cancel();
     cache.invalidate_inline_snap(/*slot=*/1);
     TEST_ASSERT(prepared.commit(pinned));
 
@@ -3797,26 +4051,15 @@ TEST_CASE(ServerUnitFixture, test_find_boundaries_clean_prompt_unchanged) {
 
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_advances_past_restore) {
     const std::vector<int> boundaries = {100, 240, 380, 520};
-    // Second-to-last is the boundary before the current user turn.
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries) == 380);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 240) == 380);
+    // The last boundary, the end of the last message: a person's follow-up
+    // and an agent's next step after its tool results both extend it.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries) == 520);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380) == 520);
     // Do not reserve a snapshot when the restore already covers that point.
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380) == 0);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 500) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 520) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 600) == 0);
     TEST_ASSERT(select_inline_snapshot_boundary({}, 0) == 0);
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 0) == 100);
-}
-
-TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_includes_trailing_tool_result) {
-    const std::vector<int> boundaries = {100, 240, 380, 520};
-    // A prompt ending in tool results is snapshotted through them, up to
-    // the generation prompt, because the next agent turn only appends.
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 0, false, true) == 520);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380, false, true) == 520);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 520, false, true) == 0);
-    // The cold tools head still comes first.
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 0, true, true) == 100);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true, true) == 520);
 }
 
 // Families with a trailing role marker can snapshot through the tool results.
@@ -3869,43 +4112,73 @@ TEST_CASE(ServerUnitFixture, test_spaced_restore_points) {
     // Prefix-stable: a shorter prompt keeps the longer prompt's points up to its end.
     TEST_ASSERT((spaced_restore_points({300, 900, 1500, 2600}, 2048) == std::vector<int>{300, 2600}));
 
-    // A capture moves down to a spaced point, and none is reserved when that adds no prefix.
+    // A capture is the end of the last message, the point the next turn
+    // extends; with spacing, a cut short of it moves down to a spaced point,
+    // and none is reserved when that adds no prefix.
     const std::string path = write_deepseek_marker_tokenizer_fixture();
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
     PrefixCache cache(4, tokenizer);
     const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102, 3};
     const std::vector<int> boundaries = find_all_boundaries(prompt, cache.chat_markers());
-    TEST_ASSERT(boundaries.size() >= 2);
+    TEST_ASSERT(boundaries.size() >= 3);
     const int head = boundaries.front();
-    auto plain = cache.reserve_inline_snap(prompt, 0, false, 0, -1, {}, /*include_last_message=*/true);
-    TEST_ASSERT(plain.active() && plain.target_cut() > head);
+    auto plain = cache.reserve_inline_snap(prompt);
+    TEST_ASSERT(plain.active() && plain.target_cut() == boundaries.back());
     plain.cancel();
-    // A spacing wider than the prompt keeps only the head.
-    auto moved = cache.reserve_inline_snap(prompt, 0, false, 0, -1, {}, true, 0, /*restore_point_spacing=*/64);
+    // A spacing wider than the whole prompt still keeps the last message's end.
+    auto last = cache.reserve_inline_snap(prompt, 0, false, 0, -1, {}, 0, /*restore_point_spacing=*/64);
+    TEST_ASSERT(last.active() && last.target_cut() == boundaries.back());
+    last.cancel();
+    // A pinned cut in the middle moves down to the head, the only spaced point.
+    auto moved = cache.reserve_inline_snap(prompt, 0, false, /*forced_cut=*/boundaries[1], -1, {}, 0, 64);
     TEST_ASSERT(moved.active() && moved.target_cut() == head);
     moved.cancel();
-    auto none = cache.reserve_inline_snap(prompt, head, false, 0, -1, {}, true, 0, 64);
+    auto none = cache.reserve_inline_snap(prompt, boundaries.back(), false, 0, -1, {}, 0, 64);
     TEST_ASSERT(!none.active());
+}
+
+// Concurrent requests each capture their own prefix at once: a capture in
+// flight holds its slot and bytes, and the same prefix is not captured twice.
+TEST_CASE(ServerUnitFixture, test_inline_captures_in_flight_hold_their_slots) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(2, tokenizer, /*max_resident_bytes=*/1000);
+    const std::vector<int32_t> a = {1, 100, 3, 101, 4};
+    const std::vector<int32_t> b = {1, 200, 3, 201, 4};
+    const std::vector<int32_t> c = {1, 300, 3, 301, 4};
+    const auto bytes = [](int) { return (size_t)400; };
+    auto first = cache.reserve_inline_snap(a, 0, false, 0, -1, bytes);
+    auto twin = cache.reserve_inline_snap(a, 0, false, 0, -1, bytes);
+    auto second = cache.reserve_inline_snap(b, 0, false, 0, -1, bytes);
+    TEST_ASSERT(first.active() && !twin.active() && second.active());
+    TEST_ASSERT(first.slot() != second.slot());
+    // Both slots are held, and a third capture would not fit the budget anyway.
+    auto third = cache.reserve_inline_snap(c, 0, false, 0, -1, bytes);
+    TEST_ASSERT(!third.active());
+    TEST_ASSERT(second.commit(b, 400));
+    TEST_ASSERT(first.commit(a, 400));
+    TEST_ASSERT(cache.lookup_candidate({1, 100, 3, 101, 4, 9}, 5).second > 0);
+    TEST_ASSERT(cache.lookup_candidate({1, 200, 3, 201, 4, 9}, 5).second > 0);
+    unlink(path.c_str());
 }
 
 TEST_CASE(ServerUnitFixture, test_inline_snapshot_skips_unreachable_cuts) {
     const std::vector<int> boundaries = {266, 700, 1300, 1800};
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    boundaries, 0, true, false, /*reachable_from=*/512) == 1300);
-    TEST_ASSERT(select_inline_snapshot_boundary(
-                    boundaries, 0, true, true, 512) == 1800);
+                    boundaries, 0, true, /*reachable_from=*/512) == 1800);
     // A reachable head is still pinned first.
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    boundaries, 0, true, false, 1) == 266);
+                    boundaries, 0, true, 1) == 266);
     // Nothing reachable yet: no reservation, prefill stays cold.
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    {100, 300}, 0, true, true, 512) == 0);
+                    {100, 300}, 0, true, 512) == 0);
     // Restored at 1024 with 512-token chunks: 1300 lies in the first chunk.
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    boundaries, 1024, false, false, 1024 + 512) == 0);
+                    {266, 1300}, 1024, false, 1024 + 512) == 0);
     TEST_ASSERT(select_inline_snapshot_boundary(
-                    boundaries, 1024, false, true, 1024 + 512) == 1800);
+                    boundaries, 1024, false, 1024 + 512) == 1800);
     // A PPP pin the backend cannot save is not forced.
     TEST_ASSERT(!should_force_inline_snapshot_boundary(
                     boundaries, 2000, 0, true, 266, 512));
@@ -3920,7 +4193,7 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_skips_unreachable_cuts) {
     const std::vector<int32_t> prompt = {1, 100, 3, 101, 4, 102, 3};
     auto capture = cache.reserve_inline_snap(
         prompt, 0, /*prefer_tools_boundary=*/true, /*forced_cut=*/2, -1, {},
-        /*include_last_message=*/false, /*reachable_from=*/3);
+        /*reachable_from=*/3);
     TEST_ASSERT(capture.active());
     TEST_ASSERT(capture.target_cut() > 2);
     capture.cancel();
@@ -3941,9 +4214,9 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_prefers_tools_boundary_until_r
     const std::vector<int> boundaries = {100, 240, 380, 520};
     // Cold tool-heavy: pin system+tools head (first marker), not deepen cut.
     TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 0, true) == 100);
-    // After tools head is restored, deepen to second-to-last.
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 380);
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380, true) == 0);
+    // After tools head is restored, deepen to the end of the last message.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 520);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 520, true) == 0);
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 0, true) == 100);
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 100, true) == 0);
 }
@@ -3959,7 +4232,7 @@ TEST_CASE(ServerUnitFixture, test_forced_tools_pin_yields_to_deepen_after_restor
     // later conversation boundary instead of forcing the nearby pin again.
     TEST_ASSERT(!should_force_inline_snapshot_boundary(
         boundaries, 600, 100, true, 110));
-    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 380);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 520);
 
     // Without tools preference, a still-unrestored forced cut retains its
     // original behavior.
@@ -4150,10 +4423,17 @@ TEST_CASE(ServerUnitFixture, test_evict_single_is_zero) {
 }
 
 TEST_CASE(ServerUnitFixture, test_evict_chain_keeps_ancestors) {
-    // Oldest-first chain: [s] < [s,a] < [s,a,b]. Only the longest is a leaf, so
-    // the short shared ancestors are kept and the victim is the deepest entry.
+    // Oldest-first chain: [s] < [s,a] < [s,a,b]. [s,a] sits between the head
+    // and the newest turn, kept only for an edit of the last message: it goes
+    // first. Then the leaf, and the shared head last.
     std::vector<std::vector<int32_t>> ids = {{9}, {9, 1}, {9, 1, 2}};
-    TEST_ASSERT(select_inline_evict_victim(ids) == 2);
+    TEST_ASSERT(select_inline_evict_victim(ids) == 1);
+    ids = {{9}, {9, 1, 2}};
+    TEST_ASSERT(select_inline_evict_victim(ids) == 1);
+    // A protected turn in between stays; the leaf goes.
+    ids = {{9}, {9, 1}, {9, 1, 2}};
+    std::vector<bool> protect = {false, true, false};
+    TEST_ASSERT(select_inline_evict_victim(ids, &protect) == 2);
 }
 
 TEST_CASE(ServerUnitFixture, test_evict_unrelated_falls_back_to_lru) {
@@ -4259,11 +4539,12 @@ TEST_CASE(ServerUnitFixture, test_slide_restore_source_never_evicted) {
         const int victim = select_inline_evict_victim(ids, nullptr, skip);
         TEST_ASSERT(victim >= 0 && victim != skip);
     }
-    // Linear chain whose only leaf is the restore source: evict the
-    // shallowest unprotected ancestor instead of cancelling everything.
-    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 3) == 0);
-    // With a free leaf the usual leaf preference still applies.
-    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 0) == 3);
+    // Linear chain whose only leaf is the restore source: evict a turn kept
+    // between the head and the newest instead of cancelling everything.
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 3) == 1);
+    // Otherwise the shallowest unprotected ancestor.
+    ids = {{9}, {9, 1}};
+    TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 1) == 0);
 }
 
 // (c) The protected tools pin is never evicted, even when it is the
@@ -4437,25 +4718,40 @@ TEST_CASE(ServerUnitFixture, test_prune_superseded_ancestors) {
     cache.confirm_inline_snap(3, (int)sibling.size(), sibling, false, 20);
     cache.confirm_inline_snap(4, (int)t3.size(), t3, false, 40);
 
+    // The head and the previous turn stay; the turn before that goes.
     auto pruned = cache.prune_superseded_ancestors(4);
-    std::sort(pruned.begin(), pruned.end());
-    TEST_ASSERT(pruned == std::vector<int>({1, 2}));
-    TEST_ASSERT(cache.stats().in_use == 3);
-    TEST_ASSERT(cache.stats().resident_bytes == 70);
+    TEST_ASSERT(pruned == std::vector<int>({1}));
+    TEST_ASSERT(cache.stats().in_use == 4);
+    TEST_ASSERT(cache.stats().resident_bytes == 100);
     TEST_ASSERT(cache.lookup(t3).first == 4);
     TEST_ASSERT(cache.lookup(sibling).first == 3);
+    // A person who edits the last message resumes from the previous turn.
+    std::vector<int32_t> edited = t2;
+    edited.insert(edited.end(), {3, 104});
+    TEST_ASSERT(cache.lookup(edited).first == 2);
     // Pruning again finds nothing left to drop.
     TEST_ASSERT(cache.prune_superseded_ancestors(4).empty());
     // A slot without an entry prunes nothing.
     TEST_ASSERT(cache.prune_superseded_ancestors(7).empty());
 
+    // The previous turn goes too when the resident budget cannot hold it.
+    PrefixCache tight(8, tokenizer, /*max_resident_bytes=*/70);
+    tight.confirm_inline_snap(0, (int)head.size(), head, false, 10);
+    tight.confirm_inline_snap(1, (int)t2.size(), t2, false, 30);
+    tight.confirm_inline_snap(2, (int)t3.size(), t3, false, 40);
+    TEST_ASSERT(tight.prune_superseded_ancestors(2) == std::vector<int>({1}));
+    TEST_ASSERT(tight.stats().resident_bytes == 50);
+
     // A protected pin that is not the shallowest ancestor also survives.
+    std::vector<int32_t> t4 = t3;
+    t4.insert(t4.end(), {4, 104});
     PrefixCache pinned(8, tokenizer);
     pinned.confirm_inline_snap(0, (int)head.size(), head);
     pinned.confirm_inline_snap(1, (int)t1.size(), t1, /*protect=*/true);
     pinned.confirm_inline_snap(2, (int)t2.size(), t2);
     pinned.confirm_inline_snap(3, (int)t3.size(), t3);
-    TEST_ASSERT(pinned.prune_superseded_ancestors(3) == std::vector<int>({2}));
+    pinned.confirm_inline_snap(4, (int)t4.size(), t4);
+    TEST_ASSERT(pinned.prune_superseded_ancestors(4) == std::vector<int>({2}));
     unlink(path.c_str());
 }
 
@@ -4835,30 +5131,6 @@ TEST_CASE(ServerUnitFixture, test_max_output_alias_precedence_ignores_shadowed_i
         resolve_max_output_tokens({{"max_completion_tokens", 8}}, 400) == 8);
 }
 
-// Thinking force-close: once the remaining budget reaches the reply reserve the next tokens become the close
-// sequence; a model that emits close[0] itself keeps its own token and is not counted as forced.
-TEST_CASE(ServerUnitFixture, test_budget_hook_state_force_closes_at_reply_reserve) {
-    const BudgetHook hook{{7, 8, 9}, 4};
-    BudgetHookState s;
-    int32_t tok = 1;
-    TEST_ASSERT(!s.apply(hook, 5, 10, tok) && tok == 1);   // remaining 5 > reserve 4
-    tok = 2;
-    TEST_ASSERT(s.apply(hook, 6, 10, tok) && tok == 7);    // remaining 4: forced close[0]
-    tok = 3;
-    TEST_ASSERT(!s.apply(hook, 7, 10, tok) && tok == 8);
-    tok = 3;
-    TEST_ASSERT(!s.apply(hook, 8, 10, tok) && tok == 9);
-    tok = 3;
-    TEST_ASSERT(!s.apply(hook, 9, 10, tok) && tok == 3);   // the answer resumes
-    BudgetHookState own;
-    tok = 7;
-    TEST_ASSERT(!own.apply(hook, 6, 10, tok) && tok == 7); // self-closed at the boundary
-    tok = 5;
-    TEST_ASSERT(!own.apply(hook, 7, 10, tok) && tok == 8);
-    BudgetHookState off;
-    tok = 5;
-    TEST_ASSERT(!off.apply(BudgetHook{}, 9, 10, tok) && tok == 5);
-}
 
 static ServerConfig deepseek_reasoning_test_config() {
     ServerConfig config;
@@ -4906,6 +5178,10 @@ TEST_CASE(ServerUnitFixture, test_qwen4exp_thinks_by_default) {
     TEST_ASSERT(by_default.thinking_enabled && by_default.thinking_opt_in);
     const ParsedRequest off = resolve_qwen4exp_reasoning({{"thinking", {{"type", "disabled"}}}});
     TEST_ASSERT(!off.thinking_enabled && !off.thinking_opt_in);
+    // Claude Code's "adaptive" leaves it to the model: the default.
+    const ParsedRequest adaptive = resolve_qwen4exp_reasoning({{"thinking", {{"type", "adaptive"}}}});
+    TEST_ASSERT(adaptive.thinking_enabled && adaptive.thinking_opt_in);
+    TEST_ASSERT(!resolve_qwen_reasoning({{"thinking", {{"type", "adaptive"}}}}).thinking_enabled);
     const ParsedRequest kw_off = resolve_qwen4exp_reasoning({{"chat_template_kwargs", {{"enable_thinking", false}}}});
     TEST_ASSERT(!kw_off.thinking_enabled && !kw_off.thinking_opt_in);
     TEST_ASSERT(!resolve_qwen_reasoning(json::object()).thinking_enabled);
@@ -6954,14 +7230,15 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         if (on_prefill) on_prefill();
         return true;
     }
-    bool decode_ar(int last_tok, int committed, int n_gen,
+    bool decode_ar(int last_tok, int committed, ThinkingBudget & budget,
                    const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override {
         (void)history_prefix;
         TEST_ASSERT(committed == current_pos);
+        const int n_gen = budget.remaining();
         for (int i = 0; i < n_gen; ++i) {
-            int32_t tok = last_tok + i + 1;
+            int32_t tok = budget.apply(last_tok + i + 1).token;
             out_tokens.push_back(tok);
             emitted_tokens.push_back(tok);
             io.emit(tok);
@@ -6976,15 +7253,16 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         return mixed_backend_enabled;
     }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
-                       int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
+                       int last_tok, ThinkingBudget & budget, std::vector<int32_t> & out_tokens,
                        const DaemonIO & io, float & accept_rate_out) override {
         (void)prompt;
         accept_rate_out = 0.0f;
         dflash_called = true;
         dflash_base = base_pos;
         dflash_last = last_tok;
+        const int n_gen = budget.remaining();
         for (int i = 0; i < n_gen; ++i) {
-            int32_t tok = last_tok + i + 10;
+            int32_t tok = budget.apply(last_tok + i + 10).token;
             out_tokens.push_back(tok);
             emitted_tokens.push_back(tok);
             io.emit(tok);
@@ -7313,24 +7591,29 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_finalization_prunes_chain) {
     turn1.insert(turn1.end(), {3, 101});
     std::vector<int32_t> turn2 = turn1;
     turn2.insert(turn2.end(), {4, 102});
+    std::vector<int32_t> turn3 = turn2;
+    turn3.insert(turn3.end(), {3, 103});
     cache.confirm_inline_snap(0, (int)head.size(), head);
     cache.confirm_inline_snap(1, (int)turn1.size(), turn1);
+    cache.confirm_inline_snap(2, (int)turn2.size(), turn2);
 
     auto reservation = cache.reserve_inline_snap(
-        turn2, (int)turn1.size(), /*prefer_tools_boundary=*/false,
-        /*forced_cut=*/(int)turn2.size(), /*restore_source_slot=*/1);
+        turn3, (int)turn2.size(), /*prefer_tools_boundary=*/false,
+        /*forced_cut=*/(int)turn3.size(), /*restore_source_slot=*/2);
     TEST_ASSERT(reservation.active());
     const int slot = reservation.slot();
-    TEST_ASSERT(slot != 0 && slot != 1);
+    TEST_ASSERT(slot != 0 && slot != 1 && slot != 2);
     backend.saved_slot = slot;
-    backend.saved_position = (int)turn2.size();
+    backend.saved_position = (int)turn3.size();
     SchedulerTestHarness::finalize_inline_snapshot(
-        server, turn2, std::move(reservation), slot,
-        /*requested_cut=*/(int)turn2.size());
+        server, turn3, std::move(reservation), slot,
+        /*requested_cut=*/(int)turn3.size());
 
+    // The head and the previous turn stay.
     TEST_ASSERT(backend.freed == std::vector<int>({1}));
-    TEST_ASSERT(cache.stats().in_use == 2);
-    TEST_ASSERT(cache.lookup(turn2).first == slot);
+    TEST_ASSERT(cache.stats().in_use == 3);
+    TEST_ASSERT(cache.lookup(turn3).first == slot);
+    TEST_ASSERT(cache.lookup(turn2).first == 2);
     std::vector<int32_t> other = head;
     other.insert(other.end(), {3, 999});
     TEST_ASSERT(cache.lookup(other).first == 0);
@@ -7899,6 +8182,104 @@ struct SchedulerPrefixBackend : MockBackend {
     SeqEngine * seq_engine() override { return &engine; }
 };
 
+// Concurrent serving: two requests admitted together both capture, and a
+// conversation's new checkpoint frees the ones it supersedes (keeping the
+// shallowest, the shared head, and the previous turn for an edit).
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_captures_concurrently_and_prunes_superseded) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<SchedulerPrefixBackend>();
+    SchedulerPrefixBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 8;
+    config.concurrent_prefix_cache_max_bytes = 4096;
+    config.concurrent_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+
+    std::vector<std::unique_ptr<ServerJob>> jobs;
+    std::vector<int> fds;
+    const auto make_job = [&](std::vector<int32_t> prompt, const char * id) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        fds.push_back(sockets[0]);
+        fds.push_back(sockets[1]);
+        auto job = std::make_unique<ServerJob>();
+        job->fd = sockets[0];
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens = std::move(prompt);
+        job->req.max_output = 1;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = id;
+        jobs.push_back(std::move(job));
+        return jobs.back().get();
+    };
+    const auto wait_done = [](ServerJob * job) {
+        std::unique_lock<std::mutex> lock(job->mu);
+        return job->cv.wait_for(lock, std::chrono::seconds(5), [&] { return job->done; });
+    };
+
+    // Admitted in one pass: both capture their head.
+    ServerJob * a = make_job({1, 100, 3, 101, 4}, "a");
+    ServerJob * b = make_job({1, 200, 3, 201, 4}, "b");
+    SchedulerTestHarness::enqueue(server, a);
+    SchedulerTestHarness::enqueue(server, b);
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+    const bool ab_done = wait_done(a) && wait_done(b);
+
+    // One conversation, three more turns, each saved at its end: the fourth
+    // turn's checkpoint supersedes the second's, which is freed; the head and
+    // the third turn stay.
+    const std::vector<int32_t> turn2 = {1, 100, 3, 101, 4, 102, 2, 3, 103, 4};
+    std::vector<int32_t> turn3 = turn2;
+    turn3.insert(turn3.end(), {104, 2, 3, 105, 4});
+    std::vector<int32_t> turn4 = turn3;
+    turn4.insert(turn4.end(), {106, 2, 3, 107, 4});
+    ServerJob * second = make_job(turn2, "turn2");
+    SchedulerTestHarness::enqueue(server, second);
+    const bool second_done = wait_done(second);
+    ServerJob * third = make_job(turn3, "turn3");
+    SchedulerTestHarness::enqueue(server, third);
+    const bool third_done = wait_done(third);
+    ServerJob * fourth = make_job(turn4, "turn4");
+    SchedulerTestHarness::enqueue(server, fourth);
+    const bool fourth_done = wait_done(fourth);
+
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+
+    TEST_ASSERT(ab_done && second_done && third_done && fourth_done);
+    // Both heads were captured although their requests prefilled together.
+    TEST_ASSERT(cache.lookup_candidate({1, 100, 3, 101, 4, 9}, 5).second == 3);
+    TEST_ASSERT(cache.lookup_candidate({1, 200, 3, 201, 4, 9}, 5).second == 3);
+    std::vector<int32_t> next = turn4;
+    next.push_back(9);
+    TEST_ASSERT(cache.lookup_candidate(next, (int)next.size() - 1).second == 20);
+    // An edit of the last message resumes from the third turn's end.
+    std::vector<int32_t> edited = turn3;
+    edited.insert(edited.end(), {106, 2, 3, 999, 4});
+    TEST_ASSERT(cache.lookup_candidate(edited, (int)edited.size() - 1).second == 15);
+    // The turn-2 checkpoint is gone from the cache and freed in the engine.
+    std::vector<int32_t> after_turn2 = turn2;
+    after_turn2.push_back(9);
+    TEST_ASSERT(cache.lookup_candidate(after_turn2, 10).second == 3);
+    bool freed_turn2 = false;
+    for (const auto & ref : backend.engine.discarded) freed_turn2 |= ref.tokens == 10;
+    TEST_ASSERT(freed_turn2);
+}
+
 TEST_CASE(ServerUnitFixture,
           test_scheduler_counts_restore_only_after_engine_attempts_it) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
@@ -8033,6 +8414,196 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(stats.restore_attempts == 1);
     TEST_ASSERT(stats.restore_invalidations == 1);
     TEST_ASSERT(stats.restore_stall_us_total == 2500);
+}
+
+// A long prompt shares the time with a decoding request: after each of its
+// chunks the decoder steps alone for as long as the chunk took. Prompt steps
+// here take 40 ms and decode steps 2 ms.
+class TimeShareEngine final : public SeqEngine {
+public:
+    explicit TimeShareEngine(int long_prompt_tokens = 0)
+        : long_prompt_tokens_(long_prompt_tokens) {}
+    int slot_count() const override { return 2; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t) const override { return false; }
+    StepPlanLimits step_plan_limits(int decode_rows) const override {
+        return {decode_rows > 0 ? 1 : 2, 16, 32, 16, /*prefill_time_share=*/0.5,
+                long_prompt_tokens_};
+    }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> & prompt, const SamplerCfg &) override {
+        AdmitResult result;
+        const int slot = !slots_[0].active ? 0 : !slots_[1].active ? 1 : -1;
+        if (slot < 0) {
+            result.status = AdmitResult::Status::busy;
+            return result;
+        }
+        slots_[(size_t)slot] = {true, (int)prompt.size()};
+        result.status = AdmitResult::Status::admitted;
+        result.slot = slot;
+        return result;
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const StepInput & input : plan.decode) result.decode.push_back({input.slot, 7, false, {}});
+        for (const PrefillSlice & slice : plan.prefills) {
+            Slot & slot = slots_[(size_t)slice.slot];
+            slot.remaining -= std::min(slot.remaining, slice.max_tokens);
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = slot.remaining == 0 ? PrefillOutput::Status::completed
+                                             : PrefillOutput::Status::advanced;
+            if (slot.remaining == 0) out.token = 7;
+            result.prefills.push_back(out);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(plan.prefills.empty() ? 2 : 40));
+        std::lock_guard<std::mutex> lock(mu);
+        steps.push_back({(int)plan.decode.size(), (int)plan.prefills.size()});
+        std::vector<int> chunk_slots;
+        for (const PrefillSlice & slice : plan.prefills) chunk_slots.push_back(slice.slot);
+        prompt_slots.push_back(std::move(chunk_slots));
+        return result;
+    }
+    void retire(int slot) override { slots_[(size_t)slot] = {}; }
+
+    std::mutex mu;
+    std::vector<std::pair<int, int>> steps;  // (decode rows, prompt chunks)
+    std::vector<std::vector<int>> prompt_slots;  // the slots each step prefilled
+
+private:
+    struct Slot { bool active = false; int remaining = 0; };
+    std::array<Slot, 2> slots_{};
+    int long_prompt_tokens_;
+};
+
+struct TimeShareBackend : MockBackend {
+    explicit TimeShareBackend(int long_prompt_tokens = 0) : engine(long_prompt_tokens) {}
+    TimeShareEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+// A chat that decodes, then a 128-token prompt (8 chunks) beside it. Returns
+// the most decode-only steps the chat took between two of the prompt's chunks.
+static int decode_only_steps_between_chunks(int long_prompt_tokens) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<TimeShareBackend>(long_prompt_tokens);
+    TimeShareBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+
+    int fds[4] = {-1, -1, -1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds + 2) == 0);
+    const auto make_job = [](ServerJob & job, int fd, int prompt, int output, const char * id) {
+        job.fd = fd;
+        job.req.format = ApiFormat::OPENAI_CHAT;
+        job.req.prompt_tokens.assign((size_t)prompt, 100);
+        job.req.max_output = output;
+        job.req.stream = false;
+        job.req.model = "scheduler-test";
+        job.req.response_id = id;
+    };
+    ServerJob chat, document;
+    make_job(chat, fds[0], 4, 400, "chat");
+    make_job(document, fds[2], 128, 1, "document");
+    SchedulerTestHarness::enqueue(server, &chat);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    SchedulerTestHarness::enqueue(server, &document);
+    const auto wait_done = [](ServerJob & job) {
+        std::unique_lock<std::mutex> lock(job.mu);
+        return job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
+    };
+    const bool done = wait_done(document) && wait_done(chat);
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+    TEST_ASSERT(done);
+
+    int chunks_beside = 0, alone_between = 0, alone_run = 0;
+    bool after_chunk = false;
+    for (const auto & [decode, chunks] : backend.engine.steps) {
+        if (chunks > 0 && decode > 0) {
+            if (after_chunk) alone_between = std::max(alone_between, alone_run);
+            ++chunks_beside;
+            after_chunk = true;
+            alone_run = 0;
+        } else if (chunks == 0 && decode > 0 && after_chunk) {
+            ++alone_run;
+        }
+    }
+    TEST_ASSERT(chunks_beside >= 2);
+    return alone_between;
+}
+
+TEST_CASE(ServerUnitFixture, test_scheduler_gives_decoders_time_beside_a_long_prompt) {
+    // Between two chunks of the long prompt that ran beside the chat, the chat
+    // stepped alone: several decode-only steps, not none.
+    TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/0) >= 5);
+    // A prompt under the engine's long-prompt size keeps every step.
+    TEST_ASSERT(decode_only_steps_between_chunks(/*long_prompt_tokens=*/256) == 0);
+}
+
+// A prompt that fits in one step runs before a longer one, alone.
+TEST_CASE(ServerUnitFixture, test_scheduler_runs_a_short_prompt_before_a_long_one) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<TimeShareBackend>();
+    TimeShareBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+
+    int fds[4] = {-1, -1, -1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds + 2) == 0);
+    ServerJob document, question;
+    for (auto [job, fd, prompt, id] : {std::tuple{&document, fds[0], 128, "document"},
+                                       std::tuple{&question, fds[2], 4, "question"}}) {
+        job->fd = fd;
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens.assign((size_t)prompt, 100);
+        job->req.max_output = 1;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = id;
+    }
+    SchedulerTestHarness::enqueue(server, &document);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    SchedulerTestHarness::enqueue(server, &question);
+    const auto wait_done = [](ServerJob & job) {
+        std::unique_lock<std::mutex> lock(job.mu);
+        return job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
+    };
+    const bool done = wait_done(question) && wait_done(document);
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+    unlink(path.c_str());
+    TEST_ASSERT(done);
+
+    // The question's step carried only the question; the document went on after.
+    int question_step = -1, last_document_step = -1;
+    for (int i = 0; i < (int)backend.engine.prompt_slots.size(); ++i) {
+        const auto & chunk_slots = backend.engine.prompt_slots[(size_t)i];
+        if (chunk_slots == std::vector<int>{1}) question_step = i;
+        if (std::find(chunk_slots.begin(), chunk_slots.end(), 0) != chunk_slots.end()) last_document_step = i;
+    }
+    TEST_ASSERT(question_step > 0);
+    TEST_ASSERT(last_document_step > question_step);
 }
 
 TEST_CASE(ServerUnitFixture,
@@ -9930,6 +10501,18 @@ TEST_CASE(ServerUnitFixture, test_usage_timings_reports_prefix_cache_work) {
     TEST_ASSERT(j["prefilled_tokens"].get<int>() == 64);
     TEST_ASSERT(j["effective_prompt_tokens"].get<int>() == 8256);
     TEST_ASSERT(j["agent_turn_cache_hit"].get<bool>());
+
+    // Apps read the cached share where OpenAI puts it.
+    for (const auto format : {ApiFormat::OPENAI_CHAT, ApiFormat::RESPONSES}) {
+        auto em = make_emitter(format);
+        em.emit_start();
+        em.emit_token("x");
+        const std::string wire = concat(em.emit_finish(1, &t));
+        const char * field = format == ApiFormat::OPENAI_CHAT
+            ? "\"prompt_tokens_details\":{\"cached_tokens\":8192}"
+            : "\"input_tokens_details\":{\"cached_tokens\":8192}";
+        TEST_ASSERT(wire.find(field) != std::string::npos);
+    }
 }
 
 TEST_CASE(ServerUnitFixture, test_usage_timings_omitted_when_null) {

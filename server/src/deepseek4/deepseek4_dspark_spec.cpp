@@ -22,7 +22,7 @@
 // LUCE_DS4_FULL_SNAP=1 for A/B validation.
 
 #include "deepseek4_dspark.h"
-#include "deepseek4_budget_hook.h"
+#include "thinking_budget.h"
 #include "deepseek4_internal.h"
 #include "cluster/cluster_decision_hooks.h"
 #include "cluster/fast_reduce.h"
@@ -1052,6 +1052,7 @@ bool run_deepseek4_dspark_spec_decode(
         int committed,
         int last_tok,
         int n_gen,
+        ThinkingBudget & budget,
         const float * prompt_feature_window,
         int win_len,
         std::vector<int32_t> & out_tokens,
@@ -1061,7 +1062,7 @@ bool run_deepseek4_dspark_spec_decode(
         MoeExpertComputeRuntime * expert_runtime,
         MoeHybridRoutingStats * routing_stats,
         DSparkSpecSampling * sampling,
-        DSparkBudgetHook * budget_hook,
+        const std::function<bool()> & is_cancelled,
         luce::cluster::Ds4ClusterHooks * cluster_hooks) {
     const int n_embd = target_w.n_embd;
     // Cluster lockstep (from maikzz32's lucebox-halo-cluster). Only a real
@@ -1089,9 +1090,14 @@ bool run_deepseek4_dspark_spec_decode(
         ggml_backend_t backend; bool on;
         ~KeepaliveOff() { if (on) ggml_backend_cuda_keepalive(backend, false, 0); }
     } keepalive_off{backend, worker_keepalive};
-    const bool hook_on = budget_hook && !budget_hook->close_ids.empty();
-    luce::deepseek4::SpecBudgetHookState hook_st;
-    bool close_emitted = false;    // the hook's close token reached the stream
+    // A cluster request that drafts carries no thinking budget (the head
+    // decodes budgeted requests AR) and the head alone stops early (an empty
+    // draft block tells the workers): every rank must keep the same tokens.
+    if (cluster_spec && (!budget.settled() || is_cancelled)) {
+        std::fprintf(stderr, "[ds4-spec] a cluster rank drafts with a thinking budget or a "
+                     "local cancel check; refusing\n");
+        return false;
+    }
     const int n_tgt = drafter.n_target_layers;
     const int block = drafter.block_size;
     const int n_swa = target_w.n_swa;
@@ -1289,6 +1295,8 @@ bool run_deepseek4_dspark_spec_decode(
     std::vector<float> padded_hidden((size_t) n_embd * (block + 1), 0.0f);
     std::vector<float> padded_confidence_hidden((size_t) n_embd * (block + 1), 0.0f);
     std::vector<int32_t> draft_tok, tgt_am;
+    draft_tok.reserve((size_t) q_cap);
+    out_tokens.reserve(out_tokens.size() + (size_t) std::max(0, n_gen));
     std::vector<float> draft_confidence;
     std::vector<float> step_confidence;
 
@@ -1379,12 +1387,12 @@ bool run_deepseek4_dspark_spec_decode(
     };
 
     while (n_generated < n_gen) {
+        if (is_cancelled && is_cancelled()) break;
         const SpecClock::time_point step_t0 = SpecClock::now();
         const int ctx_len = feat_count < n_swa ? feat_count : n_swa;
         // The close sequence is under way: verify its remaining tokens as
         // forced drafts instead of asking the drafter.
-        const bool forcing = hook_on &&
-            luce::deepseek4::spec_budget_hook_forcing(budget_hook->close_ids, hook_st);
+        const bool forcing = budget.injecting();
 
         // Noise block = [seed] + [MASK]*(block-1).
         SpecClock::time_point t0 = SpecClock::now();
@@ -1468,10 +1476,10 @@ bool run_deepseek4_dspark_spec_decode(
         }
         if (forcing) {
             draft_tok.push_back(lt);
-            const int pending = (int) (budget_hook->close_ids.size() - hook_st.inject_pos);
+            const int pending = (int) budget.pending_close_tokens();
             const int k = std::min(pending, std::max(0, q_step_cap - 1));
             for (int i = 0; i < k; i++) {
-                draft_tok.push_back(budget_hook->close_ids[hook_st.inject_pos + (size_t) i]);
+                draft_tok.push_back(budget.pending_close_token((size_t) i));
             }
             ds_ok = true;
         } else if (q_step_cap >= 2 && !worker_skips_draft) {
@@ -1720,8 +1728,7 @@ bool run_deepseek4_dspark_spec_decode(
             // While close tokens remain after this step's forced candidates,
             // the hook replaces the bonus with the next one; only the step that
             // finishes the sequence keeps it (the first answer token).
-            const bool bonus_kept =
-                hook_st.inject_pos + (size_t) (q - 1) >= budget_hook->close_ids.size();
+            const bool bonus_kept = (size_t) (q - 1) >= budget.pending_close_tokens();
             if (sampling && bonus_kept) {
                 t0 = SpecClock::now();
                 if (!target.read_verify_logits(q, spec_logits)) {
@@ -1778,20 +1785,6 @@ bool run_deepseek4_dspark_spec_decode(
             }
             bonus = tgt_am[accept - 1];                       // target's token at the accept point
         }
-        // Thinking-budget hook over this step's emitted tokens: where the AR
-        // rule would override a token, truncate the step there and emit the
-        // close token as the bonus.
-        const bool hook_was_started = hook_st.started;
-        if (hook_on) {
-            int32_t hook_bonus = bonus;
-            luce::deepseek4::spec_budget_hook_step(
-                budget_hook->close_ids, n_gen - n_generated, budget_hook->hard_limit,
-                forcing, forcing ? q - 1 : 0, accept, hook_bonus, hook_st);
-            bonus = hook_bonus;
-        }
-        // The hook replaced this step's bonus with the close token (and may
-        // have cut the step short there).
-        const bool close_bonus = hook_on && !hook_was_started && hook_st.started;
         // Cluster: the head's accept/bonus are authoritative. Workers compute
         // their own (identical when the expert-parallel graph is exact) but
         // adopt the head's, so a numerically different argmax on one rank
@@ -1818,6 +1811,52 @@ bool run_deepseek4_dspark_spec_decode(
                 bonus = bonus_msg;
             }
         }
+        // Apply the shared controller and emit the accepted drafts/bonus in
+        // order, without copying a block or advancing over a stopped suffix.
+        // Any cut (including a forced close equal to the draft) defers its
+        // token as the bonus; the rollback below retains only its predecessors.
+        const bool budget_was_forced = budget.forced_close();
+        bool hit_eos = false;
+        for (int i = 1; i <= accept; i++) {
+            if (is_cancelled && is_cancelled()) {
+                stop_requested = true;
+                // The seed was emitted before this verify. Keep it even if
+                // cancellation stops all new output: pooled-window rollback
+                // cannot recover a pre-seed row overwritten by verification.
+                accept = std::max(1, i - 1);
+                bonus = draft_tok[i - 1];
+                break;
+            }
+            const int32_t candidate = i < accept ? draft_tok[i] : bonus;
+            const ThinkingBudget::Decision decision = budget.apply(candidate);
+            const int32_t t = decision.token;
+            if (decision.cut) {
+                accept = i;
+                bonus = t;
+            }
+            if (token_trace) {
+                std::fprintf(stderr,
+                             "[ds4-spec-token] out=%d step=%ld slot=%d token=%d%s\n",
+                             n_generated, steps, i, t,
+                             i == accept ? " bonus" : "");
+            }
+            out_tokens.push_back(t);
+            if (sampling) sampling->history.push_back(t);
+            n_generated++;
+            if (on_token && !on_token(t)) stop_requested = true;
+            hit_eos = target.is_eos(t);
+            if (stop_requested || hit_eos) {
+                // A cluster head's local stop must not change what the ranks
+                // keep: the workers keep the whole accepted block, so the head
+                // does too (an EOS is seen by every rank at the same token).
+                if (!(cluster_spec && stop_requested && !hit_eos)) {
+                    accept = i;
+                    bonus = t;
+                }
+                break;
+            }
+        }
+        const bool close_bonus = !budget_was_forced && budget.forced_close();
         const int matched = accept - 1;                       // accepted candidates
         const int commit_pos = pos + accept;                  // seed + accepted candidates in KV
 
@@ -1838,17 +1877,14 @@ bool run_deepseek4_dspark_spec_decode(
         if (full_snap && accept < q) {
             // Legacy: full restore + replay the committed tokens through the
             // target so ring/compressor/n_comp advance exactly.
-            std::vector<int32_t> kv_toks;
-            kv_toks.push_back(lt);
-            for (int i = 1; i < accept; i++) kv_toks.push_back(draft_tok[i]);
+            draft_tok.resize((size_t) accept);
             if (!target.restore_kv()) {
                 std::fprintf(stderr, "[ds4-spec] snapshot restore failed\n");
                 ok = false;
                 break;
             }
             int replay_last = -1;
-            std::vector<int32_t> replay_am;
-            if (!target.verify_batch(kv_toks, pos, replay_last, &replay_am)) {
+            if (!target.verify_batch(draft_tok, pos, replay_last)) {
                 std::fprintf(stderr, "[ds4-spec] replay verify failed\n");
                 ok = false;
                 break;
@@ -1902,16 +1938,9 @@ bool run_deepseek4_dspark_spec_decode(
             } else {
                 spec_rollback_apply(
                     rollback, target_w, target_cache, pos, true);
-                std::vector<int32_t> kv_toks;
-                kv_toks.reserve((size_t) accept);
-                kv_toks.push_back(lt);
-                for (int i = 1; i < accept; ++i) {
-                    kv_toks.push_back(draft_tok[i]);
-                }
+                draft_tok.resize((size_t) accept);
                 int replay_last = -1;
-                std::vector<int32_t> replay_am;
-                if (!target.verify_batch(
-                        kv_toks, pos, replay_last, &replay_am)) {
+                if (!target.verify_batch(draft_tok, pos, replay_last)) {
                     std::fprintf(stderr,
                                  "[ds4-spec] wide rollback replay failed\n");
                     ok = false;
@@ -1946,29 +1975,6 @@ bool run_deepseek4_dspark_spec_decode(
             }
         }
 
-        // The close token only counts as fired once it is emitted: an EOS or
-        // stop earlier in the step ends the stream first, as it would under AR.
-        // Output tokens this step = accepted candidates + bonus.
-        bool hit_eos = false;
-        for (int i = 1; i <= accept; i++) {
-            const int t = (i < accept) ? draft_tok[i] : bonus;
-            if (token_trace) {
-                std::fprintf(stderr,
-                             "[ds4-spec-token] out=%d step=%ld slot=%d token=%d%s\n",
-                             n_generated, steps, i, t,
-                             i == accept ? " bonus" : "");
-            }
-            out_tokens.push_back(t);
-            if (i == accept && close_bonus) close_emitted = true;
-            if (sampling) sampling->history.push_back(t);
-            n_generated++;
-            if (on_token && !on_token(t)) {
-                stop_requested = true;
-                break;
-            }
-            if (target.is_eos(t)) { hit_eos = true; break; }
-            if (n_generated >= n_gen) break;
-        }
         pos = commit_pos;              // seed + accepted candidates now in KV
         lt = bonus;                    // deferred bonus becomes next seed
         if (!hook_step) {
@@ -2031,7 +2037,6 @@ bool run_deepseek4_dspark_spec_decode(
         }
     }
 
-    if (hook_on && close_emitted) budget_hook->fired = true;
     const double total_ms = spec_ms_since(run_t0);
     if (accept_rate_out) {
         *accept_rate_out = offered_sum > 0

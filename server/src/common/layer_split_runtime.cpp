@@ -5,7 +5,7 @@ namespace luce::common {
 bool run_layer_split_ar_decode(
         int last_tok,
         int committed,
-        int n_gen,
+        ThinkingBudget & budget,
         int vocab,
         const std::vector<float> & prefill_last_logits,
         const SamplerCfg & sampler,
@@ -15,6 +15,7 @@ bool run_layer_split_ar_decode(
         const std::function<bool(int)> & is_eos,
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
+    const int n_gen = budget.remaining();
     if (n_gen <= 0) return true;
 
     std::vector<int32_t> history;
@@ -27,6 +28,11 @@ bool run_layer_split_ar_decode(
                                  history, rng);
     }
 
+    if (io.is_cancelled()) {
+        io.emit(-1);
+        return true;
+    }
+    last_tok = budget.apply(last_tok).token;
     out_tokens.push_back(last_tok);
     if (sampler.needs_logit_processing()) history.push_back(last_tok);
     io.emit(last_tok);
@@ -55,7 +61,9 @@ bool run_layer_split_ar_decode(
                                      history, rng);
         }
 
-        last_tok = next_tok;
+        if (io.is_cancelled()) break;
+
+        last_tok = budget.apply(next_tok).token;
         out_tokens.push_back(last_tok);
         if (sampler.needs_logit_processing()) history.push_back(last_tok);
         io.emit(last_tok);

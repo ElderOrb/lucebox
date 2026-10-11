@@ -10,42 +10,13 @@
 
 #include "image_prompt.h"
 #include "sampler.h"
+#include "thinking_budget.h"
 
 namespace luce::common {
 
 // Called once for each token committed by transitional whole-request
 // executors. Returning false requests cancellation.
 using TokenCallback = std::function<bool(int32_t token)>;
-
-// Pre-commit token substitution for thinking budgets. When the remaining
-// generation budget reaches hard_limit_remaining, close_token_ids replaces
-// the next sampled tokens in order so reusable KV state sees the replacement.
-struct BudgetHook {
-    std::vector<int32_t> close_token_ids;
-    int hard_limit_remaining = 0;
-};
-
-// Per-generation force-close state. apply() takes the candidate token after
-// `generated` tokens of an `n_gen` budget and substitutes the close sequence
-// once the remaining budget reaches the reserve. A model that samples
-// close[0] itself keeps it. Returns true when close[0] was forced.
-struct BudgetHookState {
-    bool started = false;
-    int  pos     = 0;
-    bool apply(const BudgetHook & hook, int generated, int n_gen, int32_t & tok) {
-        if (hook.close_token_ids.empty()) return false;
-        if (started) {
-            if (pos < (int) hook.close_token_ids.size()) tok = hook.close_token_ids[(size_t) pos++];
-            return false;
-        }
-        if (n_gen - generated > hook.hard_limit_remaining) return false;
-        started = true;
-        pos = 1;
-        if (tok == hook.close_token_ids.front()) return false;
-        tok = hook.close_token_ids.front();
-        return true;
-    }
-};
 
 struct GenerateRequest {
     std::vector<int32_t> prompt;
@@ -71,6 +42,8 @@ struct GenerateRequest {
     std::vector<int32_t> stall_tool_prefix_tokens;
     std::vector<int32_t> stall_action_suffix_tokens;
     std::vector<int32_t> stall_skip_tokens;
+    // Immutable model/request policy. Decode owns one ThinkingBudget instance
+    // for the whole generation; a strategy handoff must not restart it.
     BudgetHook budget_hook;
     // Set only for the single autoregressive retry after empty spec output.
     bool force_ar_decode = false;

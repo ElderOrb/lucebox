@@ -82,7 +82,7 @@ using LayerSplitForwardStep = std::function<bool(
 bool run_layer_split_ar_decode(
     int last_tok,
     int committed,
-    int n_gen,
+    ThinkingBudget & budget,
     int vocab,
     const std::vector<float> & prefill_last_logits,
     const SamplerCfg & sampler,

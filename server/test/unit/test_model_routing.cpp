@@ -344,9 +344,9 @@ struct HeldSingleBackend final : RoutedBackend {
     std::vector<float> temperatures;
 };
 
-void load_tokenizer(Tokenizer & tokenizer, bool second) {
+void load_tokenizer(Tokenizer & tokenizer, bool second, const char * first_output) {
     gguf_context * ctx = gguf_init_empty();
-    const char * first[] = {"q", "x", "<eos>", "y", "s"};
+    const char * first[] = {first_output, "x", "<eos>", "y", "s"};
     const char * other[] = {"s", "y", "<eos>", "x", "q"};
     const uint32_t types[] = {1, 1, 3, 1, 1};
     gguf_set_arr_str(ctx, "tokenizer.ggml.tokens", second ? other : first, 5);
@@ -387,9 +387,10 @@ public:
 
     explicit RunningModels(bool single_peer = false, bool single_listener = false,
                            bool load_balancing = true, int queue_limit = 0,
-                           bool reverse_priority = false, size_t offload_bytes = 0) {
-        load_tokenizer(first_tok, false);
-        load_tokenizer(second_tok, true);
+                           bool reverse_priority = false, size_t offload_bytes = 0,
+                           const char * first_output = "q") {
+        load_tokenizer(first_tok, false, first_output);
+        load_tokenizer(second_tok, true, "s");
         // Obtain a loopback test port from the OS, then hand it to HttpServer.
         Socket reservation(socket(AF_INET, SOCK_STREAM, 0));
         sockaddr_in address{};
@@ -603,6 +604,43 @@ TEST_CASE(ModelRoutingFixture, test_response_protocols_use_selected_model_and_te
     ROUTING_CHECK(response["model"] == "ds4");
     ROUTING_CHECK(response["output"][0]["content"][0]["text"] == "s");
     models.wait_load(0, 0);
+}
+
+TEST_CASE(ModelRoutingFixture, test_responses_nonstream_preserves_prose_and_multiple_calls) {
+    const char * generated =
+        "Listing.\n<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=read>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>";
+    for (bool single : {false, true}) {
+        RunningModels models(false, single, false, 0, false, 0, generated);
+        models.first.engine.finish();
+        models.first_single.finish();
+        const json request = json::parse(R"({
+            "model": "qwen",
+            "input": [{"role": "user", "content": "x"}],
+            "max_output_tokens": 4,
+            "tools": [
+                {"type": "function", "name": "ls",
+                 "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+                {"type": "function", "name": "read",
+                 "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+            ]
+        })");
+        const auto body = response_body(models.post(request, "/v1/responses").read());
+        const auto & output = body.at("output");
+        ROUTING_CHECK(output.size() == 3);
+        ROUTING_CHECK(output.at(0).at("type") == "message");
+        ROUTING_CHECK(output.at(0).at("role") == "assistant");
+        ROUTING_CHECK(output.at(0).at("content").at(0).at("text") == "Listing.\n");
+        for (size_t index : {1, 2}) {
+            const auto & call = output.at(index);
+            ROUTING_CHECK(call.at("type") == "function_call");
+            ROUTING_CHECK(call.at("status") == "completed");
+            ROUTING_CHECK(call.at("name") == (index == 1 ? "ls" : "read"));
+            ROUTING_CHECK(json::parse(call.at("arguments").get<std::string>()) ==
+                          json({{"path", index == 1 ? "." : "README.md"}}));
+        }
+        ROUTING_CHECK(output.at(1).at("call_id") != output.at(2).at("call_id"));
+    }
 }
 
 TEST_CASE(ModelRoutingFixture, test_shutdown_drains_both_models_and_incomplete_upload) {

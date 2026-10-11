@@ -39,9 +39,11 @@ public:
 protected:
     bool load_target_model(ggml_backend_t backend, TargetWeights & out) override;
     bool post_kvflash_init_gate() override;
-    bool run_ar_decode_path(int committed, int n_gen,
+    bool run_ar_decode_path(int committed, ThinkingBudget & budget,
                             std::vector<int32_t> & out_tokens,
-                            const DaemonIO & io) override;
+                            const DaemonIO & io,
+                            bool * forced_close_out,
+                            bool * degenerate_close_out) override;
     bool should_capture_moe_router() const override { return routing_stats_ != nullptr; }
     bool spark_wants_bootstrap() const override;
     bool spark_bootstrap_finalize(const std::string & profile_path) override;
@@ -74,9 +76,9 @@ private:
                                 MoeHybridPlacement & out,
                                 std::string * err);
 
-    // Hybrid speculative decode: draft tokens using DFlash draft model,
-    // verify via hybrid forward (layer-by-layer with hot/MoE expert compute).
-    bool do_hybrid_spec_decode(int committed, int n_gen,
+    // Hybrid speculative decode shares the generation controller with AR.
+    // Apply only emitted candidates, then replay the retained/replaced prefix.
+    bool do_hybrid_spec_decode(int committed, ThinkingBudget & budget,
                                std::vector<int32_t> & out_tokens,
                                const DaemonIO & io,
                                float * accept_rate_out = nullptr);
@@ -95,8 +97,9 @@ private:
                               std::vector<int32_t> & argmax_out,
                               bool capture_features);
 
-    // Pipelined decode: uses cached DeltaNet graphs + optimized FFN loop
-    bool run_pipelined_decode_path(int committed, int n_gen,
+    // Pipelined decode enters with a fully committed prefix and an un-emitted
+    // cache.last_tok seed; the first emitted token stays pending at committed.
+    bool run_pipelined_decode_path(int committed, ThinkingBudget & budget,
                                    std::vector<int32_t> & out_tokens,
                                    const DaemonIO & io);
 

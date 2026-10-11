@@ -200,9 +200,11 @@ public:
 
 protected:
     virtual bool load_target_model(ggml_backend_t backend, TargetWeights & out);
-    virtual bool run_ar_decode_path(int committed, int n_gen,
+    virtual bool run_ar_decode_path(int committed, ThinkingBudget & budget,
                                     std::vector<int32_t> & out_tokens,
-                                    const DaemonIO & io);
+                                    const DaemonIO & io,
+                                    bool * forced_close_out,
+                                    bool * degenerate_close_out);
     virtual bool should_capture_moe_router() const { return false; }
     // Hook after kvflash pool sizing, before create_target_cache: a subclass
     // may disable the pool (kvflash_tokens_=0) when it is redundant. Default no-op.
@@ -403,47 +405,33 @@ private:
                    const std::vector<int> & restore_points = {});
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
-    // When budget_hook is non-null and (n_gen - generated) drops to the
-    // hard-limit boundary, breaks out of the spec-decode loop and tails
-    // off via do_ar_decode so the force-close override fires cleanly
-    // with KV state intact. Spec-decode itself can't safely inject the
-    // close token mid-batch (verify-and-accept assumes the sampled
-    // tokens are the ones that got committed), so the boundary switch
-    // is the simplest correct integration.
+    // The generation's controller observes every emitted token, including the
+    // first seed. A forced close cuts the verified block, restores/replays the
+    // preceding prefix, and hands the pending close token plus the same
+    // controller to AR. Settled controllers allow the tree-verify fast path.
     // out_accept_rate receives accepted/total draft token ratio (0.0 if AR fallback).
     // out_spec_ran is true when spec decode actually ran (even with 0 accepts).
-    bool do_spec_decode(int committed, int n_gen,
+    bool do_spec_decode(int committed, ThinkingBudget & budget,
                         std::vector<int32_t> & out_tokens,
                         const DaemonIO & io,
                         float & out_accept_rate,
                         bool & out_spec_ran,
-                        const std::vector<int32_t> * hint_tokens = nullptr,
-                        const std::vector<int32_t> * stall_tool_prefix_tokens = nullptr,
-                        const std::vector<int32_t> * stall_action_suffix_tokens = nullptr,
-                        const std::vector<int32_t> * stall_skip_tokens = nullptr,
-                        const BudgetHook * budget_hook = nullptr,
-                        bool * forced_close_out = nullptr,
-                        bool * degenerate_close_out = nullptr);
+                        const std::vector<int32_t> * hint_tokens,
+                        const std::vector<int32_t> * stall_tool_prefix_tokens,
+                        const std::vector<int32_t> * stall_action_suffix_tokens,
+                        const std::vector<int32_t> * stall_skip_tokens,
+                        bool * forced_close_out,
+                        bool * degenerate_close_out);
 
-    // AR decode fallback (no draft model or sampling mode).
-    // budget_hook (when close_token_ids is non-empty) overrides the next
-    // sampled token(s) with the close-tag sequence once (n_gen - committed)
-    // <= hard_limit. For Qwen3.x, close_token_ids is the canonical
-    // "Considering the limited time..." summarize-and-stop lead-in (24
-    // tokens including `</think>`); for non-qwen arches it's a single
-    // close-tag token. Mirrors the trained pathway documented in the
-    // Qwen3 technical report (arXiv 2505.09388).
-    // forced_close_out, when non-null, is set to true iff the hook injected
-    // the close sequence (vs. the model self-closing at the boundary). The
-    // server uses this to attribute close_kind=hard correctly — decoding
-    // the token stream and grepping for "</think>" cannot distinguish an
-    // injected close from a natural one because the bytes are identical.
-    bool do_ar_decode(int committed, int n_gen,
+    // AR fallback/tail shares output accounting and marker observation with
+    // speculative decode. An existing out_tokens.back() is pending at
+    // `committed`: forward it without advancing the controller a second time.
+    // forced_close_out attributes injected closes independently of their bytes.
+    bool do_ar_decode(int committed, ThinkingBudget & budget,
                       std::vector<int32_t> & out_tokens,
                       const DaemonIO & io,
-                      const BudgetHook & budget_hook = {},
-                      bool * forced_close_out = nullptr,
-                      bool * degenerate_close_out = nullptr);
+                      bool * forced_close_out,
+                      bool * degenerate_close_out);
 
     bool begin_paged_sequence(uint32_t prompt_tokens);
     // Allocates the next paged K/V row and uploads this step's block-table /

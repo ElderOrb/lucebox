@@ -342,14 +342,14 @@ which dominates for long traces.
 
 ### 5.2 Level 2 — in-process force-close
 
-When supported by the backend (currently Qwen3.5/3.6, Gemma4, Laguna),
-the server avoids the phase-2 reprompt by overriding sampling in the
-generation loop:
+The native Qwen3, Qwen3.5/3.6 dense and MoE, Qwen4Exp, DeepSeek4,
+Gemma4, and Laguna backends, the concurrent scheduler, and the shared
+layer-split decode paths override sampling inside the generation loop:
 
-- Track the number of tokens generated since entry to the AR loop.
-- When `(n_gen − generated) ≤ --hard-limit-reply-budget`, the
-  remaining headroom is dedicated to the visible reply. Override the
-  next sampled token with the tokenizer's `</think>` close-tag.
+- Track emitted generation tokens, excluding the prompt.
+- While thinking is still open, when
+  `(n_gen − generated) ≤ effective_reply_budget`, override the next
+  sampled token with the first token of the configured close sequence.
 - Close tags that tokenize to multiple ids (e.g. DeepSeek/Laguna,
   where `</think>` is `[1718, 37947, 32]`) are injected as a multi-
   token sequence: each subsequent loop iteration overrides one more
@@ -358,6 +358,37 @@ generation loop:
 - After the close sequence, normal sampling resumes. The model
   continues from a still-hot KV cache and writes the visible reply
   naturally, with `--hard-limit-reply-budget` tokens of headroom.
+
+All these paths use the generation-owned `ThinkingBudget` controller in
+`common/thinking_budget.h`. The immutable `BudgetHook` supplies the
+model's bare end-of-thinking marker separately from its injected hint.
+There are no model-name or architecture branches in the controller.
+Only accepted output tokens advance it, including the first token;
+multi-token markers can span speculative blocks. A natural marker
+completion, including exactly at the threshold, disarms forcing for
+the rest of the generation. A long answer is therefore neither
+overwritten nor reported as a forced close.
+
+The same controller follows every speculative-to-AR handoff. Qwen3.5
+dense repairs a forced-cut block and leaves the replacement pending for
+its AR tail. DeepSeek4 DSpark, hybrid MoE, and shared layer-split DFlash
+can repair the retained prefix and continue speculation. Repair also
+runs when cancellation occurs while emitting a replacement; discarded
+tokens never consume the budget. Gemma4 and Laguna hand off to AR before
+an unsettled budget could force a replacement inside a speculative block.
+Natural closure removes that restriction. Qwen4Exp MTP compares each token
+with its draft after budget substitution. A mismatch ends the accepted
+prefix and uses MTP's existing cache rollback; matching forced drafts can
+remain accepted because every later token still passes through the same
+controller. The concurrent scheduler disables speculation while its budget
+is unsettled and resumes it after natural or completed forced closure.
+
+Shared layer-split decode checks cancellation again after forward/verify,
+before advancing the controller. If DFlash emits no tokens from a verified
+block, it restores the snapshot without replaying an empty prefix. DSpark
+instead retains its already-emitted seed even when cancellation stops all
+new output; this preserves the accepted-seed invariant required to repair
+V4.1 pooled compressor windows.
 
 Level 2 is strictly cheaper than Level 1 (no reprompt, no second
 prefill, KV cache preserved) and produces a higher-quality reply
@@ -371,27 +402,60 @@ encounters an unexpected state.
 
 ### 5.3 Budget arithmetic
 
-In Level 2 the budget check runs against tokens **generated in the
-current AR loop**, not against the absolute KV position:
+In Level 2 the budget check uses emitted generation tokens, not the
+absolute KV position:
 
 ```
-generated = committed_now − committed_at_entry
+generated = number of output tokens already emitted
 remaining = n_gen − generated
-if remaining ≤ effective_reply_budget: force-close
+if thinking is still open and remaining ≤ effective_reply_budget: force-close
 ```
 
 Where `effective_reply_budget` is the per-request `thinking.reply_budget`
-clamped to `--hard-limit-reply-budget` (see §4.4), and `n_gen` is the
-effective phase-1 cap: `thinking.budget_tokens` clamped to
-`--think-max-tokens` if set, otherwise the `reasoning.effort` tier value
-narrowed by `request.max_tokens − hard_limit_reply_budget` (see §4.4).
+clamped to `--hard-limit-reply-budget` (see §4.4). The initial `n_gen` is
+the combined thinking ceiling and reply reserve, capped by the request's
+maximum output and the backend's available context. Every decode
+strategy receives the same controller by reference; `remaining()` is
+the generation's remaining output allowance, not a new tail-local cap.
 
-The generated-since-entry frame matters because `committed_now`
-includes the prompt length and any tokens already committed before
-AR took over (e.g. when the spec-decode path tails off into AR for
-the final stretch). Without the offset the check would fire
-`prompt_len` tokens early and could go negative after spec-decode
-tail-off, force-closing immediately as AR began.
+This frame matters because absolute KV positions include the prompt and
+tokens already committed before an AR tail begins. Counting them again
+would force the close too early. Emitted-token counts also work when
+chunked AR forwarding leaves the KV position temporarily unchanged.
+
+### 5.4 Adding models and decode strategies
+
+Model differences belong in configuration: the existing model card
+provides the thinking marker and optional terminator hint, and the
+tokenizer converts them to `BudgetHook` token ids. New checkpoints on an
+existing backend inherit its budget behavior; a different marker or
+hint needs the appropriate model-card data, not another budget algorithm.
+
+A new backend or decode strategy must use the shared commit contract:
+
+1. Construct one `ThinkingBudget(req.budget_hook, effective_output_cap)`
+   for a fresh or restored generation. The hook must outlive it.
+2. Pass that controller through seed emission, speculative decoding, and
+   every AR tail. Prefer `run_layer_split_ar_decode` or the shared
+   `run_dflash_spec_decode` loop; their server interfaces require it.
+3. Call `apply(candidate)` exactly once for each accepted output token,
+   even after closure. Emit and forward the returned token. Do not count
+   prompt tokens, rejected drafts, or KV replay.
+4. On a speculative `Decision::cut`, discard the suffix and repair KV
+   to the retained output prefix, including on cancellation. A decoder
+   without that repair path must use `needs_ar_tail` before the boundary.
+5. Report `forced_close()` in the generation result. Verify natural
+   closure, seed forcing, multi-token markers across blocks, output caps,
+   handoffs, and cancellation at a forced replacement.
+
+`apply_block` is available when the entire retained block will be emitted.
+Loops with per-token cancellation must instead advance the controller
+alongside actual emission, so an un-emitted suffix cannot alter its state.
+
+This is a decoder contract, not an HTTP output filter: substituting text
+after decoding would leave the model's KV cache conditioned on the wrong
+tokens. A genuinely new architecture still needs a decoder adapter; the
+controller cannot infer an unknown model's thinking protocol.
 
 ## 6. Response shape
 

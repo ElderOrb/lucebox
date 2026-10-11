@@ -28,9 +28,10 @@ public:
     virtual int prefill_chunk_tokens() const { return 0; }
     virtual bool prefill(const std::vector<int32_t> & prompt,
                          int base_pos, int & last_tok) = 0;
-    // history_prefix is the full original request prompt (not the delta
-    // prefill after a prefix-cache restore); it seeds sampler penalty history.
-    virtual bool decode_ar(int last_tok, int committed, int n_gen,
+    // history_prefix seeds sampler penalties. The request-owned controller is
+    // mandatory: apply it to every output candidate before history/KV/emission.
+    // New adapters should reuse run_layer_split_ar_decode for this contract.
+    virtual bool decode_ar(int last_tok, int committed, ThinkingBudget & budget,
                            const std::vector<int32_t> & history_prefix,
                            std::vector<int32_t> & out_tokens,
                            const DaemonIO & io) = 0;
@@ -38,10 +39,10 @@ public:
 
     virtual bool can_dflash_decode() const { return false; }
     virtual bool decode_dflash(const std::vector<int32_t> & prompt,
-                               int base_pos, int last_tok, int n_gen,
+                               int base_pos, int last_tok, ThinkingBudget & budget,
                                std::vector<int32_t> & out_tokens,
                                const DaemonIO & io, float & accept_rate_out) {
-        (void)prompt; (void)base_pos; (void)last_tok; (void)n_gen;
+        (void)prompt; (void)base_pos; (void)last_tok; (void)budget;
         (void)out_tokens; (void)io;
         accept_rate_out = 0.0f;
         return false;

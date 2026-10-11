@@ -61,6 +61,13 @@ struct GenTimings {
 //   effective_prompt_tokens = total prompt tokens seen by the backend
 nlohmann::json build_timings_json(const GenTimings & t, int completion_tokens);
 
+// The Responses API output items of a completed turn, shared by the stream's
+// response.completed and the non-streaming response: the assistant message
+// (its text, possibly empty) first, then one function_call item per call.
+nlohmann::json responses_output_items(const std::string & message_id,
+                                      const std::string & text,
+                                      const std::vector<ToolCall> & calls);
+
 // Manages SSE streaming for a single request.
 class SseEmitter {
 public:

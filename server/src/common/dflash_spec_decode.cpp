@@ -41,8 +41,9 @@ bool run_dflash_spec_decode(
         int base_pos) {
     DaemonIO io;
     io.stream_fd = stream_fd;
+    ThinkingBudget budget(nullptr, n_gen);
     return run_dflash_spec_decode(target, draft_weights, draft_backend,
-                                  feature_ring, prompt, n_gen, last_tok,
+                                  feature_ring, prompt, budget, last_tok,
                                   out_path, draft_ctx_max, io,
                                   remote_draft, hint_tokens, base_pos);
 }
@@ -53,7 +54,7 @@ bool run_dflash_spec_decode(
         ggml_backend_t draft_backend,
         DraftFeatureMirror & feature_ring,
         const std::vector<int32_t> & prompt,
-        int n_gen,
+        ThinkingBudget & budget,
         int last_tok,
         const char * out_path,
         int draft_ctx_max,
@@ -62,6 +63,7 @@ bool run_dflash_spec_decode(
         const std::vector<int32_t> * hint_tokens,
         int base_pos,
         double * accept_rate_out) {
+    const int n_gen = budget.remaining();
     const bool use_remote_draft = remote_draft && remote_draft->active();
     if (!use_remote_draft && !feature_ring.target_feat) return false;
 
@@ -81,6 +83,8 @@ bool run_dflash_spec_decode(
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;       // host buffer for local draft hidden states
     std::vector<float>   remote_hidden;      // host buffer for remote-draft hidden states
+    std::vector<int32_t> replay_tok;
+    replay_tok.reserve((size_t)q_len);
 
     std::vector<int32_t> out_all = prompt;
     int committed       = base_pos + (int)prompt.size();
@@ -96,7 +100,8 @@ bool run_dflash_spec_decode(
 
     auto t_dec0 = std::chrono::steady_clock::now();
     while (n_generated < n_gen) {
-        const int need_commit_budget = n_gen - n_generated;
+        if (io.is_cancelled()) break;
+        const int need_commit_budget = budget.remaining();
 
         // ── Build noise input for draft ────────────────────────────────────
         noise_ids[0] = last_tok;
@@ -226,29 +231,51 @@ bool run_dflash_spec_decode(
             if (commit_n <= accept_n) bonus_tok = -1;
         }
 
-        // ── Commit accepted tokens to KV state ──────────────────────────
-        // Adaptive: use fast-rollback when acceptance is high enough to benefit.
+        // Choose the accepted prefix before advancing the output controller.
+        // Fast rollback defers the bonus to the next step; it must not consume
+        // budget here. The replay buffer is reused across steps.
         rollback_diag.record_accept(accept_n);
         const bool use_fast_rollback =
             target.supports_fast_rollback() &&
             (accept_n >= rollback_policy.fast_rollback_threshold);
-
-        std::vector<int32_t> replay_tok((size_t)commit_n);
+        if (use_fast_rollback) {
+            bonus_tok = -1;
+            commit_n = std::min(accept_n, need_commit_budget);
+        }
+        replay_tok.resize((size_t)commit_n);
         for (int i = 0; i < commit_n; i++) {
             replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
         }
 
+        // Only emitted tokens advance policy. End at a replacement, EOS or
+        // cancellation, then commit exactly that prefix below. In particular,
+        // cancellation must not bypass repair of an overridden draft token.
+        bool budget_cut = false;
+        bool hit_eos = false;
+        int emitted = 0;
+        for (int i = 0; i < commit_n; i++) {
+            if (io.is_cancelled()) break;
+            const auto decision = budget.apply(replay_tok[i]);
+            replay_tok[i] = decision.token;
+            budget_cut = decision.cut;
+            out_all.push_back(decision.token);
+            io.emit(decision.token);
+            ++emitted;
+            hit_eos = target.is_eos(decision.token);
+            if (budget_cut || hit_eos || io.is_cancelled()) break;
+        }
+        if (emitted == 0) {
+            if (!target.restore_kv()) {
+                std::fprintf(stderr, "dflash-spec restore_kv after cancellation failed\n");
+                return false;
+            }
+            break;
+        }
+        commit_n = emitted;
+        replay_tok.resize((size_t)commit_n);
+
         bool fast_rolled_back = false;
-        if (use_fast_rollback) {
-            // Fast rollback: restore SSM from intermediates, skip replay.
-            // Implicit bonus: deferred to next step as draft_tok[0].
-            // Respect the generation budget: accept_n can exceed the remaining
-            // budget (need_commit_budget). Committing accept_n would both
-            // overrun the budget and grow replay_tok with zero-initialised
-            // tokens (it was sized to the clamped commit_n above).
-            bonus_tok = -1;
-            commit_n = std::min(accept_n, need_commit_budget);
-            replay_tok.resize(commit_n);
+        if (use_fast_rollback && !budget_cut) {
             if (target.rollback_to(committed, commit_n)) {
                 last_tok = target_tok[commit_n - 1];
                 fast_rolled_back = true;
@@ -259,8 +286,6 @@ bool run_dflash_spec_decode(
                                          "an in-place commit attempt; aborting\n");
                     return false;
                 }
-                // The pre-verify snapshot is still valid, so degrade to the
-                // legacy restore+replay path below.
                 std::fprintf(stderr, "dflash-spec rollback_to failed; "
                                      "falling back to restore+replay\n");
                 rollback_diag.record_failed_fallback();
@@ -268,9 +293,6 @@ bool run_dflash_spec_decode(
         }
         if (!fast_rolled_back) {
             rollback_diag.record_legacy_replay();
-            // Legacy path: restore SSM snapshot and replay accepted + bonus tokens.
-            // (When falling back from fast-rollback, bonus_tok is already -1 and
-            //  replay_tok/commit_n reflect the budget-clamped accepted set.)
             if (!target.restore_kv()) {
                 std::fprintf(stderr, "dflash-spec restore_kv failed\n");
                 return false;
@@ -283,27 +305,15 @@ bool run_dflash_spec_decode(
             last_tok = replay_last_tok;
         }
 
-        bool hit_eos = false;
-        int emitted = 0;
-        for (int i = 0; i < commit_n; i++) {
-            out_all.push_back(replay_tok[i]);
-            io.emit(replay_tok[i]);
-            if (io.is_cancelled()) break;
-            ++emitted;
-            if (target.is_eos(replay_tok[i])) hit_eos = true;
-        }
         committed   += emitted;
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
 
-        // Notify observer with accepted tokens for this step.
         if (io.observer) {
             io.observer("verify", replay_tok);
         }
-
-        if (io.is_cancelled()) break;
-        if (hit_eos) break;
+        if (io.is_cancelled() || hit_eos) break;
     }
     if (!target.finish_speculative_state()) {
         std::fprintf(stderr, "dflash-spec final recurrent-state flush failed\n");

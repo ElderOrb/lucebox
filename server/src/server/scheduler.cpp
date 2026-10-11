@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <thread>
 
@@ -36,6 +37,12 @@ struct SchedSlot {
     SocketHandle fd = kInvalidSocket;
     std::unique_ptr<SseEmitter> emitter;
     bool prefilling = false;
+    // Prompt tokens still to prefill, less each step's grant (a step can end
+    // its chunk early, so it may run low), and the new tokens the prompt
+    // brought (StepPlanLimits::time_share_prompt_tokens). A recomputed
+    // request counts as long.
+    int prompt_left = 0;
+    int prompt_new = 0;
     uint64_t admission_order = 0;
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
@@ -54,11 +61,9 @@ struct SchedSlot {
     // reader can never head-of-line-block the shared decode loop.
     luce::common::ClientSendBuffer send_buffer;
     // Thinking-budget force-close, applied scheduler-side before the token
-    // is fed back (mirrors do_ar_decode's maybe_force_close).
+    // is fed back (the same rule as do_ar_decode, common/thinking_budget.h).
     luce::common::BudgetHook hook;
-    bool hook_started = false;
-    int  hook_pos = 0;
-    bool budget_forced_close = false;
+    luce::common::ThinkingBudget budget;
     bool degenerate_close = false;
 };
 
@@ -200,37 +205,16 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
     };
 
-    auto maybe_force_close = [](SchedSlot & s, int32_t & tok) {
-        if (s.hook.close_token_ids.empty()) return;
-        if (s.hook_started) {
-            if (s.hook_pos < (int)s.hook.close_token_ids.size()) {
-                tok = s.hook.close_token_ids[(size_t)s.hook_pos++];
-            }
-            return;
-        }
-        const int generated = (int)s.gen_tokens.size();
-        const int remaining = s.n_gen_cap - generated;
-        if (remaining <= s.hook.hard_limit_remaining) {
-            const int32_t first_close = s.hook.close_token_ids.front();
-            s.hook_started = true;
-            s.hook_pos = 1;
-            if (tok != first_close) {
-                tok = first_close;
-                s.budget_forced_close = true;
-            }
-        }
-    };
-
     // Advances one slot by a single sampled token — the post-sample path
     // shared by the first (prefill-logits) token and every decode-step token.
-    // Note `tok` is by value but not passthrough: maybe_force_close may
-    // *substitute* a close token for it, and that substitute is what gets
+    // Note `tok` is by value but not passthrough: the shared budget may
+    // substitute a close token, and that substitute is what gets
     // recorded, emitted, and fed back. Appends to gen_tokens, streams the
     // delta into send_buffer, and parks the token in pending_tok as the next
     // step's input for this slot. Sets s.finished — but never retires the
     // slot — on EOS, gen cap, stop-sequence hit, or degenerate repetition.
     auto advance_slot = [&](SchedSlot & s, int32_t tok) {
-        maybe_force_close(s, tok);
+        tok = s.budget.apply(tok).token;
         s.gen_tokens.push_back(tok);
         const bool cont = deliver_generation_token(
             s.job, s.job->req, *s.emitter, tok, s.completion_tokens,
@@ -259,8 +243,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
         // Post-close repetition watchdog (periods 12..80), mirrors
         // do_ar_decode's sweep once the close sequence has fully injected.
-        if (s.hook_started &&
-            s.hook_pos >= (int)s.hook.close_token_ids.size()) {
+        if (s.budget.forced_close() && !s.budget.injecting()) {
             const auto end = s.gen_tokens.end();
             const int avail = (int)s.gen_tokens.size();
             for (int P = 12; P <= 80; P++) {
@@ -336,7 +319,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
         } else if (!req.stream && !s.client_disconnected) {
             send_nonstream_response(req, s.fd, *s.emitter, s.gen_tokens,
-                                    s.n_gen_cap, s.budget_forced_close,
+                                    s.n_gen_cap, s.budget.forced_close(),
                                     s.degenerate_close, gen_timings,
                                     &s.send_buffer);
         }
@@ -496,8 +479,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 [&engine](int target_cut) {
                     return engine.estimate_prefix_store_bytes(target_cut);
                 },
-                req.ends_with_tool_result, /*reachable_from=*/0,
-                backend_.restore_point_spacing());
+                /*reachable_from=*/0, backend_.restore_point_spacing());
             if (capture_reservation.active()) {
                 const uint64_t capture_id = next_prefix_capture_id++;
                 if (next_prefix_capture_id == 0)
@@ -517,7 +499,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             // The same cuts on hits and misses, whatever the cache holds (as the
             // single-sequence path passes GenerateRequest::restore_points).
             prefix_plan.restore_points = request_restore_points(
-                req.prompt_tokens, req.ends_with_tool_result,
+                req.prompt_tokens,
                 {prefix_plan.restore.tokens, prefix_plan.capture.checkpoint.tokens});
         }
         if (prefix_plan.capture.valid()) {
@@ -687,6 +669,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.started_at = started_at;
         s.decode_started_at = started_at;  // sane on prefill failure
         s.cached_prefix_tokens = prefix.restored.tokens;
+        s.prompt_left = (int)req.prompt_tokens.size() - prefix.restored.tokens;
+        s.prompt_new = s.prompt_left;
         s.cache_capture = std::move(prepared_capture);
         s.n_gen_cap = std::min(
             n_gen_cap,
@@ -696,8 +680,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         if (budget_active && !config_.think_close_token_ids.empty() &&
             config_.hard_limit_reply_budget > 0) {
             s.hook.close_token_ids = config_.think_close_token_ids;
+            s.hook.marker_token_ids = config_.think_marker_token_ids;
             s.hook.hard_limit_remaining = eff_reply_for_n_gen;
         }
+        s.budget = luce::common::ThinkingBudget(s.hook, s.n_gen_cap);
         live_slots++;
         publish_live_count();
         return AdmissionDisposition::Admitted;
@@ -725,6 +711,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     std::vector<PrefillCandidate> prefill_candidates;
     prefill_candidates.reserve((size_t)n_slots);
     size_t prefill_round_robin_start = 0;
+    // The decoding requests' turn beside a long prompt
+    // (StepPlanLimits::prefill_time_share): no prompt chunk joins a step that
+    // has them until it ends.
+    std::chrono::steady_clock::time_point decode_only_until{};
 
     while (true) {
         // Phase 1 — Admission: deferred job first (FIFO), then the queue.
@@ -845,6 +835,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     auto & s = slots[(size_t)oldest];
                     if (oldest_state.recompute) {
                         s.prefilling = true;
+                        s.prompt_left = std::numeric_limits<int>::max();
+                        s.prompt_new = std::numeric_limits<int>::max();
                         s.pending_tok = -1;
                         std::fprintf(stderr,
                             "[parallel] slot %d resumed via re-prefill\n",
@@ -893,14 +885,29 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 if (!s.job || parked(i)) continue;
                 if (!s.prefilling) {
                     step_plan.decode.push_back(
-                        {i, s.pending_tok, s.hook.close_token_ids.empty()});
+                        {i, s.pending_tok, s.budget.settled()});
                 } else {
                     prefill_candidates.push_back({i, s.admission_order});
                 }
             }
-            step_plan.prefills = plan_prefill_slices(prefill_candidates,
-                engine.step_plan_limits((int)step_plan.decode.size()),
-                prefill_round_robin_start);
+            const bool decoders_turn = !step_plan.decode.empty() &&
+                std::chrono::steady_clock::now() < decode_only_until;
+            const auto limits = engine.step_plan_limits((int)step_plan.decode.size());
+            // Prompts that finish in one step go first, without the longer
+            // ones: a question asked beside a long document answers after one
+            // short forward, not after the document's next chunk.
+            const auto fits_one_step = [&](const PrefillCandidate & c) {
+                return slots[(size_t)c.slot].prompt_left <= limits.max_prefill_tokens_per_sequence;
+            };
+            if (std::any_of(prefill_candidates.begin(), prefill_candidates.end(), fits_one_step) &&
+                !std::all_of(prefill_candidates.begin(), prefill_candidates.end(), fits_one_step)) {
+                prefill_candidates.erase(std::remove_if(prefill_candidates.begin(), prefill_candidates.end(),
+                    [&](const PrefillCandidate & c) { return !fits_one_step(c); }),
+                    prefill_candidates.end());
+            }
+            step_plan.prefills = decoders_turn
+                ? std::vector<PrefillSlice>{}
+                : plan_prefill_slices(prefill_candidates, limits, prefill_round_robin_start);
         };
         build_plan();
         while (!engine.reserve_decode(step_plan)) {
@@ -966,7 +973,31 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         if (!prefill_candidates.empty()) ++prefill_round_robin_start;
         if (step_plan.decode.empty() && step_plan.prefills.empty()) continue;
 
+        const auto step_started = std::chrono::steady_clock::now();
         SeqEngine::StepResult step_result = engine.step(step_plan);
+        // A long prompt shares the time with the decoding requests, from its
+        // first chunk to its last; a short one (an agent's next turn, even when
+        // a prefix capture splits it in two forwards) does not hold them up.
+        const auto step_limits = engine.step_plan_limits((int)step_plan.decode.size());
+        const int long_prompt_tokens = step_limits.time_share_prompt_tokens > 0
+            ? step_limits.time_share_prompt_tokens
+            : step_limits.max_prefill_tokens_per_sequence;
+        bool long_prompt = false;
+        for (const PrefillSlice & slice : step_plan.prefills) {
+            SchedSlot & s = slots[(size_t)slice.slot];
+            long_prompt |= s.prompt_new > long_prompt_tokens;
+            if (s.prompt_left != std::numeric_limits<int>::max())
+                s.prompt_left = std::max(0, s.prompt_left - slice.max_tokens);
+        }
+        if (long_prompt && !step_plan.decode.empty()) {
+            const double share = step_limits.prefill_time_share;
+            if (share > 0.0 && share < 1.0) {
+                const auto now = std::chrono::steady_clock::now();
+                decode_only_until = now + std::chrono::duration_cast<
+                    std::chrono::steady_clock::duration>(
+                        (now - step_started) * ((1.0 - share) / share));
+            }
+        }
         const std::string protocol_error =
             validate_step_result(step_plan, step_result, n_slots);
         if (!protocol_error.empty()) {
@@ -1019,7 +1050,17 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 using Resolution = PrefixCaptureTxn::Resolution;
                 const Resolution resolution = s.cache_capture.resolve(
                     out.prefix_store, s.job->req.prompt_tokens);
-                if (resolution == Resolution::failed) {
+                if (resolution == Resolution::saved) {
+                    // A conversation's checkpoints are prefixes of each other;
+                    // restores use only the deepest, so the ones it supersedes
+                    // would hold memory the other conversations need.
+                    std::vector<int> tokens;
+                    const auto pruned = prefix_cache_.prune_superseded_ancestors(
+                        (int)out.prefix_store.ticket.checkpoint.id - 1, &tokens);
+                    for (size_t i = 0; i < pruned.size(); ++i) {
+                        engine.discard_prefix_store({(uint64_t)pruned[i] + 1, tokens[i]});
+                    }
+                } else if (resolution == Resolution::failed) {
                     std::fprintf(stderr,
                         "[parallel-pc] capture failed checkpoint=%llu: %s\n",
                         (unsigned long long)

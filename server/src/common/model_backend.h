@@ -158,6 +158,9 @@ struct ModelBackend {
     // Print the "[<arch>-daemon] ready ..." banner on stdout.
     virtual void print_ready_banner() const = 0;
     virtual int prefill_chunk_size() const { return 0; }
+    // The context one sequence can hold, from a backend that can fit it to
+    // its devices (DevicePlacement::fit_ctx); 0 from one that cannot.
+    virtual int context_limit() const { return 0; }
 
     // ── Park / unpark ────────────────────────────────────────────────
     // Backend decides which resources to release/restore. Returns true on
@@ -169,6 +172,12 @@ struct ModelBackend {
     // ── Generation ───────────────────────────────────────────────────
     // Run a full prefill + decode cycle. Backend owns the strategy
     // (autoregressive, speculative, DDTree, …).
+    // Decode contract for every backend, including restore paths: create one
+    // ThinkingBudget from req.budget_hook and the effective output cap. Share
+    // it with the seed and all decode strategies. Apply accepted candidates
+    // before history/KV/emission; never process prompts or replay tokens.
+    // A speculative cut must repair KV even if emission cancels the request.
+    // Prefer the shared AR/speculative loops when adding a model adapter.
     GenerateResult generate(const GenerateRequest & req, const DaemonIO & io) {
         GenerateResult result = generate_impl(req, io);
         if (!should_retry_empty_spec_decode(req, result)) return result;
@@ -260,9 +269,9 @@ struct ModelBackend {
     virtual int restore_point_spacing() const { return 0; }
 
     // True when the backend ends a prompt forward at every restore point
-    // (GenerateRequest::restore_points). A tool-result request then keeps its
-    // own last boundary among them, so a hit that skips the capture and a
-    // miss that captures the tools head cut prefill alike.
+    // (GenerateRequest::restore_points). A request then keeps its own last
+    // boundary among them, where its snapshot goes, so a hit that skips the
+    // capture and a miss that captures cut prefill alike.
     virtual bool prefill_cuts_at_restore_points() const { return false; }
 
     // System-memory bytes a snapshot of the first `tokens` positions would

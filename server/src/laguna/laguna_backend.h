@@ -12,6 +12,7 @@
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
 #include "common/dflash_draft_kv.h"
+#include "common/thinking_budget.h"
 #include "placement/placement_config.h"
 #include "qwen3_drafter.h"
 #include "kvflash_pager.h"
@@ -198,8 +199,7 @@ private:
     bool do_spec_decode(int committed, int n_gen,
                         std::vector<int32_t> & out_tokens,
                         const DaemonIO & io,
-                        const BudgetHook * budget_hook = nullptr,
-                        bool * forced_close_out = nullptr,
+                        ThinkingBudget & budget,
                         float * accept_rate_out = nullptr,
                         const std::vector<int32_t> * sample_history_prefix = nullptr);
 };

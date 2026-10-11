@@ -128,16 +128,22 @@ static void print_usage(const char * prog) {
         "  --mmproj-device hip:N  Run the DS4V image encoder on another GPU (one-GPU layout)\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
-        "  --max-ctx <N>        Max context length (default: 8192)\n"
+        "  --max-ctx <N|auto>   Max context length (default: 8192). auto: the model's\n"
+        "                       trained context, lowered to what the devices hold\n"
+        "                       (Qwen3.8-Flash-Next)\n"
         "  --max-tokens <N>     Default max output tokens (legacy alias for\n"
         "                       --default-max-tokens; loses to --default-max-tokens\n"
         "                       when both are passed)\n"
         "  --target-device <backend:gpu|auto>\n"
         "                                 Target device (default: auto:0, the first\n"
-        "                                 GPU). auto picks a GPU the model fits on,\n"
-        "                                 discrete before integrated, else the\n"
-        "                                 largest; see --list-devices. Env default:\n"
-        "                                 LUCE_TARGET_DEVICE\n"
+        "                                 GPU). auto skips GPUs another process\n"
+        "                                 computes on and sizes by free memory: a\n"
+        "                                 discrete GPU that holds the model, else\n"
+        "                                 the model's multi-GPU technique over all\n"
+        "                                 free GPUs (DeepSeek4 expert parallel,\n"
+        "                                 others layer split; not with --profile),\n"
+        "                                 else one GPU that holds it; see\n"
+        "                                 --list-devices. Env: LUCE_TARGET_DEVICE\n"
         "  --draft-device <backend:gpu>   Draft device (default: auto:0; DeepSeek4\n"
         "                                 and --target-device auto: the target GPU)\n"
         "  --expert-device <backend:gpu>  DeepSeek4, Qwen3.8-Flash-Next: keep dense work\n"
@@ -475,7 +481,8 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             sconfig.host = argv[++i];
         } else if (std::strcmp(argv[i], "--max-ctx") == 0 && i + 1 < argc) {
-            int v = std::atoi(argv[++i]);
+            bargs.device.fit_ctx = std::strcmp(argv[++i], "auto") == 0;
+            int v = bargs.device.fit_ctx ? 0 : std::atoi(argv[i]);
             sconfig.max_ctx = v;
             bargs.device.max_ctx = v;
         } else if (std::strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
@@ -1073,6 +1080,16 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
     if (bargs.max_concurrency > 1 &&
         inspect_gguf_model_info(bargs.model_path.c_str()).arch != "qwen4exp")
         bargs.paged_attention = true;
+    // --max-ctx auto starts from the trained context; the backend lowers it to what its devices hold.
+    if (bargs.device.fit_ctx) {
+        const GgufMetadata meta = read_gguf_metadata(bargs.model_path, false);
+        if (meta.general_architecture != "qwen4exp" || meta.context_length <= 0) {
+            std::fprintf(stderr, "[server] --max-ctx auto needs a model whose backend fits its context to the "
+                                 "devices (Qwen3.8-Flash-Next); give --max-ctx a token count\n");
+            return 2;
+        }
+        bargs.device.max_ctx = meta.context_length;
+    }
     if (sconfig.decode_kv_offload_bytes &&
         sconfig.decode_kv_offload_bytes != kAutoKvOffloadBytes && bargs.max_concurrency <= 1) {
         std::fprintf(stderr, "[server] --decode-kv-offload-mb requires --max-concurrency greater than 1\n");
@@ -1104,9 +1121,37 @@ static uint64_t model_kv_cache_bytes(const ModelOptions & model) {
                                override_type(model.cache_type_v));
 }
 
-// --target-device auto: bind the model block to the GPU the policy picks.
+// The placement `--target-device auto` picks for a model: availability over
+// live device state, and the architecture's multi-GPU technique. A launch
+// profile is a recipe qualified for one topology, so with one auto only picks
+// the device.
+static AutoPlacement plan_auto_placement(const std::vector<GpuDeviceInfo> & devices,
+                                         const BackendArgs & args,
+                                         uint64_t model_bytes, uint64_t kv_bytes,
+                                         bool allow_multi_gpu) {
+    const std::string arch = inspect_gguf_model_info(args.model_path.c_str()).arch;
+    AutoPlacementRequest request;
+    request.model_bytes = model_bytes;
+    request.kv_bytes = kv_bytes;
+    request.technique = allow_multi_gpu ? auto_multi_gpu_technique(arch, args)
+                                        : MultiGpuTechnique::None;
+    request.can_offload = arch_has_expert_offload(arch);
+    request.paged_expert_parallel = args.paged_attention;
+    return choose_auto_placement(devices, request);
+}
+
+static std::string auto_placement_devices(const AutoPlacement & placement) {
+    const char * backend = placement_backend_name(compiled_placement_backend());
+    std::string out;
+    for (int gpu : placement.gpus) {
+        out += std::string(out.empty() ? "" : ",") + backend + ":" + std::to_string(gpu);
+    }
+    return out;
+}
+
+// --target-device auto: bind the model block to the placement the policy picks.
 static bool resolve_auto_target_device(ModelOptions & model) {
-    const std::vector<GpuDeviceInfo> devices = enumerate_gpu_devices();
+    const std::vector<GpuDeviceInfo> devices = enumerate_gpu_devices(/*query_free=*/true);
     const uint64_t model_bytes = gguf_model_bytes(model.bargs.model_path);
     if (model_bytes == 0) {
         std::fprintf(stderr, "[server] --target-device auto: cannot read model %s\n",
@@ -1116,21 +1161,43 @@ static bool resolve_auto_target_device(ModelOptions & model) {
     // One sequence at --max-ctx must fit; paged serving sizes its pool from
     // whatever memory is left.
     const uint64_t kv_bytes = model_kv_cache_bytes(model);
-    const AutoDeviceChoice choice = choose_auto_target_device(devices, model_bytes, kv_bytes);
-    if (choice.index < 0) {
-        std::fprintf(stderr, "[server] --target-device auto: %s\n", choice.reason.c_str());
+    for (const GpuDeviceInfo & device : devices) {
+        std::fprintf(stderr,
+            "[server] --target-device auto: %s:%d (%s, %s) %.1f GiB free%s%s\n",
+            placement_backend_name(compiled_placement_backend()), device.index,
+            device.name.c_str(), device.arch.c_str(), bytes_to_gib(auto_device_capacity(device)),
+            device.busy ? ", busy: " : "", device.busy_by.c_str());
+    }
+    const AutoPlacement placement = plan_auto_placement(
+        devices, model.bargs, model_bytes, kv_bytes,
+        /*allow_multi_gpu=*/model.profile == nullptr);
+    if (placement.gpus.empty()) {
+        std::fprintf(stderr, "[server] --target-device auto: %s (%.1f GiB model + %.1f GiB KV)\n",
+                     placement.reason.c_str(), bytes_to_gib(model_bytes), bytes_to_gib(kv_bytes));
         return false;
     }
     DevicePlacement & target = model.bargs.device;
-    target.backend = compiled_placement_backend();
-    target.gpu = choice.index;
-    const GpuDeviceInfo & device = devices[(size_t) choice.index];
+    const PlacementBackend backend = compiled_placement_backend();
+    target.backend = backend;
+    target.gpu = placement.gpus[0];
+    if (placement.technique == MultiGpuTechnique::LayerSplit) {
+        target.split_mode = TargetSplitMode::Layer;
+        target.layer_split_gpus = placement.gpus;
+        target.layer_split_backends.assign(placement.gpus.size(), backend);
+        target.layer_split_weights = placement.layer_weights;
+    } else if (placement.technique == MultiGpuTechnique::ExpertParallel) {
+        DevicePlacement expert;
+        expert.backend = backend;
+        expert.gpu = placement.gpus[1];
+        model.expert_device = expert;
+        // The routed-expert join copies between the two GPUs every layer.
+        target.peer_access = true;
+    }
     std::fprintf(stderr,
-        "[server] --target-device auto: %s (%s, %s, %.1f GiB) for a %.1f GiB model"
-        " + %.1f GiB KV at %d tokens: %s\n",
-        placement_device_name(target).c_str(), device.name.c_str(), device.arch.c_str(),
-        bytes_to_gib(device.total_bytes), bytes_to_gib(model_bytes), bytes_to_gib(kv_bytes),
-        model.bargs.device.max_ctx, choice.reason.c_str());
+        "[server] --target-device auto: %s on %s for a %.1f GiB model + %.1f GiB KV at %d tokens: %s\n",
+        multi_gpu_technique_name(placement.technique), auto_placement_devices(placement).c_str(),
+        bytes_to_gib(model_bytes), bytes_to_gib(kv_bytes), target.max_ctx,
+        placement.reason.c_str());
     return true;
 }
 
@@ -1647,6 +1714,10 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         backend_owner = std::move(head);
     }
     ModelBackend * backend = backend_owner.get();
+    // --max-ctx auto: serve the context the backend fitted to its devices.
+    if (backend_placement.target.fit_ctx && backend->context_limit() > 0) {
+        sconfig.max_ctx = backend->context_limit();
+    }
     // Cross-check the capability table against the backend that was actually
     // built. arch_supports_remote_draft() admitted this launch from the arch
     // string alone; if the two ever disagree the table is stale, and failing
@@ -2057,6 +2128,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         auto close_ids = tokenizer.encode(close_text);
         if (!close_ids.empty()) {
             sconfig.think_close_token_ids = close_ids;
+            // The marker alone is how the hook recognizes that the model
+            // closed thinking itself, after which it no longer intervenes.
+            sconfig.think_marker_token_ids = tokenizer.encode(marker);
             const char * src = card.thinking_terminator_hint.empty()
                                    ? "marker-only" : "sidecar-hint";
             std::fprintf(stderr,
@@ -2119,11 +2193,12 @@ static int list_devices(const char * model_path) {
     const std::vector<GpuDeviceInfo> devices = enumerate_gpu_devices(/*query_free=*/true);
     const char * backend = placement_backend_name(compiled_placement_backend());
     for (const GpuDeviceInfo & device : devices) {
-        std::printf("device %s:%d arch=%s type=%s total_mib=%llu free_mib=%llu name=%s\n",
+        std::printf("device %s:%d arch=%s type=%s total_mib=%llu free_mib=%llu busy=%s name=%s\n",
             backend, device.index, device.arch.empty() ? "unknown" : device.arch.c_str(),
             device.integrated ? "integrated" : "discrete",
             (unsigned long long) (device.total_bytes >> 20),
-            (unsigned long long) (device.free_bytes >> 20), device.name.c_str());
+            (unsigned long long) (device.free_bytes >> 20),
+            device.busy ? device.busy_by.c_str() : "no", device.name.c_str());
     }
     if (!model_path) return devices.empty() ? 1 : 0;
 
@@ -2139,15 +2214,20 @@ static int list_devices(const char * model_path) {
         info.arch.empty() ? "unknown" : info.arch.c_str(),
         (unsigned long long) (model_bytes >> 20), (unsigned long long) (kv_bytes >> 20),
         model_path);
-    const AutoDeviceChoice choice = choose_auto_target_device(devices, model_bytes, kv_bytes);
-    if (choice.index < 0) {
-        std::printf("auto none reason=%s\n", choice.reason.c_str());
+    BackendArgs args;
+    args.model_path = model_path;
+    const AutoPlacement placement = plan_auto_placement(
+        devices, args, model_bytes, kv_bytes, /*allow_multi_gpu=*/true);
+    if (placement.gpus.empty()) {
+        std::printf("auto none reason=%s\n", placement.reason.c_str());
         return 1;
     }
-    std::printf("auto %s:%d fits=%s total_mib=%llu reason=%s\n", backend, choice.index,
-        choice.fits ? "yes" : "no",
-        (unsigned long long) (devices[(size_t) choice.index].total_bytes >> 20),
-        choice.reason.c_str());
+    std::printf("auto %s technique=%s fits=%s reason=%s\n",
+        auto_placement_devices(placement).c_str(),
+        placement.technique == MultiGpuTechnique::LayerSplit ? "layer-split"
+        : placement.technique == MultiGpuTechnique::ExpertParallel ? "expert-parallel"
+        : "single",
+        placement.fits ? "yes" : "no", placement.reason.c_str());
     return 0;
 }
 

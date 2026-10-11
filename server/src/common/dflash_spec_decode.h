@@ -57,13 +57,16 @@ bool run_dflash_spec_decode(
         const std::vector<int32_t> * hint_tokens = nullptr,
         int base_pos = 0);
 
+// Server adapters must pass the request's controller. Replacements are applied
+// before KV commit; a cut restores/replays only the emitted prefix, including
+// on cancellation. No target-specific thinking policy is needed.
 bool run_dflash_spec_decode(
         DFlashTarget & target,
         DraftWeights & draft_weights,
         ggml_backend_t draft_backend,
         DraftFeatureMirror & feature_ring,
         const std::vector<int32_t> & prompt,
-        int n_gen,
+        ThinkingBudget & budget,
         int last_tok,
         const char * out_path,
         int draft_ctx_max,

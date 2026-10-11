@@ -88,6 +88,28 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
     };
 }
 
+json responses_output_items(const std::string & message_id,
+                            const std::string & text,
+                            const std::vector<ToolCall> & calls) {
+    json items = json::array();
+    items.push_back({
+        {"type", "message"}, {"id", message_id},
+        {"status", "completed"}, {"role", "assistant"},
+        {"content", json::array({{
+            {"type", "output_text"}, {"text", text},
+            {"annotations", json::array()}
+        }})}
+    });
+    for (const auto & tc : calls) {
+        items.push_back({
+            {"type", "function_call"}, {"id", tc.id},
+            {"status", "completed"}, {"call_id", tc.id},
+            {"name", tc.name}, {"arguments", tc.arguments}
+        });
+    }
+    return items;
+}
+
 // ─── Constructor ────────────────────────────────────────────────────────
 
 SseEmitter::SseEmitter(ApiFormat format,
@@ -433,6 +455,17 @@ std::vector<std::string> SseEmitter::emit_token(const std::string & raw_piece) {
         }
 
         // mode_ == StreamMode::CONTENT
+        // The reply starts at its first line of text: the newlines a template
+        // puts after </think> are not part of it (apps would show them as
+        // blank lines on top). Spaces stay: they can indent its first line.
+        if (accumulated_content_.empty()) {
+            const size_t first = window_.find_first_not_of("\r\n");
+            if (first == std::string::npos) {
+                window_.clear();
+                break;
+            }
+            window_.erase(0, first);
+        }
         // Look for <think>, </think>, or supported tool-call starts.
         size_t think_idx = window_.find(THINK_OPEN);
         size_t think_close_idx = window_.find(THINK_CLOSE);
@@ -888,18 +921,9 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 break;
             }
             case ApiFormat::RESPONSES:
-                for (const auto & tc : tool_calls_) {
-                    out.push_back(format_responses_event(
-                        "response.function_call_arguments.delta", {
-                            {"item_id", tc.id}, {"output_index", 0},
-                            {"delta", tc.arguments}
-                        }));
-                    out.push_back(format_responses_event(
-                        "response.function_call_arguments.done", {
-                            {"item_id", tc.id}, {"output_index", 0},
-                            {"arguments", tc.arguments}, {"name", tc.name}
-                        }));
-                }
+                // Each function_call is its own output item, emitted after
+                // the message item is closed (below): output_item.added,
+                // arguments delta / done, output_item.done.
                 break;
             default: break;
             }
@@ -951,6 +975,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             {"total_tokens", prompt_tokens_ + completion_tokens}
         };
         if (timings) {
+            // OpenAI's field for the prompt tokens a cache served.
+            usage_body["prompt_tokens_details"] = {{"cached_tokens", timings->cached_prefix_tokens}};
             usage_body["timings"] = build_timings_json(*timings, completion_tokens);
         }
         json usage = {
@@ -1012,32 +1038,37 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                       {"annotations", json::array()}}}
         }));
 
-        // Build final output items
-        json final_output = json::array();
-        if (!tool_calls_.empty()) {
-            for (const auto & tc : tool_calls_) {
-                final_output.push_back({
-                    {"type", "function_call"}, {"id", tc.id},
-                    {"status", "completed"}, {"call_id", tc.id},
-                    {"name", tc.name}, {"arguments", tc.arguments}
-                });
-            }
-        } else {
-            final_output.push_back({
-                {"type", "message"}, {"id", msg_item_id_},
-                {"status", "completed"}, {"role", "assistant"},
-                {"content", json::array({{
-                    {"type", "output_text"}, {"text", accumulated_content_},
-                    {"annotations", json::array()}
-                }})}
-            });
-        }
-
-        // output_item.done for each item
-        for (size_t i = 0; i < final_output.size(); i++) {
+        // Output items, in stream order (OpenAI Responses stream contract):
+        // the message item emit_start opened at output_index 0 is closed
+        // first; each function call is then its own item -- added,
+        // arguments delta and done, done -- at the next output_index.
+        // Clients such as Pi build a tool call only from an item that
+        // response.output_item.added opened.
+        const json final_output = responses_output_items(
+            msg_item_id_, accumulated_content_, tool_calls_);
+        out.push_back(format_responses_event("response.output_item.done", {
+            {"output_index", 0}, {"item", final_output[0]}
+        }));
+        for (size_t index = 1; index < final_output.size(); ++index) {
+            const json & done = final_output[index];
+            json added = done;
+            added["status"] = "in_progress";
+            added["arguments"] = "";
+            out.push_back(format_responses_event("response.output_item.added", {
+                {"output_index", (int) index}, {"item", added}
+            }));
+            out.push_back(format_responses_event(
+                "response.function_call_arguments.delta", {
+                    {"item_id", done["id"]}, {"output_index", (int) index},
+                    {"delta", done["arguments"]}
+                }));
+            out.push_back(format_responses_event(
+                "response.function_call_arguments.done", {
+                    {"item_id", done["id"]}, {"output_index", (int) index},
+                    {"arguments", done["arguments"]}, {"name", done["name"]}
+                }));
             out.push_back(format_responses_event("response.output_item.done", {
-                {"output_index", (int)i},
-                {"item", final_output[i]}
+                {"output_index", (int) index}, {"item", done}
             }));
         }
 
@@ -1048,6 +1079,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             {"total_tokens", prompt_tokens_ + completion_tokens}
         };
         if (timings) {
+            resp_usage["input_tokens_details"] = {{"cached_tokens", timings->cached_prefix_tokens}};
             resp_usage["timings"] = build_timings_json(*timings, completion_tokens);
         }
         json shell = {

@@ -368,8 +368,7 @@ private:
                    const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io,
-                   const BudgetHook & budget_hook = {},
-                   bool * forced_close_out = nullptr);
+                   ThinkingBudget & budget);
 
     bool load_model();
     bool init_hybrid_model();

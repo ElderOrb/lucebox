@@ -6,6 +6,7 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/thinking_budget.h"
 #include "placement/placement_config.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
@@ -128,29 +129,17 @@ private:
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
                    int kv_offset = 0);
 
-    // Autoregressive decode loop.
-    // budget_hook (when close_token_ids is non-empty) overrides the next
-    // sampled token(s) with the close-tag sequence once (n_gen - committed)
-    // <= hard_limit. Mirrors qwen35's do_ar_decode. For Gemma4 the close
-    // tag is typically `<channel|>` (single token in the gemma4 vocab).
-    // forced_close_out, when non-null, is set to true iff the hook injected
-    // the close sequence (vs. the model self-closing). See qwen35_backend.h
-    // for full rationale.
-    bool do_decode(int committed, int n_gen,
+    // Emit next_tok (not yet committed to KV), then continue autoregressively.
+    // The request's controller covers the seed and any speculative prefix.
+    bool do_decode(int committed, int32_t next_tok,
                    std::vector<int32_t> & out_tokens,
-                   const DaemonIO & io,
-                   const BudgetHook & budget_hook = {},
-                   bool * forced_close_out = nullptr);
+                   const DaemonIO & io, ThinkingBudget & budget);
 
-    // DFlash speculative decode loop.
-    // When budget_hook is non-null and (n_gen - generated) falls within
-    // hard_limit + batch headroom, breaks out and tails via do_decode so
-    // the force-close override fires cleanly with KV state intact.
-    bool do_spec_decode(int committed, int n_gen,
+    // DFlash hands the uncommitted next token and the same controller to AR
+    // before a verified block could reach the force-close boundary.
+    bool do_spec_decode(int committed,
                         std::vector<int32_t> & out_tokens,
-                        const DaemonIO & io,
-                        const BudgetHook * budget_hook = nullptr,
-                        bool * forced_close_out = nullptr,
+                        const DaemonIO & io, ThinkingBudget & budget,
                         float * accept_rate_out = nullptr);
 
     bool load_decode_draft();

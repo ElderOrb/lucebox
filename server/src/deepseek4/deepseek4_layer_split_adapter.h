@@ -52,7 +52,7 @@ public:
     int prefill_chunk_tokens() const override { return cfg_.chunk; }
     bool prefill(const std::vector<int32_t> & prompt,
                  int base_pos, int & last_tok) override;
-    bool decode_ar(int last_tok, int committed, int n_gen,
+    bool decode_ar(int last_tok, int committed, ThinkingBudget & budget,
                    const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override;

@@ -1292,14 +1292,12 @@ Qwen4ExpInputs qwen4exp_prepare_inputs(const Qwen4ExpWeights & w,
     return res;
 }
 
-// Split mode placement: the routed experts on the expert device, every other
-// node and the graph inputs on the target. Left unpinned, the scheduler places
-// a node after its graph-order neighbour, often an expert split, and keeps graph
-// inputs on the CPU, copying them to each split that reads them; a strided view
-// of an input (MTP prefill's per-block positions) cannot be copied as one span.
+// Split mode placement: the routed experts, and the attention of layers whose cache rows live there, on the expert
+// device; every other node and the graph inputs on the target. Left unpinned, the scheduler places a node after its
+// graph-order neighbour, often an expert split, and keeps graph inputs on the CPU, copying them to each split that
+// reads them; a strided view of an input (MTP prefill's per-block positions) cannot be copied as one span.
 static void qwen4exp_pin_split(ggml_backend_sched_t sched, ggml_cgraph * gf, ggml_backend_t target,
                                ggml_backend_t expert, const std::vector<ggml_tensor *> & expert_nodes) {
-    for (ggml_tensor * t : expert_nodes) ggml_backend_sched_set_tensor_backend(sched, t, expert);
     const std::unordered_set<const ggml_tensor *> on_expert(expert_nodes.begin(), expert_nodes.end());
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
@@ -1312,7 +1310,9 @@ static void qwen4exp_pin_split(ggml_backend_sched_t sched, ggml_cgraph * gf, ggm
         }
         const bool view = node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
                           node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
-        if (!view && !on_expert.count(node) && ggml_backend_supports_op(target, node)) {
+        if (on_expert.count(node)) {
+            ggml_backend_sched_set_tensor_backend(sched, node, expert);
+        } else if (!view && ggml_backend_supports_op(target, node)) {
             ggml_backend_sched_set_tensor_backend(sched, node, target);
         }
     }
@@ -1373,6 +1373,24 @@ struct Qwen4ExpLayerBuilder {
     // Layer il + 1 starts with PLE, so layer il's output cannot be fused with its attention norm.
     bool next_is_ple(int il) const { return il + 1 < w.n_layer && w.layers[il + 1].is_ple && has_ple; }
 
+    // Full-attention layer `fi`'s attention, from its input projections through the output projection: with its
+    // cache rows on the expert device (Qwen4ExpCache::remote), every node `build` adds runs there, beside those rows
+    // and the layer's weights (move_qwen4exp_attention); only the input and the output cross.
+    template<class Build> ggml_tensor * on_cache_device(int fi, Build build) {
+        if (!cache.remote(fi)) return build();
+        ggml_tensor * last = nullptr;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) last = t;
+        ggml_tensor * out = build();
+        for (ggml_tensor * t = last ? ggml_get_next_tensor(ctx, last) : ggml_get_first_tensor(ctx); t;
+             t = ggml_get_next_tensor(ctx, t)) {
+            // Views stay with their source, as qwen4exp_pin_split leaves them; inputs stay on the target.
+            const bool view = t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+                              t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+            if (!view && !(t->flags & GGML_TENSOR_FLAG_INPUT)) expert_nodes.push_back(t);
+        }
+        return out;
+    }
+
     // The HC mix into layer il's attention input, from the previous layer's fused norm when xn_next holds it
     // (consumed). `inject` receives the mix's injection.
     ggml_tensor * attn_input(int il, ggml_tensor * res_hc, ggml_tensor *& xn_next, ggml_tensor *& inject) {
@@ -1397,12 +1415,14 @@ struct Qwen4ExpLayerBuilder {
         ggml_tensor * cur = attn_input(il, res_hc, xn_next, inject);
         if (L.is_full_attention) {
             const int fi = full_idx[il];
-            return build_full_attn(ctx, gf, cur, L, w,
-                                   cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
-                                   w.qsa ? cache.indexer_raw[fi] : nullptr,
-                                   b.positions, b.mask, kv_row, b.kv_len, b.pos0,
-                                   il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
-                                   b.n_pooled, b.qsa, rows, qsa_ws);
+            return on_cache_device(fi, [&] {
+                return build_full_attn(ctx, gf, cur, L, w,
+                                       cache.attn_k[fi], cache.attn_v[fi], cache.indexer_k[fi],
+                                       w.qsa ? cache.indexer_raw[fi] : nullptr,
+                                       b.positions, b.mask, kv_row, b.kv_len, b.pos0,
+                                       il < (int) w.compress_ratios.size() ? w.compress_ratios[il] : 0,
+                                       b.n_pooled, b.qsa, rows, qsa_ws);
+            });
         }
         const int li = lin_idx[il];
         return build_linear_attn(ctx, gf, cur, L, w, cache.ssm_state[li], cache.conv_state[li],
@@ -1760,24 +1780,30 @@ static bool run_stable_graph(Qwen4ExpStableInputs & in, Qwen4ExpDecodeWorkspace 
 }
 
 // Dense decode may not have maintained the pooled QSA prefix: pool the already-cached complete blocks before pos0
-// once. The stable graph handles this forward's own blocks.
+// once, on the device holding each layer's rows (Qwen4ExpCache::remote). The stable graph handles this forward's own
+// blocks.
 static bool bootstrap_qsa_prefix(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache, int pos0) {
-    ggml_context * bc = ggml_init({8 * 1024 * 1024, nullptr, true});
-    if (!bc) return false;
-    ggml_cgraph * bg = ggml_new_graph_custom(bc, 8192, false);
-    for (size_t fi = 0; fi < cache.full_layer_ids.size(); ++fi) {
-        const auto & L = w.layers[cache.full_layer_ids[fi]];
-        qsa_pooled_keys(bc, bg, L, w, cache.indexer_k[fi], cache.indexer_raw[fi], nullptr,
-                        pos0, 4, cache.indexer_blocks, pos0 / 4);
+    for (ggml_backend_t device : {backend, cache.remote_backend}) {
+        if (!device) continue;
+        ggml_context * bc = ggml_init({8 * 1024 * 1024, nullptr, true});
+        if (!bc) return false;
+        ggml_cgraph * bg = ggml_new_graph_custom(bc, 8192, false);
+        for (size_t fi = 0; fi < cache.full_layer_ids.size(); ++fi) {
+            if (cache.remote((int) fi) != (device != backend)) continue;
+            const auto & L = w.layers[cache.full_layer_ids[fi]];
+            qsa_pooled_keys(bc, bg, L, w, cache.indexer_k[fi], cache.indexer_raw[fi], nullptr,
+                            pos0, 4, cache.indexer_blocks, pos0 / 4);
+        }
+        ggml_gallocr_t ba = ggml_graph_n_nodes(bg) ? ggml_gallocr_new(ggml_backend_get_default_buffer_type(device)) : nullptr;
+        const bool ok = !ggml_graph_n_nodes(bg) || (ba && ggml_gallocr_alloc_graph(ba, bg) &&
+            ggml_backend_graph_compute(device, bg) == GGML_STATUS_SUCCESS);
+        ggml_backend_cuda_graph_invalidate_range(device, ggml_get_mem_buffer(bc), ggml_get_mem_size(bc));
+        if (ba) ggml_gallocr_free(ba);
+        ggml_free(bc);
+        if (!ok) return false;
     }
-    ggml_gallocr_t ba = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    const bool ok = ba && ggml_gallocr_alloc_graph(ba, bg) &&
-        ggml_backend_graph_compute(backend, bg) == GGML_STATUS_SUCCESS;
-    ggml_backend_cuda_graph_invalidate_range(backend, ggml_get_mem_buffer(bc), ggml_get_mem_size(bc));
-    if (ba) ggml_gallocr_free(ba);
-    ggml_free(bc);
-    if (ok) cache.indexer_blocks = pos0 / 4;
-    return ok;
+    cache.indexer_blocks = pos0 / 4;
+    return true;
 }
 
 // The graph's metadata context: a decode or verify workspace's own (`pool`), reset for a rebuild, or a fresh one.
@@ -1812,13 +1838,17 @@ static ggml_context * graph_context(Qwen4ExpDecodeWorkspace * pool, ggml_backend
 // Split mode: one scheduler for decode, verify and short batches, one for prompt chunks; a verify width keeps its
 // own short-batch scheduler (and allocation) beside its graph (`pool`). The chunk planner measures the live
 // split-input copies through ggml_backend_sched_reserve_size.
+// The cache whose split schedulers `c` uses (Qwen4ExpCache::split_owner).
+static Qwen4ExpCache & split_owner(Qwen4ExpCache & c) { return c.split_owner ? *c.split_owner : c; }
+
 static ggml_backend_sched_t split_scheduler(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
                                             Qwen4ExpDecodeWorkspace * pool, bool verify, bool short_batch) {
+    Qwen4ExpCache & owner = split_owner(cache);
     ggml_backend_sched_t & sched = verify && pool ? pool->sched
-                                 : short_batch ? cache.split_sched_short : cache.split_sched;
+                                 : short_batch ? owner.split_sched_short : owner.split_sched;
     if (!sched) {
-        if (!cache.split_cpu) cache.split_cpu = ggml_backend_cpu_init();
-        ggml_backend_t backends[3] = { backend, w.expert_backend, cache.split_cpu };
+        if (!owner.split_cpu) owner.split_cpu = ggml_backend_cpu_init();
+        ggml_backend_t backends[3] = { backend, w.expert_backend, owner.split_cpu };
         // Both are parallel: per-copy events make a split wait for its
         // cross-device inputs on the GPU; a single-copy scheduler instead
         // synchronizes the receiving device from the host before every such
@@ -1887,7 +1917,7 @@ static void measure_split_graph(ggml_backend_t backend, const Qwen4ExpWeights & 
                                 ggml_cgraph * gf, const std::vector<ggml_tensor *> & expert_nodes, int64_t T, int pos0,
                                 bool verify, Qwen4ExpGraphMemory & measure) {
     ggml_backend_sched_t sched = split_scheduler(backend, w, cache, nullptr, verify, T <= kSplitShortRows);
-    const ggml_backend_t devices[3] = { backend, w.expert_backend, cache.split_cpu };
+    const ggml_backend_t devices[3] = { backend, w.expert_backend, split_owner(cache).split_cpu };
     const ggml_tensor * unplaced = nullptr;
     for (int i = 0; i < ggml_graph_n_nodes(gf) && !unplaced; ++i) {
         const ggml_tensor * node = ggml_graph_node(gf, i);
@@ -1907,7 +1937,7 @@ static void measure_split_graph(ggml_backend_t backend, const Qwen4ExpWeights & 
     size_t sizes[3] = {};
     ggml_backend_sched_reserve_size(sched, gf, sizes);
     ggml_backend_sched_reset(sched);
-    if (T <= kSplitShortRows) ++cache.split_short_gen;   // a retained stable graph must allocate again
+    if (T <= kSplitShortRows) ++split_owner(cache).split_short_gen;   // a retained stable graph must allocate again
     measure.graph = sizes[0];
 }
 
@@ -1947,23 +1977,36 @@ static bool place_inputs_in_ring(ggml_backend_t backend, const Qwen4ExpWeights &
     return true;
 }
 
+// The CUDA pools keep every block they free, so the growing temporaries of a long prompt can hold the memory a graph
+// allocation needs. Release the devices' cached blocks (ggml_backend_cuda_trim_pool); true when any came back.
+static bool release_cached_pools(ggml_backend_t backend, const Qwen4ExpWeights & w) {
+    size_t freed = ggml_backend_cuda_trim_pool(backend);
+    if (w.expert_backend) freed += ggml_backend_cuda_trim_pool(w.expert_backend);
+    if (freed) std::fprintf(stderr, "[qwen4exp] released %zu MiB of cached pool memory for a graph\n", freed >> 20);
+    return freed > 0;
+}
+
 // Allocate the graph: on the split scheduler (weights decide placement, see qwen4exp_pin_split), or with the
-// workspace's retained allocator (`pool`), or a fresh one (`galloc`, the caller frees it). On failure the caller
-// frees its context unless the workspace owns it.
+// workspace's retained allocator (`pool`), or a fresh one (`galloc`, the caller frees it). A failed allocation
+// retries once with the cached pool memory released. On failure the caller frees its context unless the workspace
+// owns it.
 static bool allocate_graph(ggml_backend_t backend, const Qwen4ExpWeights & w, Qwen4ExpCache & cache,
                            Qwen4ExpDecodeWorkspace * pool, bool verify, ggml_cgraph * gf,
                            const std::vector<ggml_tensor *> & expert_nodes, int64_t T, int64_t kv_len,
                            ggml_backend_sched_t & split_sched, ggml_gallocr_t & galloc) {
     if (w.expert_backend) {
         split_sched = split_scheduler(backend, w, cache, pool, verify, T <= kSplitShortRows);
-        ggml_backend_sched_reset(split_sched);
-        qwen4exp_pin_split(split_sched, gf, backend, w.expert_backend, expert_nodes);
-        if (!ggml_backend_sched_alloc_graph(split_sched, gf)) {
+        auto alloc = [&] {
+            ggml_backend_sched_reset(split_sched);
+            qwen4exp_pin_split(split_sched, gf, backend, w.expert_backend, expert_nodes);
+            return ggml_backend_sched_alloc_graph(split_sched, gf);
+        };
+        if (!alloc() && !(release_cached_pools(backend, w) && alloc())) {
             std::fprintf(stderr, "[qwen4exp] split graph alloc failed (T=%lld kv_len=%lld)\n",
                          (long long) T, (long long) kv_len);
             return false;
         }
-        if (split_sched == cache.split_sched_short) ++cache.split_short_gen;
+        if (split_sched == split_owner(cache).split_sched_short) ++split_owner(cache).split_short_gen;
         return true;
     }
     if (pool) {
@@ -1981,8 +2024,10 @@ static bool allocate_graph(ggml_backend_t backend, const Qwen4ExpWeights & w, Qw
     // T=1 graphs keep the same broad shape but advancing KV views can change
     // lifetimes. Recompute assignments while retaining the allocator buffers;
     // reusing the old index-wise plan produced incorrect tokens.
-    const bool reserve_ok = !pool || !pool->planned || ggml_gallocr_reserve(galloc, gf);
-    if (!reserve_ok || !ggml_gallocr_alloc_graph(galloc, gf)) {
+    auto alloc = [&] {
+        return (!pool || !pool->planned || ggml_gallocr_reserve(galloc, gf)) && ggml_gallocr_alloc_graph(galloc, gf);
+    };
+    if (!alloc() && !(release_cached_pools(backend, w) && alloc())) {
         std::fprintf(stderr, "[qwen4exp] graph alloc failed (T=%lld kv_len=%lld)\n",
                      (long long) T, (long long) kv_len);
         if (pool) {
@@ -2159,11 +2204,13 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
     // allocation: the scheduler rewrote its cross-device sources, so it is never split again.
     if (use_stable_graph && stable_ws.gf && (stable_ws.qsa_blocks >= 0) == stable_qsa &&
         (stable_ws.hidden != nullptr) == (out_hidden != nullptr) &&
-        (!split || stable_ws.sched || stable_ws.split_gen == cache.split_short_gen) &&
+        (!split || stable_ws.sched || stable_ws.split_gen == split_owner(cache).split_short_gen) &&
         (verify ? stable_ws.row_spans == row_spans : kv_len <= stable_ws.kv_bucket && stable_ws.next_pos == pos0) &&
         (!stable_qsa || (stable_ws.kv_bucket == stable_kv_bucket &&
                         stable_ws.qsa_budget == w.indexer_top_k / 4 && cache.indexer_blocks == pos0 / 4))) {
-        if (!run_stable_graph(stable_in, stable_ws, cache.split_sched_short, verify, out_logits, out_hidden)) return res;
+        if (!run_stable_graph(stable_in, stable_ws, split_owner(cache).split_sched_short, verify, out_logits, out_hidden)) {
+            return res;
+        }
         stable_ws.next_pos = (int) kv_len;
         cache.cur_pos = (int) kv_len;
         ++stable_ws.replays;
@@ -2311,7 +2358,7 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
 
     if (use_stable_graph) {
         stable_ws.expert_nodes = expert_nodes;
-        stable_ws.split_gen = cache.split_short_gen;
+        stable_ws.split_gen = split_owner(cache).split_short_gen;
         stable_ws.gf = gf;
         stable_ws.inp_emb = inp_emb;
         stable_ws.positions = positions;
@@ -2356,6 +2403,9 @@ static Qwen4ExpForwardResult forward_impl(ggml_backend_t backend,
         }
         return res;
     }
+    // A split prompt chunk's temporaries grow with its position, and the target's pool keeps every block it frees:
+    // a long prompt would leave each chunk's behind until the device runs out. Release them after the chunk.
+    if (split && T > kSplitShortRows) ggml_backend_cuda_trim_pool(backend);
     cache.ple_prev = inputs->ple_prev;
     // Commit only after the graph computed: a failed compute must not mark blocks the kernel never pooled.
     cache.cur_pos = (int) kv_len;
@@ -2880,27 +2930,29 @@ static bool build_batched_decode_nodes(ggml_context * ctx, const Qwen4ExpWeights
         ggml_tensor * cur = lb.attn_input(il, G.res_hc, G.xn_next, G.inject);
 
         if (L.is_full_attention) {
-            ggml_tensor * qfull = mm(ctx, L.wq, cur);
-            ggml_tensor * kraw = mm(ctx, L.wk, cur);
-            ggml_tensor * vraw = mm(ctx, L.wv, cur);
-            if (ws.kv_rows.empty()) {
-                // One mask and K/V row per slot and one M-RoPE position input per group, shared by
-                // every attention layer (a split scheduler tracks at most GGML_SCHED_MAX_SPLIT_INPUTS).
-                for (int s = 0; s < n_slots; ++s) {
-                    const int64_t span = spans[(size_t) s];
-                    ws.masks.push_back(span > 0 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, span, 1) : nullptr);
-                    ws.kv_rows.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1));
-                    if (ws.masks.back()) ggml_set_input(ws.masks.back());
-                    ggml_set_input(ws.kv_rows.back());
+            cur = lb.on_cache_device(lb.full_idx[il], [&] {
+                ggml_tensor * qfull = mm(ctx, L.wq, cur);
+                ggml_tensor * kraw = mm(ctx, L.wk, cur);
+                ggml_tensor * vraw = mm(ctx, L.wv, cur);
+                if (ws.kv_rows.empty()) {
+                    // One mask and K/V row per slot and one M-RoPE position input per group, shared by
+                    // every attention layer (a split scheduler tracks at most GGML_SCHED_MAX_SPLIT_INPUTS).
+                    for (int s = 0; s < n_slots; ++s) {
+                        const int64_t span = spans[(size_t) s];
+                        ws.masks.push_back(span > 0 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, span, 1) : nullptr);
+                        ws.kv_rows.push_back(ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1));
+                        if (ws.masks.back()) ggml_set_input(ws.masks.back());
+                        ggml_set_input(ws.kv_rows.back());
+                    }
                 }
-            }
-            if (!G.positions) {
-                G.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
-                ggml_set_input(G.positions);
-            }
-            cur = mm(ctx, L.wo, build_full_attn_slots(ctx, gf, qfull, kraw, vraw, cur, G.positions,
-                ws.masks.data() + G.s0, ws.kv_rows.data() + G.s0, spans.data() + G.s0, L, w,
-                caches + G.s0, lb.full_idx[il], use_qsa, qsa.data() + G.s0));
+                if (!G.positions) {
+                    G.positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
+                    ggml_set_input(G.positions);
+                }
+                return mm(ctx, L.wo, build_full_attn_slots(ctx, gf, qfull, kraw, vraw, cur, G.positions,
+                    ws.masks.data() + G.s0, ws.kv_rows.data() + G.s0, spans.data() + G.s0, L, w,
+                    caches + G.s0, lb.full_idx[il], use_qsa, qsa.data() + G.s0));
+            });
         } else {
             // Dense input projections are batched; with stacked slot states the conv and
             // recurrence run once for the group, else each slot's sees one row and its own state.

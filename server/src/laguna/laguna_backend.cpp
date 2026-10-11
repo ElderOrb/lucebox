@@ -499,8 +499,7 @@ int LagunaBackend::snapshot_cur_pos(int slot) const {
 bool LagunaBackend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
-                                    const BudgetHook * budget_hook,
-                                    bool * forced_close_out,
+                                    ThinkingBudget & budget,
                                     float * accept_rate_out,
                                     const std::vector<int32_t> * sample_history_prefix) {
     DraftWeights * active_dw = active_dw_;
@@ -602,49 +601,10 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
     auto run_ar_tail = [&](int ar_n_gen) -> bool {
         std::vector<float> embed_step((size_t)hidden);
         std::vector<float> logits;
-        bool budget_close_started = false;
-        int close_inject_pos = 0;
         int32_t tok = last_tok;
 
-        auto maybe_force_close = [&](int32_t & t) {
-            if (!budget_hook || budget_hook->close_token_ids.empty()) return;
-            if (budget_close_started &&
-                close_inject_pos < (int)budget_hook->close_token_ids.size()) {
-                int32_t inj = budget_hook->close_token_ids[(size_t)close_inject_pos];
-                std::fprintf(stderr,
-                    "[budget-hook] laguna spec-tail close-seq continue %d/%zu: "
-                    "overriding sampled token %d with %d\n",
-                    close_inject_pos + 1,
-                    budget_hook->close_token_ids.size(), t, inj);
-                t = inj;
-                close_inject_pos++;
-                return;
-            }
-            if (budget_close_started) return;
-            const int remaining = n_gen - n_generated;
-            if (remaining <= budget_hook->hard_limit_remaining) {
-                int32_t first_close = budget_hook->close_token_ids.front();
-                if (t == first_close) {
-                    budget_close_started = true;
-                    close_inject_pos = 1;
-                    return;
-                }
-                std::fprintf(stderr,
-                    "[budget-hook] laguna spec-tail force-close at generated=%d/%d "
-                    "(remaining=%d <= hard_limit=%d): overriding token %d "
-                    "with close[0]=%d (seq len %zu)\n",
-                    n_generated, n_gen, remaining,
-                    budget_hook->hard_limit_remaining, t, first_close,
-                    budget_hook->close_token_ids.size());
-                t = first_close;
-                budget_close_started = true;
-                close_inject_pos = 1;
-                if (forced_close_out) *forced_close_out = true;
-            }
-        };
-
         for (int s = 0; s < ar_n_gen; ++s) {
-            maybe_force_close(tok);
+            tok = budget.apply(tok).token;
             if (!ignore_eos && target->is_eos(tok)) break;
 
             out_tokens.push_back(tok);
@@ -734,28 +694,29 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         target_tok.resize((size_t)q_len);
         const int need_commit_budget = n_gen - n_generated;
 
-        if (budget_hook && !budget_hook->close_token_ids.empty()) {
-            const int hard = budget_hook->hard_limit_remaining;
-            if (need_commit_budget <= hard + q_len) {
-                std::fprintf(stderr,
-                    "[budget-hook] laguna spec-decode tail-off at committed=%d "
-                    "remaining=%d hard_limit=%d batch=%d - switching to AR\n",
-                    committed, need_commit_budget, hard, q_len);
-                step_graph_destroy(draft_sg);
-                const bool ok = run_ar_tail(need_commit_budget);
-                auto t_dec1 = std::chrono::steady_clock::now();
-                const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-                const int total_draft_pos = std::max(1, n_draft_pos_sum);
-                const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
-                std::fprintf(stderr,
-                    "[laguna-spec] tail-off-stats tokens=%d time=%.3f s speed=%.2f tok/s "
-                    "steps=%d accepted=%d/%d (%.1f%%)\n",
-                    n_generated, decode_s,
-                    n_generated > 0 ? n_generated / decode_s : 0.0,
-                    n_draft_steps, n_accept_sum, total_draft_pos, accept_pct);
-                io.emit(-1);
-                return ok;
-            }
+        // A chain can emit at most q_len tokens (including its seed/bonus).
+        // Hand off before any candidate could need replacement: verified KV
+        // then always matches the emitted block, without replaying its tokens
+        // through the budget controller.
+        if (budget.needs_ar_tail(q_len)) {
+            std::fprintf(stderr,
+                "[budget-hook] laguna spec-decode tail-off at committed=%d "
+                "remaining=%d batch=%d - switching to AR\n",
+                committed, budget.remaining(), q_len);
+            step_graph_destroy(draft_sg);
+            const bool ok = run_ar_tail(need_commit_budget);
+            auto t_dec1 = std::chrono::steady_clock::now();
+            const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
+            const int total_draft_pos = std::max(1, n_draft_pos_sum);
+            const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
+            std::fprintf(stderr,
+                "[laguna-spec] tail-off-stats tokens=%d time=%.3f s speed=%.2f tok/s "
+                "steps=%d accepted=%d/%d (%.1f%%)\n",
+                n_generated, decode_s,
+                n_generated > 0 ? n_generated / decode_s : 0.0,
+                n_draft_steps, n_accept_sum, total_draft_pos, accept_pct);
+            io.emit(-1);
+            return ok;
         }
 
         noise_ids[0] = last_tok;
@@ -976,8 +937,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         }
 
         if (step_prof) prof_heads_ms += prof_lap();
-        const bool tree_special_inactive =
-            !(budget_hook && !budget_hook->close_token_ids.empty());
+        const bool tree_special_inactive = budget.settled();
         // kvflash: the tree graph is position-indexed, so only take it while
         // the pager is identity and the step fits the resident pool; otherwise
         // the slot-mapped chain verify below handles it.
@@ -1051,7 +1011,8 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
             int emitted = 0;
             for (int i = 0; i < commit_n; ++i) {
                 const int dfs = accepted[(size_t)i];
-                const int32_t tok = (dfs == 0) ? last_tok : tree.token_ids[(size_t)dfs - 1];
+                const int32_t tok = budget.apply(
+                    (dfs == 0) ? last_tok : tree.token_ids[(size_t)dfs - 1]).token;
                 if (!ignore_eos && target->is_eos(tok)) { hit_eos = true; break; }
                 out_tokens.push_back(tok);
                 sample_history.push_back(tok);
@@ -1238,7 +1199,7 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
         bool hit_eos = false;
         int emitted = 0;
         for (int i = 0; i < commit_n; i++) {
-            int tok = replay_tok[(size_t)i];
+            const int32_t tok = budget.apply(replay_tok[(size_t)i]).token;
             if (!ignore_eos && target->is_eos(tok)) { hit_eos = true; break; }
             out_tokens.push_back(tok);
             sample_history.push_back(tok);
@@ -1452,6 +1413,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
 
     cache_.last_tok = argmax(last_logits);
     result.tokens.reserve(req.n_gen);
+    ThinkingBudget budget(req.budget_hook, req.n_gen);
     const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, req.do_sample);
     const bool can_spec = req.n_gen > 0
         && !req.force_ar_decode
@@ -1475,11 +1437,10 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
             return result;
         }
         result.spec_decode_ran = true;
-        if (!do_spec_decode(N, req.n_gen, result.tokens, out_io,
-                            &req.budget_hook,
-                            &result.budget_forced_close,
-                            &result.accept_rate,
-                            &history)) {
+        const bool spec_ok = do_spec_decode(N, req.n_gen, result.tokens, out_io,
+                                            budget, &result.accept_rate, &history);
+        result.budget_forced_close = budget.forced_close();
+        if (!spec_ok) {
             result.fail(GenerateErrorCode::BackendSpecific, "spec_decode");
             return result;
         }
@@ -1491,54 +1452,11 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
 
     int next_tok = pick(last_logits);
 
-    // Budget force-close state — see model_backend.h BudgetHook docs.
-    // Mirrors qwen35/do_ar_decode's maybe_force_close. Laguna has no
-    // spec-decode path so this is the only override site.
-    const BudgetHook & budget_hook = req.budget_hook;
-    bool budget_close_started = false;
-    int  close_inject_pos     = 0;
-    auto maybe_force_close = [&](int32_t & tok, int committed_now) {
-        if (budget_hook.close_token_ids.empty()) return;
-        if (budget_close_started &&
-            close_inject_pos < (int)budget_hook.close_token_ids.size())
-        {
-            int32_t inj = budget_hook.close_token_ids[close_inject_pos];
-            std::fprintf(stderr,
-                "[budget-hook] laguna close-seq continue %d/%zu: overriding "
-                "sampled token %d with %d\n",
-                close_inject_pos + 1,
-                budget_hook.close_token_ids.size(), tok, inj);
-            tok = inj;
-            close_inject_pos++;
-            return;
-        }
-        if (budget_close_started) return;
-        int remaining = req.n_gen - committed_now;
-        if (remaining <= budget_hook.hard_limit_remaining) {
-            int32_t first_close = budget_hook.close_token_ids.front();
-            if (tok == first_close) {
-                budget_close_started = true;
-                close_inject_pos = 1;
-                return;
-            }
-            std::fprintf(stderr,
-                "[budget-hook] laguna force-close at committed=%d/%d "
-                "(remaining=%d <= hard_limit=%d): overriding token %d "
-                "with close[0]=%d (seq len %zu)\n",
-                committed_now, req.n_gen, remaining,
-                budget_hook.hard_limit_remaining, tok, first_close,
-                budget_hook.close_token_ids.size());
-            tok = first_close;
-            budget_close_started = true;
-            close_inject_pos = 1;
-            result.budget_forced_close = true;
-        }
-    };
-
     std::vector<float> embed_step((size_t)w_.n_embd);
     auto t_g0 = std::chrono::steady_clock::now();
     for (int s = 0; s < req.n_gen; ++s) {
-        maybe_force_close(next_tok, s);
+        next_tok = budget.apply(next_tok).token;
+        result.budget_forced_close = budget.forced_close();
         if (!std::getenv("LUCE_IGNORE_EOS") && (next_tok == w_.eos_id || next_tok == w_.eos_chat_id)) break;
         result.tokens.push_back(next_tok);
         history.push_back(next_tok);
@@ -1705,6 +1623,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     const int committed = cache_.cur_pos;
     cache_.last_tok = argmax(last_logits);
     result.tokens.reserve(req.n_gen);
+    ThinkingBudget budget(req.budget_hook, req.n_gen);
     const bool sampled_verify = laguna_sampled_verify_enabled(sampler_, req.do_sample);
     const bool can_spec = req.n_gen > 0
         && !req.force_ar_decode
@@ -1728,11 +1647,10 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
             return result;
         }
         result.spec_decode_ran = true;
-        if (!do_spec_decode(committed, req.n_gen, result.tokens, out_io,
-                            &req.budget_hook,
-                            &result.budget_forced_close,
-                            &result.accept_rate,
-                            &history)) {
+        const bool spec_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
+                                            budget, &result.accept_rate, &history);
+        result.budget_forced_close = budget.forced_close();
+        if (!spec_ok) {
             result.fail(GenerateErrorCode::BackendSpecific, "spec_decode");
             return result;
         }
@@ -1744,51 +1662,11 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
 
     int next_tok = pick(last_logits);
 
-    const BudgetHook & budget_hook = req.budget_hook;
-    bool budget_close_started = false;
-    int  close_inject_pos     = 0;
-    auto maybe_force_close = [&](int32_t & tok, int committed_now) {
-        if (budget_hook.close_token_ids.empty()) return;
-        if (budget_close_started &&
-            close_inject_pos < (int)budget_hook.close_token_ids.size())
-        {
-            int32_t inj = budget_hook.close_token_ids[close_inject_pos];
-            std::fprintf(stderr,
-                "[budget-hook] laguna(restore) close-seq continue %d/%zu: "
-                "overriding sampled token %d with %d\n",
-                close_inject_pos + 1,
-                budget_hook.close_token_ids.size(), tok, inj);
-            tok = inj;
-            close_inject_pos++;
-            return;
-        }
-        if (budget_close_started) return;
-        int remaining = req.n_gen - committed_now;
-        if (remaining <= budget_hook.hard_limit_remaining) {
-            int32_t first_close = budget_hook.close_token_ids.front();
-            if (tok == first_close) {
-                budget_close_started = true;
-                close_inject_pos = 1;
-                return;
-            }
-            std::fprintf(stderr,
-                "[budget-hook] laguna(restore) force-close at "
-                "committed=%d/%d (remaining=%d <= hard_limit=%d): "
-                "overriding token %d with close[0]=%d (seq len %zu)\n",
-                committed_now, req.n_gen, remaining,
-                budget_hook.hard_limit_remaining, tok, first_close,
-                budget_hook.close_token_ids.size());
-            tok = first_close;
-            budget_close_started = true;
-            close_inject_pos = 1;
-            result.budget_forced_close = true;
-        }
-    };
-
     std::vector<float> embed_step((size_t)w_.n_embd);
     auto t_g0 = std::chrono::steady_clock::now();
     for (int s = 0; s < req.n_gen; ++s) {
-        maybe_force_close(next_tok, s);
+        next_tok = budget.apply(next_tok).token;
+        result.budget_forced_close = budget.forced_close();
         if (!std::getenv("LUCE_IGNORE_EOS") && (next_tok == w_.eos_id || next_tok == w_.eos_chat_id)) break;
         history.push_back(next_tok);
         result.tokens.push_back(next_tok);
@@ -3095,38 +2973,13 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     int next_tok = pick(last_logits);
     result.tokens.reserve(req.n_gen);
 
-    // Budget force-close (same pattern as non-hybrid path)
-    const BudgetHook & budget_hook = req.budget_hook;
-    bool budget_close_started = false;
-    int  close_inject_pos     = 0;
-    auto maybe_force_close = [&](int32_t & tok, int committed_now) {
-        if (budget_hook.close_token_ids.empty()) return;
-        if (budget_close_started &&
-            close_inject_pos < (int)budget_hook.close_token_ids.size())
-        {
-            tok = budget_hook.close_token_ids[close_inject_pos++];
-            return;
-        }
-        if (budget_close_started) return;
-        int remaining = req.n_gen - committed_now;
-        if (remaining <= budget_hook.hard_limit_remaining) {
-            int32_t first_close = budget_hook.close_token_ids.front();
-            if (tok == first_close) {
-                budget_close_started = true;
-                close_inject_pos = 1;
-                return;
-            }
-            tok = first_close;
-            budget_close_started = true;
-            close_inject_pos = 1;
-            result.budget_forced_close = true;
-        }
-    };
+    ThinkingBudget budget(req.budget_hook, req.n_gen);
 
     std::vector<float> act_cur((size_t)w_.n_embd);
     auto t_g0 = std::chrono::steady_clock::now();
     for (int s = 0; s < req.n_gen; ++s) {
-        maybe_force_close(next_tok, s);
+        next_tok = budget.apply(next_tok).token;
+        result.budget_forced_close = budget.forced_close();
         if (!std::getenv("LUCE_IGNORE_EOS") && (next_tok == w_.eos_id || next_tok == w_.eos_chat_id)) break;
         result.tokens.push_back(next_tok);
         history.push_back(next_tok);

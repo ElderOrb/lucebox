@@ -1470,9 +1470,9 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
     prefix_cache_.init_full_cache(config.prefill_cache_cap);
-    // Single-sequence commits prune superseded snapshots (see
-    // trim_snapshots_after_commit); the paged scheduler does not.
-    prefix_cache_.set_prunes_superseded(!config.concurrent_prefix_cache);
+    // Commits prune the snapshots they supersede: single-sequence serving in
+    // trim_snapshots_after_commit, the concurrent scheduler as each capture lands.
+    prefix_cache_.set_prunes_superseded(true);
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a
@@ -2415,7 +2415,9 @@ void apply_request_reasoning(
     }
     if (body.contains("thinking") && body["thinking"].is_object()) {
         const auto & thinking = body["thinking"];
-        if (thinking.contains("type")) {
+        // "adaptive" (Claude Code's default) leaves thinking to the model: the
+        // same as no thinking field.
+        if (thinking.contains("type") && thinking.value("type", "") != "adaptive") {
             const bool enabled = thinking.value("type", "") == "enabled";
             enable_thinking = enabled;
             req.thinking_opt_in = enabled;
@@ -2560,7 +2562,9 @@ bool HttpServer::render_and_tokenize_request(
     if (!render_messages_to_text(chat_messages, req,
                                  /*add_generation_prompt=*/true,
                                  req.rendered_prompt, error)) {
-        send_error(fd, 500, error);
+        // The template rejected these messages: a client error, which a
+        // client must not retry as it would a server failure.
+        send_error(fd, 400, error);
         return false;
     }
     req.started_in_thinking = prompt_ends_in_open_think(req.rendered_prompt);
@@ -2973,6 +2977,9 @@ json build_openai_completion_response(
         {"completion_tokens_details", {
             {"reasoning_tokens", counts.reasoning},
         }},
+        {"prompt_tokens_details", {
+            {"cached_tokens", timings.cached_prefix_tokens},
+        }},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
@@ -3063,37 +3070,19 @@ json build_responses_api_response(
         const ParsedRequest & req, const GenerateResult & result,
         const GenTimings & timings, const CompletionTokenCounts & counts,
         const SseEmitter & emitter) {
-    json output = json::array();
-    if (!emitter.tool_calls().empty()) {
-        for (const auto & tool_call : emitter.tool_calls()) {
-            output.push_back({
-                {"type", "function_call"},
-                {"id", tool_call.id},
-                {"status", "completed"},
-                {"call_id", tool_call.id},
-                {"name", tool_call.name},
-                {"arguments", tool_call.arguments},
-            });
-        }
-    } else {
-        output.push_back({
-            {"type", "message"},
-            {"id", req.response_id + "_msg"},
-            {"status", "completed"},
-            {"role", "assistant"},
-            {"content", json::array({{
-                {"type", "output_text"},
-                {"text", emitter.accumulated_text()},
-                {"annotations", json::array()},
-            }})},
-        });
-    }
+    // The same items as the stream's response.completed: the assistant
+    // message first, then one function_call item per call.
+    const json output = responses_output_items(
+        req.response_id + "_msg", emitter.accumulated_text(), emitter.tool_calls());
 
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const json usage = {
         {"input_tokens", prompt_tokens},
         {"output_tokens", counts.total},
         {"total_tokens", prompt_tokens + counts.total},
+        {"input_tokens_details", {
+            {"cached_tokens", timings.cached_prefix_tokens},
+        }},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
@@ -3688,10 +3677,9 @@ bool HttpServer::forward_upstream(
 }
 
 std::vector<int> HttpServer::request_restore_points(const std::vector<int32_t> & prompt,
-                                                    bool ends_with_tool_result,
                                                     std::initializer_list<int> cuts) const {
     return prefix_restore_points(prompt, prefix_cache_.chat_markers(), cuts,
-        /*drop_last_boundary=*/!(backend_.prefill_cuts_at_restore_points() && ends_with_tool_result),
+        /*drop_last_boundary=*/!backend_.prefill_cuts_at_restore_points(),
         backend_.restore_point_spacing());
 }
 
@@ -4054,8 +4042,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             [this](int target_cut) {
                 return backend_.snapshot_bytes_estimate(target_cut);
             },
-            req.ends_with_tool_result, reachable_from,
-            backend_.restore_point_spacing());
+            reachable_from, backend_.restore_point_spacing());
         cache.snap_slot = cache.snap_reservation.slot();
         cache.snap_cut = cache.snap_reservation.target_cut();
     };
@@ -4135,7 +4122,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
 
     if (!prefix_cache_.disabled() || !disk_cache_.disabled()) {
         generate_request.restore_points = request_restore_points(
-            effective_prompt, req.ends_with_tool_result,
+            effective_prompt,
             {forced_cut, selected_boundary,
              cache.snap_prepared ? cache.snap_cut : 0});
     }
@@ -4616,6 +4603,8 @@ void HttpServer::prepare_generation_inputs(
         config_.hard_limit_reply_budget > 0) {
         inputs.request.budget_hook.close_token_ids =
             config_.think_close_token_ids;
+        inputs.request.budget_hook.marker_token_ids =
+            config_.think_marker_token_ids;
         inputs.request.budget_hook.hard_limit_remaining = reply_budget;
     }
 

@@ -163,6 +163,23 @@ Follows Anthropic Messages API structure with `content` blocks:
 | `service_tier` | string | — | Routing hint | ❌ TODO 🔴 |
 | `previous_response_id` | string | — | Multi-turn chaining | ❌ TODO |
 
+### Tool-call output and replay
+
+Both JSON responses and the stream's `response.completed.output` contain an
+assistant `message` first (its text may be empty), followed by one
+`function_call` item per call. The stream closes the message at `output_index`
+0 before opening calls at indices 1, 2, and so on. Each call emits
+`response.output_item.added`, `response.function_call_arguments.delta`,
+`response.function_call_arguments.done`, then `response.output_item.done`,
+with a consistent item ID and output index.
+
+For a tool follow-up, append the completed output items to `input`, then append
+one `function_call_output` per call, using its `call_id`. The assistant message
+and immediately following calls normalize to one assistant turn. Tool memory
+replays the original generated turn once when available; otherwise the server
+keeps the prose and structured calls together for the model's chat template
+to render in its native format.
+
 ---
 
 ## Sampling Chain

@@ -435,13 +435,14 @@ int Qwen3Backend::do_prefill(const std::vector<int32_t> & tokens,
 
 // ── Decode ─────────────────────────────────────────────────────────────
 
-bool Qwen3Backend::do_decode(int committed, int n_gen,
+bool Qwen3Backend::do_decode(int committed, ThinkingBudget & budget,
                               std::vector<int32_t> & out_tokens,
-                              const DaemonIO & io) {
+                              const DaemonIO & io, bool & forced_close) {
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     std::vector<float> logits;
     std::vector<float> embed_buf(hidden);
+    const int n_gen = budget.remaining();
 
     for (int i = 0; i < n_gen; ++i) {
         // Get logits: first iteration uses prefill logits, rest use step output
@@ -463,6 +464,8 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
             }
         }
 
+        next = budget.apply(next).token;
+        forced_close = budget.forced_close();
         out_tokens.push_back(next);
         io.emit(next);
         committed++;
@@ -517,6 +520,7 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
 GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
                                            const DaemonIO & io) {
     GenerateResult result;
+    ThinkingBudget budget(req.budget_hook, req.n_gen);
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
@@ -601,6 +605,8 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
                 if (logits[j] > best) { best = logits[j]; first = j; }
             }
         }
+        first = budget.apply(first).token;
+        result.budget_forced_close = budget.forced_close();
         result.tokens.push_back(first);
         out_io.emit(first);
         if (out_io.is_cancelled()) {
@@ -652,7 +658,8 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
             cur_committed++;
             cache_.cur_pos = cur_committed;
 
-            if (!do_decode(cur_committed, req.n_gen - 1, result.tokens, out_io)) {
+            if (!do_decode(cur_committed, budget, result.tokens, out_io,
+                           result.budget_forced_close)) {
                 result.fail(GenerateErrorCode::DecodeFailed);
                 return result;
             }
@@ -670,6 +677,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
                                                        const GenerateRequest & req,
                                                        const DaemonIO & io) {
     GenerateResult result;
+    ThinkingBudget budget(req.budget_hook, req.n_gen);
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !snapshots_[slot].ctx) {
         result.fail(GenerateErrorCode::InvalidSnapshotSlot);
@@ -779,6 +787,8 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
                 if (logits[j] > best) { best = logits[j]; first = j; }
             }
         }
+        first = budget.apply(first).token;
+        result.budget_forced_close = budget.forced_close();
         result.tokens.push_back(first);
         out_io.emit(first);
         if (out_io.is_cancelled()) {
@@ -829,7 +839,8 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
             cur_committed++;
             cache_.cur_pos = cur_committed;
 
-            if (!do_decode(cur_committed, req.n_gen - 1, result.tokens, out_io)) {
+            if (!do_decode(cur_committed, budget, result.tokens, out_io,
+                           result.budget_forced_close)) {
                 result.fail(GenerateErrorCode::DecodeFailed);
                 return result;
             }

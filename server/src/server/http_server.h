@@ -163,6 +163,9 @@ struct ServerConfig {
     // populates this from the tokenizer after loading; HttpServer just
     // forwards into GenerateRequest.budget_hook when thinking is opted in.
     std::vector<int32_t> think_close_token_ids;
+    // The bare end-of-thinking marker, used as BudgetHook.marker_token_ids
+    // so the hook stops once the model closes thinking on its own.
+    std::vector<int32_t> think_marker_token_ids;
 
     // Phase-1 budgets per `reasoning.effort` tier (spec §4.2). Selected
     // by the request parser when `reasoning.effort` is present. Each
@@ -375,8 +378,8 @@ struct ParsedRequest {
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
-    // The prompt ends with tool results. Clients only append after them, so
-    // the inline snapshot may cover them (see select_inline_snapshot_boundary).
+    // The prompt ends with tool results: an agent's step, which clients only
+    // append to.
     bool                      ends_with_tool_result = false;
 };
 
@@ -539,10 +542,9 @@ private:
 
     // A request's restore points (prefix_restore_points) on both serving
     // paths: its chat boundaries spaced for the backend, plus `cuts`. The
-    // generation prompt's own boundary stays only for a tool-result request
-    // on a backend that cuts prefill at every restore point.
+    // generation prompt's own boundary, where the request's snapshot goes,
+    // stays only on a backend that cuts prefill at every restore point.
     std::vector<int> request_restore_points(const std::vector<int32_t> & prompt,
-                                            bool ends_with_tool_result,
                                             std::initializer_list<int> cuts) const;
     GenerationCacheState prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,

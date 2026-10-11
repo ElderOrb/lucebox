@@ -472,15 +472,18 @@ void Qwen35MoeBackend::maybe_post_request_swap() {
     std::printf("[qwen35moe] applied %zu swap actions at request boundary\n", plan.actions.size());
 }
 
-bool Qwen35MoeBackend::run_ar_decode_path(int committed, int n_gen,
+bool Qwen35MoeBackend::run_ar_decode_path(int committed, ThinkingBudget & budget,
                                           std::vector<int32_t> & out_tokens,
-                                          const DaemonIO & io) {
+                                          const DaemonIO & io,
+                                          bool * forced_close_out,
+                                          bool * degenerate_close_out) {
     if (!target_weights().moe_hybrid) {
-        return Qwen35Backend::run_ar_decode_path(committed, n_gen, out_tokens, io);
+        return Qwen35Backend::run_ar_decode_path(
+            committed, budget, out_tokens, io, forced_close_out, degenerate_close_out);
     }
-    if (n_gen <= 0) return true;
-
-    return run_pipelined_decode_path(committed, n_gen, out_tokens, io);
+    const bool ok = run_pipelined_decode_path(committed, budget, out_tokens, io);
+    if (forced_close_out) *forced_close_out = budget.forced_close();
+    return ok;
 }
 
 // ─── Pipelined decode: cached DeltaNet graphs + optimized FFN loop ───────────
@@ -501,9 +504,10 @@ bool Qwen35MoeBackend::ensure_pipe_state(int kv_start) {
     return true;
 }
 
-bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
+bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, ThinkingBudget & budget,
                                                   std::vector<int32_t> & out_tokens,
                                                   const DaemonIO & io) {
+    if (budget.remaining() <= 0 || io.is_cancelled()) return true;
     const int hidden = target_weights().n_embd;
     const int vocab  = target_weights().n_vocab;
     std::vector<float> logits_buf((size_t)vocab);
@@ -556,7 +560,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         return true;
     };
 
-    // ── First token: sample from prefill logits ──
+    // Prefill/fully committed spec prefix supplies a new, un-emitted seed.
     {
         int32_t first_tok;
         if (sampler_config().temp > 0) {
@@ -568,11 +572,10 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         } else {
             first_tok = target_cache().last_tok;
         }
+        first_tok = budget.apply(first_tok).token;
         out_tokens.push_back(first_tok);
         io.emit(first_tok);
-        if (is_eos_tok(first_tok, target_weights())) return true;
-        committed++;
-        target_cache().cur_pos = committed;
+        if (io.is_cancelled() || is_eos_tok(first_tok, target_weights())) return true;
         if (kvflash_active()) kvflash_history_.push_back(first_tok);
     }
 
@@ -581,7 +584,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         return false;
     }
 
-    for (int step = 1; step < n_gen; ++step) {
+    while (budget.remaining() > 0) {
         const auto tok_t0 = DecodeClock::now();
 
         int32_t tok = out_tokens.back();
@@ -678,6 +681,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
             tel_layers_accum.routed_total_expert_slots += tel.routed_total_expert_slots;
         }
 
+        next_tok = budget.apply(next_tok).token;
         out_tokens.push_back(next_tok);
         io.emit(next_tok);
         committed++;
@@ -1190,6 +1194,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     // ── Hybrid Decode ──
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
+        ThinkingBudget budget(req.budget_hook, req.n_gen);
 
         // Hybrid spec-decode runs on the pool: hybrid_forward_batch is
         // slot-mapped (verify and replay both route through it) and the
@@ -1224,7 +1229,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             target_cache().last_tok = first_tok;
 
             cleanup_graphs();
-            if (!do_hybrid_spec_decode(committed, req.n_gen, result.tokens, out_io,
+            if (!do_hybrid_spec_decode(committed, budget, result.tokens, out_io,
                                        &result.accept_rate)) {
                 result.fail(GenerateErrorCode::BackendSpecific,
                                  "hybrid_spec_decode");
@@ -1257,16 +1262,15 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                     if (logits_buf[(size_t)j] > best) { best = logits_buf[(size_t)j]; first_tok = j; }
                 }
             }
+            first_tok = budget.apply(first_tok).token;
             result.tokens.push_back(first_tok);
             out_io.emit(first_tok);
-            if (!is_eos_tok(first_tok, target_weights())) {
-                committed++;
-                target_cache().cur_pos = committed;
+            if (!out_io.is_cancelled() && !is_eos_tok(first_tok, target_weights())) {
                 if (kvflash_active()) kvflash_history_.push_back(first_tok);
 
                 // Pipelined decode loop
                 PipelinedDecodeTelemetry decode_tel_accum{};
-                for (int step = 1; step < req.n_gen; ++step) {
+                while (budget.remaining() > 0) {
                     int32_t tok = result.tokens.back();
                     if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
                         result.fail(GenerateErrorCode::BackendSpecific, "decode_embed");
@@ -1351,6 +1355,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                             if (logits_buf[(size_t)j] > best) { best = logits_buf[(size_t)j]; next_tok = j; }
                         }
                     }
+                    next_tok = budget.apply(next_tok).token;
                     result.tokens.push_back(next_tok);
                     out_io.emit(next_tok);
                     committed++;
@@ -1427,6 +1432,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
             cleanup_graphs();
         }
 
+        result.budget_forced_close = budget.forced_close();
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     } else {
@@ -1598,10 +1604,12 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
             return generate_impl(req, io);
         }
         auto t_decode_start = std::chrono::steady_clock::now();
-        if (!run_pipelined_decode_path(committed, req.n_gen, result.tokens, out_io)) {
+        ThinkingBudget budget(req.budget_hook, req.n_gen);
+        if (!run_pipelined_decode_path(committed, budget, result.tokens, out_io)) {
             result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
+        result.budget_forced_close = budget.forced_close();
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
@@ -1981,7 +1989,7 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
     return true;
 }
 
-bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
+bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, ThinkingBudget & budget,
                                               std::vector<int32_t> & out_tokens,
                                               const DaemonIO & io,
                                               float * accept_rate_out) {
@@ -2039,8 +2047,8 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
-    while (n_generated < n_gen) {
-        const int need_commit_budget = n_gen - n_generated;
+    while (budget.remaining() > 0) {
+        const int need_commit_budget = budget.remaining();
         const int verify_width = forced_verify_width > 0
             ? forced_verify_width
             : shared_feedback_width
@@ -2166,7 +2174,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             if (commit_n <= accept_n) bonus_tok = -1;
         }
 
-        // 6. Restore and replay accepted tokens
+        // 6. Restore before replaying only the accepted/emitted prefix.
         if (!restore_ssm_state(target_cache(), target_backend())) {
             std::fprintf(stderr, "[hybrid-spec] recurrent-state restore failed\n");
             step_graph_destroy(draft_sg);
@@ -2178,32 +2186,34 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
         }
 
-        // Replay tokens through batched hybrid forward (captures features for next draft step)
+        // Account in emission order before replay: a forced replacement cuts
+        // the block, and cancellation/EOS never consume its un-emitted suffix.
+        bool hit_eos = false;
+        int emitted = 0;
+        for (int i = 0; i < commit_n; i++) {
+            const auto decision = budget.apply(replay_tok[i]);
+            replay_tok[i] = decision.token;
+            out_tokens.push_back(decision.token);
+            io.emit(decision.token);
+            emitted++;
+            hit_eos = is_eos_tok(decision.token, target_weights());
+            if (io.is_cancelled() || hit_eos || decision.cut) break;
+        }
+
+        // The replacement itself is committed here, unlike dense Qwen's
+        // pending-token AR handoff. Replayed tokens never advance the budget.
         std::vector<int32_t> replay_argmax;
-        if (!hybrid_forward_batch(replay_tok.data(), commit_n, committed,
+        if (!hybrid_forward_batch(replay_tok.data(), emitted, committed,
                                   act_cur, replay_argmax, /*capture_features=*/true)) {
             std::fprintf(stderr, "[hybrid-spec] replay failed\n");
             step_graph_destroy(draft_sg);
             return false;
         }
-        last_tok = replay_argmax[commit_n - 1];
-
-        // 7. Sync features to mirror for next draft step
+        last_tok = replay_argmax[emitted - 1];
         if (feature_mirror().target_feat && target_cache().target_feat) {
             draft_feature_mirror_sync_range(target_cache().target_feat,
                                              target_cache().target_feat_cap,
-                                             feature_mirror(), committed, commit_n);
-        }
-
-        // 8. Emit committed tokens
-        bool hit_eos = false;
-        int emitted = 0;
-        for (int i = 0; i < commit_n; i++) {
-            out_tokens.push_back(replay_tok[i]);
-            io.emit(replay_tok[i]);
-            emitted++;
-            if (io.is_cancelled()) break;
-            if (is_eos_tok(replay_tok[i], target_weights())) { hit_eos = true; break; }
+                                             feature_mirror(), committed, emitted);
         }
         committed += emitted;
         target_cache().cur_pos = committed;
@@ -2219,19 +2229,18 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         n_draft_steps++;
         const int fallback_steps = hybrid_spec_min_steps_before_ar();
         if (!io.is_cancelled() && !hit_eos && fallback_steps > 0 &&
-            n_draft_steps >= fallback_steps && n_generated < n_gen) {
+            n_draft_steps >= fallback_steps && budget.remaining() > 0) {
             const float accept_rate_value = acceptance.rate();
             const float min_accept = hybrid_spec_min_accept_rate();
             if (accept_rate_value < min_accept) {
-                const int ar_n_gen = n_gen - n_generated;
                 std::fprintf(stderr,
                     "[hybrid-spec] accept_rate=%.3f below %.3f after %d step(s); "
                     "switching remaining %d token(s) to AR\n",
-                    accept_rate_value, min_accept, n_draft_steps, ar_n_gen);
+                    accept_rate_value, min_accept, n_draft_steps, budget.remaining());
                 step_graph_destroy(draft_sg);
                 target_cache().last_tok = last_tok;
                 const bool ok = run_pipelined_decode_path(
-                    committed, ar_n_gen, out_tokens, io);
+                    committed, budget, out_tokens, io);
                 if (accept_rate_out) *accept_rate_out = acceptance.rate();
                 io.emit(-1);
                 return ok;

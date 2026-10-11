@@ -677,10 +677,13 @@ bool Qwen35Backend::load_target_model(ggml_backend_t backend, TargetWeights & ou
     return load_target_gguf(cfg_.target_path, backend, out);
 }
 
-bool Qwen35Backend::run_ar_decode_path(int committed, int n_gen,
+bool Qwen35Backend::run_ar_decode_path(int committed, ThinkingBudget & budget,
                                        std::vector<int32_t> & out_tokens,
-                                       const DaemonIO & io) {
-    return do_ar_decode(committed, n_gen, out_tokens, io);
+                                       const DaemonIO & io,
+                                       bool * forced_close_out,
+                                       bool * degenerate_close_out) {
+    return do_ar_decode(committed, budget, out_tokens, io,
+                        forced_close_out, degenerate_close_out);
 }
 
 bool Qwen35Backend::begin_paged_sequence(uint32_t prompt_tokens) {
@@ -1594,12 +1597,7 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     // Decode (speculative)
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        // Pass the budget hook into spec-decode. When token count nears
-        // the budget edge, do_spec_decode breaks out and tails off via
-        // AR with the hook still active — force-close fires correctly
-        // without sacrificing spec-decode throughput for the bulk of
-        // generation. Most requests never hit the tail because the
-        // model closes </think> naturally well before the budget edge.
+        // One controller accounts for every output candidate across spec and AR.
         bool decode_ok = false;
         int ar_n_gen = req.n_gen;
         if (cfg_.paged_attention) {
@@ -1629,11 +1627,11 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                     req.n_gen, ar_n_gen, committed, cfg_.device.max_ctx);
             }
         }
+        ThinkingBudget budget(req.budget_hook, ar_n_gen);
         // Image requests speculate too: the verify target shifts its rotary
         // positions by rope_delta_, and the drafter only proposes tokens.
         if (cfg_.paged_attention || req.force_ar_decode) {
-            decode_ok = do_ar_decode(committed, ar_n_gen, result.tokens, out_io,
-                                     req.budget_hook,
+            decode_ok = do_ar_decode(committed, budget, result.tokens, out_io,
                                      &result.budget_forced_close,
                                      &result.degenerate_decode_close);
             out_io.emit(-1);
@@ -1646,11 +1644,10 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                 ? nullptr : &req.stall_action_suffix_tokens;
             const auto * stall_skip = req.stall_skip_tokens.empty()
                 ? nullptr : &req.stall_skip_tokens;
-            decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
+            decode_ok = do_spec_decode(committed, budget, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
                                        hint_tokens, stall_prefix, stall_suffix,
                                        stall_skip,
-                                       &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
             if (decode_ok) {
@@ -1842,16 +1839,10 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
     // Decode
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
-        // Pass the budget hook into spec-decode. When token count nears
-        // the budget edge, do_spec_decode breaks out and tails off via
-        // AR with the hook still active — force-close fires correctly
-        // without sacrificing spec-decode throughput for the bulk of
-        // generation. Most requests never hit the tail because the
-        // model closes </think> naturally well before the budget edge.
+        ThinkingBudget budget(req.budget_hook, req.n_gen);
         bool decode_ok = false;
         if (req.force_ar_decode) {
-            decode_ok = do_ar_decode(committed, req.n_gen, result.tokens, out_io,
-                                     req.budget_hook,
+            decode_ok = do_ar_decode(committed, budget, result.tokens, out_io,
                                      &result.budget_forced_close,
                                      &result.degenerate_decode_close);
             out_io.emit(-1);
@@ -1864,11 +1855,10 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                 ? nullptr : &req.stall_action_suffix_tokens;
             const auto * stall_skip = req.stall_skip_tokens.empty()
                 ? nullptr : &req.stall_skip_tokens;
-            decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
+            decode_ok = do_spec_decode(committed, budget, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
                                        hint_tokens, stall_prefix, stall_suffix,
                                        stall_skip,
-                                       &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
             if (decode_ok) {
@@ -2378,100 +2368,26 @@ void Qwen35Backend::kvflash_maybe_reselect(int generated) {
     }
 }
 
-bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
+bool Qwen35Backend::do_ar_decode(int committed, ThinkingBudget & budget,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
-                                  const BudgetHook & budget_hook,
                                   bool * forced_close_out,
                                   bool * degenerate_close_out) {
-    // Budget hook state.
-    //   - budget_close_started: true once we've begun injecting the close
-    //     sequence. Prevents re-triggering on continued forward generation.
-    //   - close_inject_pos: index into budget_hook.close_token_ids for the
-    //     NEXT token to inject. While < close_token_ids.size(), each
-    //     iteration overrides the sampled token with the corresponding
-    //     close-sequence token (single-token close = 1 override and done;
-    //     multi-token close like DeepSeek/laguna [1718,37947,32] = 3
-    //     consecutive overrides). Once equal to close_token_ids.size(),
-    //     normal sampling resumes (model writes visible answer).
-    bool budget_close_started = false;
-    int  close_inject_pos     = 0;
-    // Capture the entry emit count so the budget check is in the
-    // "generated since entry" frame, not the absolute KV frame.
-    // n_gen is the gen-only count (or the remaining-budget remap done by
-    // spec-decode tail-off); measuring against the absolute KV position
-    // (prompt_len + tokens generated this call) would treat prompt-length
-    // tokens as if they were generated output, firing force-close
-    // prompt_len tokens early on prompted requests and potentially going
-    // negative after spec-decode tail-off.
-    //
-    // Count emitted tokens rather than KV positions: the first AR token is
-    // sampled from the prefill logits and stays pending until the first loop
-    // iteration forwards it, so `committed` lags the emit count by one for
-    // the whole loop and is not a usable "tokens generated" proxy.
     const size_t out_tokens_at_entry = out_tokens.size();
-    auto maybe_force_close = [&](int32_t & tok) {
-        if (budget_hook.close_token_ids.empty()) return;
-
-        // Continue an already-started multi-token close sequence.
-        if (budget_close_started &&
-            close_inject_pos < (int)budget_hook.close_token_ids.size())
-        {
-            int32_t inj = budget_hook.close_token_ids[close_inject_pos];
+    auto apply_budget = [&](int32_t & tok) {
+        const int remaining = budget.remaining();
+        const bool was_forced = budget.forced_close();
+        const int32_t sampled = tok;
+        tok = budget.apply(sampled).token;
+        if (budget.forced_close() && !was_forced) {
             std::fprintf(stderr,
-                "[budget-hook] close-seq continue %d/%zu: overriding "
-                "sampled token %d with %d\n",
-                close_inject_pos + 1,
-                budget_hook.close_token_ids.size(), tok, inj);
-            tok = inj;
-            close_inject_pos++;
-            return;
-        }
-
-        // Already injected the full sequence — no further overrides.
-        if (budget_close_started) return;
-
-        // Check if budget has tightened to the force-close trigger.
-        // generated = tokens already emitted by THIS do_ar_decode call
-        // (`tok` is the candidate for the next one, not yet pushed);
-        // remaining = budget headroom, measured against n_gen (the
-        // requested gen count or tail-off remap, never against the
-        // absolute KV position which would mis-count the prompt).
-        const int generated = (int)(out_tokens.size() - out_tokens_at_entry);
-        int remaining = n_gen - generated;
-        if (remaining <= budget_hook.hard_limit_remaining) {
-            // Don't trigger if the model already sampled the first close
-            // token naturally — avoids a redundant override.
-            int32_t first_close = budget_hook.close_token_ids.front();
-            if (tok == first_close) {
-                // Model self-closed at the boundary; consume that token
-                // as the first of the sequence so we still inject the
-                // remaining members (multi-token case) but don't double-emit.
-                budget_close_started = true;
-                close_inject_pos = 1;
-                std::fprintf(stderr,
-                    "[budget-hook] model self-emitted close[0]=%d at "
-                    "generated=%d/%d (remaining=%d <= hard_limit=%d); "
-                    "consuming as start of close sequence (%zu total)\n",
-                    first_close, generated, n_gen, remaining,
-                    budget_hook.hard_limit_remaining,
-                    budget_hook.close_token_ids.size());
-                return;
-            }
-            std::fprintf(stderr,
-                "[budget-hook] force-close at generated=%d/%d (remaining=%d "
-                "<= hard_limit=%d): overriding sampled token %d with close[0]=%d "
-                "(seq len %zu)\n",
-                generated, n_gen, remaining,
-                budget_hook.hard_limit_remaining, tok, first_close,
-                budget_hook.close_token_ids.size());
-            tok = first_close;
-            budget_close_started = true;
-            close_inject_pos = 1;
+                "[budget-hook] force-close at remaining=%d: overriding "
+                "sampled token %d with close[0]=%d\n",
+                remaining, sampled, tok);
             if (forced_close_out) *forced_close_out = true;
         }
     };
-    if (n_gen <= 0) return true;
+    if (budget.remaining() <= 0) return true;
 
     auto t_dec0_ar = std::chrono::steady_clock::now();
     static const int _repeat_guard = []{
@@ -2491,16 +2407,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     // offset from committed/KV position: restore paths can prefill a delta at
     // nonzero KV offsets, and committed then no longer describes chunk size.
     //
-    // Continuation mode: when out_tokens is non-empty, a previous decode
-    // path (e.g. spec-decode tail-off) already committed tokens and emitted
-    // them. Skip the first-token block — `committed` and `cache_.last_tok`
-    // are already pointing at the most recently committed token, and the
-    // main loop below uses out_tokens.back() as the embed input which IS
-    // that token. Without this skip we'd duplicate the last token in
-    // out_tokens, double-emit it, and advance committed past the actual
-    // KV state.
-    const int initial_emitted = out_tokens.empty() ? 1 : 0;
-    if (initial_emitted == 1) {
+    // Continuation mode keeps out_tokens.back() pending at `committed`.
+    // Forwarding it below updates KV, but never emits or accounts it again.
+    if (out_tokens.empty()) {
         int32_t first_tok;
         if (sampler_.needs_logit_processing()) {
             if (!prefill_last_logits_valid_) return false;
@@ -2511,18 +2420,18 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         } else {
             first_tok = cache_.last_tok;
         }
-        maybe_force_close(first_tok);
+        apply_budget(first_tok);
         out_tokens.push_back(first_tok);
         io.emit(first_tok);
         if (kvflash_active()) kvflash_history_.push_back(first_tok);
-        if (IS_EOS_TOK(first_tok, w_)) return true;
+        if (io.is_cancelled() || IS_EOS_TOK(first_tok, w_)) return true;
         // The first token is pending: the prefill logits produced it, but its
         // K/V row has not been written yet. The first loop iteration below
         // forwards it at `committed`; only that compute may advance the cache.
     }
 
     // AR decode loop for remaining tokens
-    for (int i = initial_emitted; i < n_gen; i++) {
+    while (budget.remaining() > 0) {
         int32_t tok = out_tokens.back();
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
@@ -2650,7 +2559,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         next_tok = apply_min_tokens_floor(
             next_tok, (int)out_tokens.size(), /*logits_row_offset=*/0);
 
-        maybe_force_close(next_tok);
+        apply_budget(next_tok);
 
         out_tokens.push_back(next_tok);
         io.emit(next_tok);
@@ -2696,7 +2605,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         // failure modes: short loops (16-24) for "we have X, X, X"
         // patterns, longer (48-64) for full-sentence restates like the
         // aime02 case.
-        if (budget_close_started && close_inject_pos >= (int)budget_hook.close_token_ids.size())
+        if (budget.forced_close() && !budget.injecting())
         {
             // Sweep contiguous periods 12..80. Any P where the last P
             // tokens equal the previous P tokens means a loop of that
@@ -2887,7 +2796,7 @@ static Qwen35AdaptiveSpecPolicy qwen35_adaptive_spec_policy() {
     return kPolicy;
 }
 
-bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
+bool Qwen35Backend::do_spec_decode(int committed, ThinkingBudget & budget,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
                                     float & out_accept_rate,
@@ -2896,11 +2805,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     const std::vector<int32_t> * stall_tool_prefix_tokens,
                                     const std::vector<int32_t> * stall_action_suffix_tokens,
                                     const std::vector<int32_t> * stall_skip_tokens,
-                                    const BudgetHook * budget_hook,
                                     bool * forced_close_out,
                                     bool * degenerate_close_out) {
     out_accept_rate = 0.0f;
     out_spec_ran    = false;
+    // The caller's controller owns the seed, every accepted block and AR tail.
     // [TAG_DRAFT_KV] the drafter ring persists across requests but its rows
     // belong to the previous conversation; start every request empty (the
     // first begin_step bulk-appends the live window from the feature mirror).
@@ -2956,11 +2865,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         && (!sampler_.needs_logit_processing() || sampled_verify);
 
     if (!can_spec) {
-        // AR fallback consumes the final prefill position itself, then advances
-        // one token at a time. Pass the budget hook through so force-close
-        // still fires when spec-decode is unavailable.
-        bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
-                                budget_hook ? *budget_hook : BudgetHook{},
+        // AR consumes the prefill candidate and retains this controller.
+        bool ok = do_ar_decode(committed, budget, out_tokens, io,
                                 forced_close_out, degenerate_close_out);
         io.emit(-1);
         return ok;
@@ -2994,16 +2900,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     const int _min_floor = dflash_min_tokens_floor();
 
-    // A mid-emit override (stall-floor tool injection or budget force-close)
-    // restores the pre-step snapshot and replays the overridden prefix. When
-    // either hook is armed, plain-decode burst steps must take the snapshot
-    // too: their rollback-free fast path otherwise skips it, and the restore
-    // would copy back state up to a whole burst stale.
-    const bool replay_hooks_armed =
-        (budget_hook && !budget_hook->close_token_ids.empty()) ||
-        (_min_floor > 0 &&
-         stall_tool_prefix_tokens && !stall_tool_prefix_tokens->empty() &&
-         stall_action_suffix_tokens && !stall_action_suffix_tokens->empty());
+    // Stall recovery always needs a pre-step snapshot; budget cuts need it only
+    // while the controller is unsettled. Re-evaluate that part for each step.
+    const bool stall_replay_armed =
+        _min_floor > 0 &&
+        stall_tool_prefix_tokens && !stall_tool_prefix_tokens->empty() &&
+        stall_action_suffix_tokens && !stall_action_suffix_tokens->empty();
 
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
@@ -3167,8 +3069,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             ? (float)(t_spec_step_ema / t_ar_step_ema) : adaptive.step_ratio;
     };
 
-    while (n_generated < n_gen) {
-        const int need_commit_budget = n_gen - n_generated;
+    while (budget.remaining() > 0) {
+        const int need_commit_budget = budget.remaining();
         // Plain-decode step inside the spec loop: no drafter forward, verify
         // the seed token only. Features are still captured, so the drafter
         // resumes cleanly on the next probe step.
@@ -3199,18 +3101,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 last_tok, (int)out_tokens.size());
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.back();
-            const int ar_n_gen = n_gen - n_generated;
-            if (ar_n_gen <= 0) {
-                if (!finish_speculative_state()) return false;
-                log_target_forward_stats();
-                io.emit(-1);
-                return true;
-            }
             if (!finish_speculative_state()) return false;
-            BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
-            bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
-                                    tail_hook, forced_close_out,
-                                    degenerate_close_out);
+            bool ok = do_ar_decode(committed, budget, out_tokens, io,
+                                    forced_close_out, degenerate_close_out);
             log_target_forward_stats();
             io.emit(-1);
             return ok;
@@ -3344,13 +3237,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // per step than chain verify. Local draft only. On any failure we
         // fall through is unsafe (draft graph already built for chain), so we
         // bail to false.
-        // The tree path handles plain generation only. Requests using features
-        // the tree branch does not implement — thinking-budget forced close,
-        // tool-call hint injection, stall recovery, or the min-tokens floor
-        // region — fall through to the chain verify path below, which handles
-        // them. (Wiring these into the tree path is a follow-up.)
+        // Until the controller settles, use chain verify so every marker token
+        // is observed and a forced close can restore/replay its accepted prefix.
+        // Tool hints, stall recovery and the min-tokens floor also require chain.
         const bool tree_special_inactive =
-            !(budget_hook && !budget_hook->close_token_ids.empty()) &&
+            budget.settled() &&
             !(hint_tokens && n_generated < (int)hint_tokens->size()) &&
             stall_tool_prefix_tokens == nullptr &&
             (int)out_tokens.size() >= _min_floor;
@@ -3725,7 +3616,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             int accepted_emitted = 0;
             for (int i = 0; i < accepted_n; i++) {
                 const int dfs = accepted[i];
-                const int32_t tok = (dfs == 0) ? last_tok : tree.token_ids[dfs - 1];
+                const int32_t tok = budget.apply(
+                    (dfs == 0) ? last_tok : tree.token_ids[dfs - 1]).token;
                 out_tokens.push_back(tok);
                 io.emit(tok);
                 accepted_emitted++;
@@ -3771,7 +3663,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     cache_.cur_pos = committed;
                     n_generated += accepted_emitted;
                     n_draft_steps++;
-                    if (hit_eos || io.is_cancelled() || n_generated >= n_gen ||
+                    if (hit_eos || io.is_cancelled() || budget.remaining() <= 0 ||
                         last_tok < 0 || target->is_eos(last_tok)) {
                         break;
                     }
@@ -3809,6 +3701,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 target_forwards++;
 
                 if (can_commit_bonus) {
+                    next_token = budget.apply(next_token).token;
                     out_tokens.push_back(next_token);
                     io.emit(next_token);
                     total_emitted++;
@@ -3831,7 +3724,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 cache_.cur_pos = committed;
                 n_generated += total_emitted;
                 n_draft_steps++;
-                if (hit_eos || io.is_cancelled() || n_generated >= n_gen ||
+                if (hit_eos || io.is_cancelled() || budget.remaining() <= 0 ||
                     last_tok < 0 || target->is_eos(last_tok)) {
                     break;
                 }
@@ -3886,6 +3779,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     return false;
                 }
 
+                next_token = budget.apply(next_token).token;
                 out_tokens.push_back(next_token);
                 io.emit(next_token);
                 total_emitted++;
@@ -3914,7 +3808,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             n_generated += total_emitted;
             n_draft_steps++;
-            if (hit_eos || io.is_cancelled() || n_generated >= n_gen || last_tok < 0) {
+            if (hit_eos || io.is_cancelled() || budget.remaining() <= 0 || last_tok < 0) {
                 break;
             }
             continue;
@@ -3957,7 +3851,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         //    A plain-decode step verifies only the (always accepted) seed, so
         //    it never rolls back: skip the snapshot copy — unless an armed
         //    emit-phase hook could still force a restore+replay this step.
-        const bool step_has_snapshot = !ar_step || replay_hooks_armed;
+        const bool step_has_snapshot =
+            !ar_step || !budget.settled() || stall_replay_armed;
         const auto profile_snapshot_start = profile_start();
         if (step_has_snapshot && !target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
@@ -4162,6 +4057,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
 
         // 8. Emit committed tokens (stop at EOS)
+        const int committed_at_step = committed;
         bool hit_eos = false;
         bool floor_to_ar = false;
         bool inject_tool_prefix = false;
@@ -4201,33 +4097,19 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     break;
                 }
             }
-            // Budget hook: check if remaining budget has hit the force-close
-            // threshold. Override this token with close_token_ids[0] and stop
-            // emitting — AR handles the rest via maybe_force_close.
-            if (budget_hook && !budget_hook->close_token_ids.empty() &&
-                !budget_close_fired)
-            {
-                const int generated_now = n_generated + emitted;
-                int remaining = n_gen - generated_now;
-                if (remaining <= budget_hook->hard_limit_remaining) {
-                    int32_t first_close = budget_hook->close_token_ids.front();
-                    if (replay_tok[i] == first_close) {
-                        // Model self-closed at the boundary; consume as
-                        // start of close sequence (no override needed).
-                        budget_close_fired = true;
-                    } else {
-                        // Force-close: override sampled token with close[0].
-                        replay_tok[i] = first_close;
-                        budget_close_fired = true;
-                        if (forced_close_out) *forced_close_out = true;
-                    }
-                    std::fprintf(stderr,
-                        "[budget-hook] spec-decode close at committed=%d/%d "
-                        "(remaining=%d <= hard_limit=%d)\n",
-                        committed + emitted, n_gen, remaining,
-                        budget_hook->hard_limit_remaining);
-                }
+            // Account only emitted candidates, including the first seed and
+            // tokens after settlement. Replayed prefixes never pass here again.
+            const int remaining = budget.remaining();
+            const auto decision = budget.apply(replay_tok[i]);
+            if (decision.cut) {
+                std::fprintf(stderr,
+                    "[budget-hook] spec-decode force-close at remaining=%d: "
+                    "overriding token %d with close token %d\n",
+                    remaining, replay_tok[i], decision.token);
+                budget_close_fired = true;
+                if (forced_close_out) *forced_close_out = true;
             }
+            replay_tok[i] = decision.token;
             out_tokens.push_back(replay_tok[i]);
             io.emit(replay_tok[i]);
             emitted++;
@@ -4257,21 +4139,38 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             committed += emitted;
             cache_.cur_pos = committed;
             if (inject_tool_prefix) {
-                int tool_prefix_last_tok = -1;
-                if (!target->verify_batch(*stall_tool_prefix_tokens, committed,
-                                          tool_prefix_last_tok, nullptr)) {
-                    std::fprintf(stderr, "spec-decode: tool prefix replay failed\n");
-                    step_graph_destroy(draft_sg);
-                    return false;
-                }
-                target_forwards++;
-                for (int32_t tok : *stall_tool_prefix_tokens) {
+                std::vector<int32_t> tool_prefix;
+                tool_prefix.reserve(std::min(
+                    stall_tool_prefix_tokens->size(), (size_t)budget.remaining()));
+                for (int32_t candidate : *stall_tool_prefix_tokens) {
+                    if (budget.remaining() <= 0) break;
+                    const auto decision = budget.apply(candidate);
+                    const int32_t tok = decision.token;
+                    if (budget.forced_close() && forced_close_out) {
+                        *forced_close_out = true;
+                    }
+                    tool_prefix.push_back(tok);
                     out_tokens.push_back(tok);
                     io.emit(tok);
+                    hit_eos = IS_EOS_TOK(tok, w_);
+                    if (io.is_cancelled() || hit_eos || decision.cut) break;
                 }
-                injected = (int)stall_tool_prefix_tokens->size();
-                committed += injected;
-                cache_.cur_pos = committed;
+                injected = (int)tool_prefix.size();
+                // Like a budget cut, leave the last emitted token pending for
+                // AR. Replay only the prefix; these are not new candidates.
+                if (injected > 1) {
+                    tool_prefix.pop_back();
+                    int tool_prefix_last_tok = -1;
+                    if (!target->verify_batch(tool_prefix, committed,
+                                              tool_prefix_last_tok, nullptr)) {
+                        std::fprintf(stderr, "spec-decode: tool prefix replay failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    target_forwards++;
+                    committed += injected - 1;
+                    cache_.cur_pos = committed;
+                }
             }
         } else {
             // Normal (non-floor) path: carry the replay's last token into the
@@ -4337,40 +4236,41 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             io.observer("verify", replay_tok);
         }
 
-        if (io.is_cancelled()) break;
+        // A cancelled forced-close emission still needs the prefix repair
+        // below: the verified block contains the original token, not close[0].
+        if (io.is_cancelled() && !budget_close_fired) break;
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
             out_accept_rate = acceptance.rate();
-            const int ar_n_gen = n_gen - n_generated;
-            if (ar_n_gen <= 0) {
+            if (budget.remaining() <= 0 || io.is_cancelled() || hit_eos) {
                 if (!finish_speculative_state()) return false;
                 log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
             if (!finish_speculative_state()) return false;
-            BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
-            bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
-                                    tail_hook, forced_close_out,
-                                    degenerate_close_out);
+            bool ok = do_ar_decode(committed, budget, out_tokens, io,
+                                    forced_close_out, degenerate_close_out);
             log_target_forward_stats();
             io.emit(-1);
             return ok;
         }
-        // Budget hook close: close token was emitted during the emit phase.
-        // Roll back KV to pre-replay state and replay only the overridden
-        // prefix (including the close token) so KV stays consistent with
-        // the emitted output before AR takes over.
+        // Budget hook close: close[0] was emitted as this step's last token.
+        // Roll back to the pre-step snapshot and replay only the tokens
+        // emitted before it. close[0] stays pending, the AR convention:
+        // do_ar_decode forwards out_tokens.back() at `committed` first, then
+        // injects the rest of the sequence through the same controller.
         if (budget_close_fired) {
             if (!target->restore_kv()) {
                 step_graph_destroy(draft_sg);
                 return false;
             }
+            committed = committed_at_step;
             cache_.cur_pos = committed;
-            if (emitted > 0) {
+            if (emitted > 1) {
                 std::vector<int32_t> replay_prefix(replay_tok.begin(),
-                                                   replay_tok.begin() + emitted);
+                                                   replay_tok.begin() + emitted - 1);
                 int prefix_last_tok = -1;
                 if (!target->verify_batch(replay_prefix, committed,
                                           prefix_last_tok, nullptr)) {
@@ -4380,24 +4280,21 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
                 target_forwards++;
             }
-            committed += emitted;
+            committed += emitted - 1;
             cache_.cur_pos = committed;
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
             out_accept_rate = acceptance.rate();
-            const int ar_n_gen = n_gen - n_generated;
-            if (ar_n_gen <= 0) {
+            if (budget.remaining() <= 0 || io.is_cancelled() ||
+                IS_EOS_TOK(out_tokens.back(), w_)) {
                 if (!finish_speculative_state()) return false;
                 log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
             if (!finish_speculative_state()) return false;
-            BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
-            tail_hook.close_token_ids.clear();
-            bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
-                                    tail_hook, forced_close_out,
-                                    degenerate_close_out);
+            bool ok = do_ar_decode(committed, budget, out_tokens, io,
+                                    forced_close_out, degenerate_close_out);
             log_target_forward_stats();
             io.emit(-1);
             return ok;

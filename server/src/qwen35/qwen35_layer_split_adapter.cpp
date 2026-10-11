@@ -1281,15 +1281,15 @@ int Qwen35LayerSplitAdapter::current_last_token() const {
 }
 
 bool Qwen35LayerSplitAdapter::decode_ar(
-        int last_tok, int committed, int n_gen,
+        int last_tok, int committed, ThinkingBudget & budget,
         const std::vector<int32_t> & history_prefix,
         std::vector<int32_t> & out_tokens,
         const DaemonIO & io) {
-    if (n_gen <= 0) return true;
+    if (budget.remaining() <= 0) return true;
     const auto & w = shards_.front().weights;
     const int vocab = w.n_vocab;
     const bool ok = run_layer_split_ar_decode(
-        last_tok, committed, n_gen, vocab, prefill_last_logits_, sampler_,
+        last_tok, committed, budget, vocab, prefill_last_logits_, sampler_,
         sampler_rng_, history_prefix,
         [&](const std::vector<int32_t> & one, int pos, int & next_tok,
             std::vector<float> * logits_out) {
@@ -1330,7 +1330,7 @@ bool Qwen35LayerSplitAdapter::can_dflash_decode() const {
 }
 
 bool Qwen35LayerSplitAdapter::decode_dflash(
-        const std::vector<int32_t> & prompt, int base_pos, int last_tok, int n_gen,
+        const std::vector<int32_t> & prompt, int base_pos, int last_tok, ThinkingBudget & budget,
         std::vector<int32_t> & out_tokens, const DaemonIO & io,
         float & accept_rate_out) {
     accept_rate_out = 0.0f;
@@ -1347,7 +1347,7 @@ bool Qwen35LayerSplitAdapter::decode_dflash(
     });
     double accept_rate = 0.0;
     const bool ok = run_dflash_spec_decode(
-        target, draft_weights_, draft_backend_, feature_ring_, prompt, n_gen,
+        target, draft_weights_, draft_backend_, feature_ring_, prompt, budget,
         last_tok, /*out_path=*/nullptr, cfg_.draft_ctx_max, collect_io,
         use_remote_draft ? &remote_draft_ : nullptr, /*hint_tokens=*/nullptr, base_pos,
         &accept_rate);
