@@ -51,6 +51,13 @@ struct ClusterCommStats {
 // builds, ignored by the loopback implementation.
 using DeviceStream = void *;
 
+// The 8-bit exchange (allreduce_sum_q8_exchange): blocks of 32 values with one
+// f32 scale. A rank's slot holds its n int8 values, then its n / 32 scales.
+constexpr size_t kQ8ExchangeBlock = 32;
+constexpr size_t q8_exchange_slot_bytes(size_t n) {
+    return n + (n / kQ8ExchangeBlock) * sizeof(float);
+}
+
 class IClusterComm {
 public:
     virtual ~IClusterComm() = default;
@@ -71,6 +78,19 @@ public:
     // dev_f32. Same stream-ordering contract as allreduce_sum_f32.
     virtual bool allreduce_sum_bf16_compressed(void * dev_f32, size_t n, void * scratch_bf16,
                                                DeviceStream stream, std::string * err) = 0;
+
+    // About 0.56x the bytes of the bf16 path, for large prefill partials:
+    // every rank quantizes its f32 partial to 8-bit blocks in its slot of
+    // `scratch` (device, >= size() * q8_exchange_slot_bytes(n) bytes),
+    // all-gathers the slots, and writes the sum of all ranks' dequantized
+    // values, in rank order, back to dev_f32: the same bits on every rank.
+    // n must be a multiple of kQ8ExchangeBlock. False when unsupported.
+    virtual bool allreduce_sum_q8_exchange(void * dev_f32, size_t n, void * scratch,
+                                           DeviceStream stream, std::string * err) {
+        (void)dev_f32; (void)n; (void)scratch; (void)stream;
+        if (err) *err = "this communicator has no 8-bit exchange";
+        return false;
+    }
 
     // Broadcast `bytes` bytes at `buf` (device memory) from `root`.
     virtual bool broadcast_bytes(void * dev_buf, size_t bytes, int root, DeviceStream stream,

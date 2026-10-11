@@ -574,6 +574,27 @@ static void ds4_cluster_allreduce_graph_callback(void * user, void * data,
         const char * v = std::getenv("LUCE_CLUSTER_PREFILL_BF16");
         return v && *v && std::strcmp(v, "0") != 0;
     }();
+    // LUCE_CLUSTER_PREFILL_Q8=1: prefill-sized partials cross the link as
+    // 8-bit blocks (32 values, one scale), about 0.56x the bytes of bf16; every
+    // rank sums the same dequantized values in rank order. The f32 scratch
+    // holds both ranks' blocks.
+    static const bool prefill_q8 = [] {
+        const char * v = std::getenv("LUCE_CLUSTER_PREFILL_Q8");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    if (prefill_q8 && n >= (size_t) 262144 && n % cluster::kQ8ExchangeBlock == 0 && rt->scratch_f32 &&
+        rt->scratch_elems * sizeof(float) >= (size_t) rt->comm->size() * cluster::q8_exchange_slot_bytes(n)) {
+        trace_coll(rt->rank(), "graph-allreduce-q8", n, stream);
+        std::string errq;
+        if (!rt->comm->allreduce_sum_q8_exchange(data, n, rt->scratch_f32->data,
+                                                 (cluster::DeviceStream) stream, &errq)) {
+            if (rt->node_error.empty()) rt->node_error = errq.empty() ? "in-graph q8 exchange failed" : errq;
+            return;
+        }
+        rt->telemetry.allreduce_calls += 1;
+        rt->telemetry.allreduce_bytes += (uint64_t) cluster::q8_exchange_slot_bytes(n);
+        return;
+    }
     if (prefill_bf16 && n >= (size_t) 262144 && rt->scratch_bf16 && rt->scratch_elems >= n) {
         trace_coll(rt->rank(), "graph-allreduce-bf16", n, stream);
         std::string err16;

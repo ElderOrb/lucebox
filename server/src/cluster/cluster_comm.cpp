@@ -177,6 +177,9 @@ static_assert(sizeof(ncclUniqueId) == kRcclUniqueIdSize,
 // Defined in cluster_comm_kernels.cu (LANGUAGE HIP).
 bool cluster_kernel_f32_to_bf16(const float * in, uint16_t * out, size_t n, void * stream);
 bool cluster_kernel_bf16_to_f32(const uint16_t * in, float * out, size_t n, void * stream);
+bool cluster_kernel_f32_to_q8(const float * in, void * slot, size_t n, void * stream);
+bool cluster_kernel_q8_sum(const void * slots, int ranks, size_t slot_bytes, size_t n, float * out,
+                           void * stream);
 
 namespace {
 
@@ -329,6 +332,37 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         stats_.allreduce_calls++;
         stats_.allreduce_bytes += n * 2;
+        return true;
+    }
+
+    bool allreduce_sum_q8_exchange(void * dev_f32, size_t n, void * scratch,
+                                   DeviceStream stream, std::string * err) override {
+        if (!check_ready(err)) return false;
+        if (n == 0) return true;
+        if (scratch == nullptr || n % kQ8ExchangeBlock != 0) {
+            set_err(err, "allreduce_sum_q8_exchange needs a device scratch and n % 32 == 0");
+            return false;
+        }
+        (void)hipSetDevice(device_);
+        const size_t slot = q8_exchange_slot_bytes(n);
+        uint8_t * base = (uint8_t *)scratch;
+        if (!cluster_kernel_f32_to_q8((const float *)dev_f32, base + (size_t)rank_ * slot, n, stream)) {
+            set_err(err, hip_err("f32->q8 launch", hipGetLastError()));
+            return false;
+        }
+        const ncclResult_t r = ncclAllGather(base + (size_t)rank_ * slot, base, slot, ncclInt8,
+                                             comm_, (hipStream_t)stream);
+        if (!nccl_ok(r)) {
+            set_err(err, nccl_err("ncclAllGather(q8)", r));
+            return false;
+        }
+        if (!cluster_kernel_q8_sum(base, size_, slot, n, (float *)dev_f32, stream)) {
+            set_err(err, hip_err("q8 sum launch", hipGetLastError()));
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        stats_.allreduce_calls++;
+        stats_.allreduce_bytes += slot;
         return true;
     }
 
