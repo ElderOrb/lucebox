@@ -382,6 +382,10 @@ TEST_CASE(ClusterUnitFixture, RequestRoundTripEmptyAndLarge) {
         CHECK_EQUAL(out.seed, in.seed);
         CHECK(out.decode_mode == DecodeMode::Speculative);
         CHECK(out.force_ar);
+        // A forced AR retry decodes AR on every rank, whatever the mode.
+        CHECK(request_decodes_ar(out));
+        out.force_ar = false;
+        CHECK_FALSE(request_decodes_ar(out));
         // Restore and inline save are independent halves; a request that
         // resumes from one slot and check-points into another must survive
         // the wire with both, or the workers' slots drift from the head's.
@@ -411,6 +415,7 @@ TEST_CASE(ClusterUnitFixture, RequestRoundTripEmptyAndLarge) {
         check_roundtrip_and_truncation(d, d_out);
         CHECK(d_out.decode_mode == DecodeMode::Autoregressive);
         CHECK_FALSE(d_out.force_ar);
+        CHECK(request_decodes_ar(d_out));
         CHECK_EQUAL(d_out.snapshot_slot, -1);
     }
 }

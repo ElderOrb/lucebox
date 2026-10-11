@@ -58,7 +58,7 @@ GenerateRequest request_from_msg(const RequestMsg & m) {
     req.sampler.seed = m.seed;
     req.do_sample = m.temperature > 0.0f;
     req.stream = false;
-    req.force_ar_decode = m.force_ar || m.decode_mode == DecodeMode::Autoregressive;
+    req.force_ar_decode = request_decodes_ar(m);
     // Since protocol 2 both halves travel, so this rank writes the same
     // inline snapshot at the same position as the head.
     req.snap_slot = m.snapshot_slot;

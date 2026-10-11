@@ -219,6 +219,14 @@ struct RequestMsg {
     static bool decode(ByteReader & r, RequestMsg & out);
 };
 
+// Whether every rank decodes this request autoregressively. The workers
+// rebuild their request from the message and the head decodes in the mode it
+// broadcast, so a backend that would speculate on its own (sampling, a
+// thinking budget) never leaves the ranks in two different decode loops.
+inline bool request_decodes_ar(const RequestMsg & m) {
+    return m.force_ar || m.decode_mode == DecodeMode::Autoregressive;
+}
+
 enum DecisionFlags : uint8_t {
     kDecisionEos      = 1u << 0,
     kDecisionStop     = 1u << 1,  // stop string / stop token matched on head

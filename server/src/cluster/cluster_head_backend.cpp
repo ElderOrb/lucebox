@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <utility>
 
 namespace luce::cluster {
@@ -413,10 +414,19 @@ GenerateResult ClusterHeadBackend::run_request(const GenerateRequest & req, cons
         return result;
     }
 
+    // Rank 0 decodes in the mode it broadcast, as the workers do; on its own
+    // the backend would also speculate on sampled and budgeted requests.
+    std::optional<GenerateRequest> ar_req;
+    if (request_decodes_ar(msg) && !req.force_ar_decode) {
+        ar_req.emplace(req);
+        ar_req->force_ar_decode = true;
+    }
+    const GenerateRequest & local_req = ar_req ? *ar_req : req;
+
     const auto compute_t0 = std::chrono::steady_clock::now();
     request_in_flight_.store(true);
-    result = restore_slot >= 0 ? inner_->restore_and_generate_impl(restore_slot, req, io)
-                               : inner_->generate_impl(req, io);
+    result = restore_slot >= 0 ? inner_->restore_and_generate_impl(restore_slot, local_req, io)
+                               : inner_->generate_impl(local_req, io);
     request_in_flight_.store(false);
     // Rank 0's own prefill+decode wall time, the counterpart of the workers'
     // compute_us. Comparing them across ranks is how an imbalanced expert
