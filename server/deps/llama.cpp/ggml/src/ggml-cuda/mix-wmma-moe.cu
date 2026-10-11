@@ -1,13 +1,17 @@
 // F16 WMMA routed-expert GEMM for the ROCmFP2/ROCmFP3 MIX expert types
-// (qtype 106 / 105) on RDNA3 (gfx11), used for large mul_mat_id batches
+// (qtype 106 / 105, and plain ROCmFP2 107) on RDNA3 (gfx11) and RDNA4 (gfx12),
+// used for large mul_mat_id batches
 // (prefill). The MMQ path re-decodes every weight tile for each 64-route tile
 // and runs the codebook unpack inside its int8 inner loop; here each K step
 // decodes a 128x32 weight tile once into LDS as F16 (scale * codebook level,
 // the same float product the dequantize kernels round to half) and eight
 // waves accumulate it against 64 gathered F16 routes on the matrix cores.
 //
-// On by default on RDNA3.5 (gfx115x, the arch it is validated on;
-// LUCE_MIX_WMMA_PREFILL=0 disables); other GPUs keep MMQ.
+// On by default on RDNA3.5 (gfx115x) and RDNA4 (gfx120x), the archs it is
+// validated on (LUCE_MIX_WMMA_PREFILL=0 disables); other GPUs keep MMQ. The
+// two archs share the kernel and differ only in the WMMA fragment layout:
+// gfx11 lanes hold all 16 K values of their row and C rows 2*e + hi, gfx12
+// lanes hold K values 8*hi .. 8*hi+7 and C rows 8*hi + e.
 //
 // The structure (dequantize a weight tile into padded LDS, then accumulate it
 // on the WMMA units against gathered routed activations) follows Piotr
@@ -27,7 +31,7 @@
 #include <mutex>
 #include <type_traits>
 
-#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__) && defined(RDNA3)
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__) && (defined(RDNA3) || defined(RDNA4))
 #define MIX_WMMA_DEVICE 1
 #else
 #define MIX_WMMA_DEVICE 0
@@ -113,15 +117,31 @@ __global__ void mix_wmma_gather(const float * __restrict__ src1, const int32_t *
 }
 
 #if MIX_WMMA_DEVICE
-using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
 using v8f  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+#if defined(RDNA4)
+using mix_wmma_frag_t = __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
 
-__device__ __forceinline__ v16h mix_wmma_frag(const half * p) {
-    union { v16h f; uint4 u[2]; } cvt;
+// gfx12: the lane's 8 K values (8 * hi ..) of the row at p (the K step).
+__device__ __forceinline__ mix_wmma_frag_t mix_wmma_frag(const half * p, int hi) {
+    union { mix_wmma_frag_t f; uint4 u; } cvt;
+    cvt.u = *reinterpret_cast<const uint4 *>(p + 8 * hi);
+    return cvt.f;
+}
+#define MIX_WMMA_MMA __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12
+#define MIX_WMMA_C_ROW(e, hi) (8 * (hi) + (e))
+#else
+using mix_wmma_frag_t = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+
+// gfx11: all 16 K values of the row at p (the K step).
+__device__ __forceinline__ mix_wmma_frag_t mix_wmma_frag(const half * p, int /*hi*/) {
+    union { mix_wmma_frag_t f; uint4 u[2]; } cvt;
     cvt.u[0] = *reinterpret_cast<const uint4 *>(p);
     cvt.u[1] = *reinterpret_cast<const uint4 *>(p + 8);
     return cvt.f;
 }
+#define MIX_WMMA_MMA __builtin_amdgcn_wmma_f32_16x16x16_f16_w32
+#define MIX_WMMA_C_ROW(e, hi) (2 * (e) + (hi))
+#endif
 #endif
 
 #if MIX_WMMA_DEVICE
@@ -328,18 +348,18 @@ __launch_bounds__(kThreads) __global__ void mix_wmma_moe_kernel(
         }
 #pragma unroll
         for (int ks = 0; ks < kBK2; ks += 16) {
-            v16h a[2], b[kNF];
+            mix_wmma_frag_t a[2], b[kNF];
 #pragma unroll
-            for (int i = 0; i < 2; ++i) a[i] = mix_wmma_frag(&s_w[(wm + i * 16 + sub) * kLds2 + ks]);
+            for (int i = 0; i < 2; ++i) a[i] = mix_wmma_frag(&s_w[(wm + i * 16 + sub) * kLds2 + ks], hl);
 #pragma unroll
             for (int j = 0; j < kNF; ++j) {
-                if (frag_live[j]) b[j] = mix_wmma_frag(&s_x[(wn + j * 16 + sub) * kLds2 + ks]);
+                if (frag_live[j]) b[j] = mix_wmma_frag(&s_x[(wn + j * 16 + sub) * kLds2 + ks], hl);
             }
 #pragma unroll
             for (int i = 0; i < 2; ++i)
 #pragma unroll
                 for (int j = 0; j < kNF; ++j)
-                    if (frag_live[j]) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b[j], acc[i][j]);
+                    if (frag_live[j]) acc[i][j] = MIX_WMMA_MMA(a[i], b[j], acc[i][j]);
         }
         __syncthreads();
     }
@@ -358,14 +378,14 @@ __launch_bounds__(kThreads) __global__ void mix_wmma_moe_kernel(
             for (int i = 0; i < 2; ++i)
 #pragma unroll
                 for (int v = 0; v < 8; ++v) {
-                    const int c = wm + i * 16 + 2 * v + hl;
+                    const int c = wm + i * 16 + MIX_WMMA_C_ROW(v, hl);
                     out_row[c] = ggml_cuda_op_swiglu_ds4_single(gate_row[c], acc[i][j][v], glu_limit);
                 }
         } else {
 #pragma unroll
             for (int i = 0; i < 2; ++i)
 #pragma unroll
-                for (int v = 0; v < 8; ++v) out_row[wm + i * 16 + 2 * v + hl] = acc[i][j][v];
+                for (int v = 0; v < 8; ++v) out_row[wm + i * 16 + MIX_WMMA_C_ROW(v, hl)] = acc[i][j][v];
         }
     }
 #else
@@ -401,8 +421,9 @@ static bool mix_wmma_prefill_enabled() {
 static std::atomic<uint64_t> g_mix_wmma_launches{0};
 
 bool ggml_cuda_mix_wmma_moe_available(int device) {
-    return mix_wmma_prefill_enabled() && device >= 0 && device < ggml_cuda_info().device_count &&
-           GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc);
+    if (!mix_wmma_prefill_enabled() || device < 0 || device >= ggml_cuda_info().device_count) return false;
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
 }
 
 uint64_t ggml_cuda_mix_wmma_moe_launch_count() {
@@ -420,7 +441,7 @@ bool ggml_cuda_mix_wmma_moe_enabled(const ggml_tensor * src0, const ggml_tensor 
         const long n = v && *v ? std::strtol(v, &end, 10) : 0;
         return (end && *end == '\0' && n >= 1 && n <= 1 << 20) ? (int) n : 64;
     }();
-    if (!enabled || !GGML_CUDA_CC_IS_RDNA3_5(cc)) return false;
+    if (!enabled || !(GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) return false;
     // Plain ROCmFP2 (qtype 107) is opt-in: LUCE_ROCMFP2_WMMA_PREFILL=1.
     static const bool plain_fp2 = [] {
 #ifdef ROCMFP2_AFFINE

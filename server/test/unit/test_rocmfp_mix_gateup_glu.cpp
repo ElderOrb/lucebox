@@ -419,7 +419,7 @@ void RocmfpMixGateupGluFixture::check_fused_gateup_glu(bool fp3) {
                          "half-registered/mismatched pairs are refused, and out-of-range ids zero\n");
 }
 
-// Prefill-sized batches of the MIX types take the F16 WMMA GEMM on RDNA3.5
+// Prefill-sized batches of the MIX types take the F16 WMMA GEMM on RDNA3.5 and RDNA4
 // (mix-wmma-moe.cu; LUCE_MMID_TELEMETRY=1 logs path=mix_wmma) and MMQ
 // elsewhere. Either way the graph result must match the registry's exact
 // per-route dots, run in verify-sized chunks, within F16 rounding, and masked
