@@ -1214,13 +1214,14 @@ bool run_deepseek4_dspark_spec_decode(
     // The table is one machine's curve: a shape that prices the widths this
     // machine has not measured yet, never mixed with its measurements.
     width_controller.set_relative_costs(width_cost_ms, AdaptiveSpecWidth::CostSeed::kShape);
-    // Step costs belong to the machine, not to the text: every request starts
-    // from the costs the earlier ones measured (their warmup hold re-arms).
-    static std::mutex measured_width_costs_mu;
-    static std::vector<float> measured_width_costs;
+    // Step costs belong to the machine and the context length, not to the
+    // text: every request starts from the costs earlier ones measured at a
+    // similar context (their warmup hold re-arms).
+    static std::mutex width_costs_mu;
+    static SpecWidthCostMemory width_costs;
     {
-        std::lock_guard<std::mutex> lock(measured_width_costs_mu);
-        width_controller.set_measured_costs(measured_width_costs);
+        std::lock_guard<std::mutex> lock(width_costs_mu);
+        width_costs.load(width_controller, committed);
     }
     if (timing && width_controller.enabled()) {
         std::fprintf(stderr,
@@ -2060,8 +2061,8 @@ bool run_deepseek4_dspark_spec_decode(
             q_cap >= 4 ? width_steps[4] : 0,
             q_cap >= 5 ? width_steps[5] : 0);
         {
-            std::lock_guard<std::mutex> lock(measured_width_costs_mu);
-            measured_width_costs = width_controller.measured_costs();
+            std::lock_guard<std::mutex> lock(width_costs_mu);
+            width_costs.store(width_controller, committed);
         }
         std::string costs = "[ds4-spec] measured step ms";
         for (int w = kDs4AdaptiveMinWidth; w <= q_cap; ++w) {
