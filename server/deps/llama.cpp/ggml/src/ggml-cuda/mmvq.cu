@@ -624,15 +624,6 @@ static bool mmid_grouped_type_ok(ggml_type type) {
     }
 }
 
-// [TAG_MMID_GROUPED] LUCE_MMID_PREP_MEMO=0 recomputes the expert grouping for
-// every MUL_MAT_ID (see the grouped path in ggml_cuda_mul_mat_vec_q).
-static bool mmid_prep_memo_on() {
-    static const bool on = [] {
-        const char * e = std::getenv("LUCE_MMID_PREP_MEMO");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    return on;
-}
 // The memo entry kind of a cached expert grouping (q8_1 entries use a type or -1).
 #define MMID_PREP_MEMO_KIND (-2)
 
@@ -2938,15 +2929,10 @@ static void mul_mat_vec_q8_0_rdna4_launch(
 // reads exactly their outputs, at 2..8 columns of batch-invariant products on
 // RDNA4: ggml_cuda_mul_mat_vec_q with the gate as fusion runs it as one launch
 // of mul_mat_vec_q8_0_rdna4, bit-identical to the two products and the GLU
-// kernel (the caller rules out split buffers). LUCE_CUDA_MMVQ_Q8_RDNA4_GLU=0
-// keeps three launches.
+// kernel (the caller rules out split buffers).
 bool ggml_cuda_mmvq_rdna4_glu_pair(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu) {
 #if defined(GGML_USE_HIP)
-    static const bool enabled = []() {
-        const char * e = std::getenv("LUCE_CUDA_MMVQ_Q8_RDNA4_GLU");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    if (!enabled || !mmvq_q8_0_rdna4_enabled() || !ggml_cuda_mmvq_batch_invariant()) return false;
+    if (!mmvq_q8_0_rdna4_enabled() || !ggml_cuda_mmvq_batch_invariant()) return false;
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
     if (!GGML_CUDA_CC_IS_RDNA4(cc) || ggml_cuda_info().devices[device].warp_size != 32 ||
@@ -3911,7 +3897,7 @@ void ggml_cuda_mul_mat_vec_q(
         // memoized q8_1 activations (same lifetime, same LIFO release), keyed
         // by the ids node like those are by their source node. Only when no
         // local pool block is outstanding, which the release order needs.
-        const bool prep_memo = gate_w == nullptr && mmid_prep_memo_on() && src1_q8_1.ptr == nullptr &&
+        const bool prep_memo = gate_w == nullptr && src1_q8_1.ptr == nullptr &&
                                ids->buffer != nullptr && ctx.stream_context().concurrent_events.empty();
         if (prep_memo) {
             for (const auto & e : ctx.luce_q8_memo) {

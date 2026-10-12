@@ -3273,7 +3273,59 @@ static bool ggml_cuda_mmb_cublas_shape_ok(const ggml_tensor * w) {
          (w->ne[0] == 10240 && w->ne[1] == 320) || (w->ne[0] == 320 && w->ne[1] == 10240));
 }
 
+// The BF16 shadow of src0 when ggml_cuda_mul_mat runs the product as a BF16
+// cuBLAS GEMM on it (qualified qwen4exp shapes), else null.
+static const void * ggml_cuda_mul_mat_bf16_shadow(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!ggml_cuda_qwen4exp_enabled() || ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
+        ggml_mul_mat_is_grouped_src(dst) || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        (src0->type != GGML_TYPE_IQ4_NL && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q5_K) ||
+        src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
+        !ggml_cuda_mmb_cublas_shape_ok(src0) || src1->ne[1] * src1->ne[2] * src1->ne[3] < 512) {
+        return nullptr;
+    }
+    return ggml_cuda_mmb_shadow_ptr(src0);
+}
 #endif // defined(GGML_USE_HIP)
+
+// If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
+// But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
+// Therefore, in such cases use cuBLAS.
+static bool ggml_cuda_src0_bad_padding_clear(const ggml_tensor * src0) {
+    return ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+}
+
+// Whether ggml_cuda_mul_mat may run this product on MMVQ, before a device
+// chooses between MMVQ and MMQ (ggml_cuda_mul_mat_prefers_mmq). The mix
+// qtypes have no generic MMVQ path because their per-expert codebooks live in
+// an out-of-band registry, and MXFP8 has its own matvec.
+static bool ggml_cuda_mul_mat_vec_q_eligible(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_MXFP8 ||
+        src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX || src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
+        ggml_cuda_src0_bad_padding_clear(src0) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src1->ne[1] > ggml_cuda_mmvq_max_ncols()) {
+        return false;
+    }
+#ifdef ROCMFP2_AFFINE
+    // The affine MMVQ dot carries the offset correction (vecdotq.cuh); it
+    // stays behind its A/B switch.
+    if (src0->type == GGML_TYPE_Q2_0_ROCMFP2 && std::getenv("LUCE_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
+        return false;
+    }
+#endif // ROCMFP2_AFFINE
+    return true;
+}
+
+// Rows from which RDNA4 runs a Q4_K product of two or more columns on MMQ:
+// MMQ streams such tall matrices faster than MMVQ, which keeps shorter ones.
+#define GGML_CUDA_RDNA4_Q4_K_MMQ_MIN_ROWS 2048
+
+// Whether a product that both MMVQ and MMQ can run takes MMQ on device cc.
+static bool ggml_cuda_mul_mat_prefers_mmq(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
+    return src0->type == GGML_TYPE_Q4_K && GGML_CUDA_CC_IS_RDNA4(cc) && src1->ne[1] > 1 &&
+           src0->ne[1] >= GGML_CUDA_RDNA4_Q4_K_MMQ_MIN_ROWS;
+}
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
@@ -3294,13 +3346,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
 #if defined(GGML_USE_HIP)
-    const bool cublas_shape_ok = ggml_cuda_mmb_cublas_shape_ok(src0);
-    if (ggml_cuda_qwen4exp_enabled() && !split && !grouped_src && src0->ne[2] == 1 && src0->ne[3] == 1 &&
-        (src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q5_K) &&
-        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
-        cublas_shape_ok && src1->ne[1] * src1->ne[2] * src1->ne[3] >= 512) {
-        const void * sh = ggml_cuda_mmb_shadow_ptr(src0);
+    {
+        const void * sh = ggml_cuda_mul_mat_bf16_shadow(src0, src1, dst);
         if (sh) {
             ggml_tensor tmp = *src0;
             tmp.type = GGML_TYPE_BF16;
@@ -3328,11 +3375,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 #endif // defined(GGML_USE_HIP)
 
-    // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
-    // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
-    // Therefore, in such cases use cuBLAS.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
-        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    const bool bad_padding_clear = ggml_cuda_src0_bad_padding_clear(src0);
 
     bool use_mul_mat_vec_f = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
@@ -3352,9 +3395,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool is_rocmfp3_mix = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
     const bool is_rocmfp2_mix = src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
     const bool is_mix_qtype    = is_rocmfp3_mix || is_rocmfp2_mix;
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !is_mix_qtype && !bad_padding_clear
-        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-        && src1->ne[1] <= luce_mmvq_max_ncols;
+    bool use_mul_mat_vec_q = ggml_cuda_mul_mat_vec_q_eligible(src0, src1, dst);
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
@@ -3365,9 +3406,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // throughput. The phase-scoped master switch still enables the qualified
     // paired gate/up fusion independently.
     if (src0->type == GGML_TYPE_Q2_0_ROCMFP2) {
-        if (std::getenv("LUCE_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
-            use_mul_mat_vec_q = false;
-        }
         if (std::getenv("LUCE_CUDA_MMQ_FP2_AFFINE") == nullptr ||
             std::getenv("LUCE_CUDA_MMQ_FP2_AFFINE_GENERAL") == nullptr) {
             use_mul_mat_q = false;
@@ -3400,17 +3438,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
-        // Q4_K at two or more columns over many rows (the DSpark drafter runs
-        // its dense projections at width five): on gfx1201 MMQ streams these
-        // at about twice the MMVQ rate (bench_dspark_mmv, width 5: attn_q_b
-        // 67 vs 137 us, attn_output_b 79 vs 117 us, fc 113 vs 217 us). MMVQ
-        // keeps the narrow shapes (under 2048 rows), where it is faster.
-        static const bool q4k_ncol_mmq = [] {
-            const char * e = std::getenv("LUCE_CUDA_Q4K_NCOL_MMQ");
-            return !(e && e[0] == '0');
-        }();
-        if (q4k_ncol_mmq && use_mul_mat_vec_q && use_mul_mat_q && src0->type == GGML_TYPE_Q4_K &&
-            GGML_CUDA_CC_IS_RDNA4(cc) && src1->ne[1] > 1 && src0->ne[1] >= 2048) {
+        if (use_mul_mat_vec_q && use_mul_mat_q && ggml_cuda_mul_mat_prefers_mmq(src0, src1, cc)) {
             use_mul_mat_vec_q = false;
         }
     }
@@ -5445,15 +5473,7 @@ static bool ggml_cuda_node_is_noop(const ggml_tensor * node) {
 //   n2 = RMS_NORM(coll)       out = MUL(n2, w)
 // and runs ggml_cuda_ds4_hc_boundary, which writes post and out (and pre
 // when anything outside the group reads it) bit-identically. n1, mm, coll
-// and n2 must have no reader outside the group. LUCE_DS4_FUSE_HC_BOUNDARY=0
-// keeps the six launches.
-static bool ggml_cuda_ds4_hc_boundary_enabled() {
-    static const bool on = [] {
-        const char * v = getenv("LUCE_DS4_FUSE_HC_BOUNDARY");
-        return !(v && v[0] == '0' && v[1] == '\0');
-    }();
-    return on;
-}
+// and n2 must have no reader outside the group.
 
 static int32_t ggml_cuda_graph_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
     const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
@@ -5473,6 +5493,28 @@ static bool ggml_cuda_elidable(const ggml_cgraph * cgraph, const ggml_tensor * t
 // Row stride in floats of a [ne0, T] F32 tensor whose rows are dense.
 static int64_t ggml_cuda_f32_row_stride(const ggml_tensor * t) {
     return t->ne[1] > 1 ? (int64_t) (t->nb[1] / sizeof(float)) : t->ne[0];
+}
+
+// Whether ggml_cuda_mul_mat runs this MUL_MAT node on its plain single-device
+// MMVQ branch, by the same tests it dispatches with. A fusion that runs MMVQ
+// in the node's place, or hands MMVQ a q8_1 activation, must decline
+// otherwise: another kernel would give other bits than the unfused graph.
+static bool ggml_cuda_mul_mat_takes_mmvq(const ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
+        !ggml_cuda_mul_mat_vec_q_eligible(src0, src1, mm)) {
+        return false;
+    }
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_mul_mat_bf16_shadow(src0, src1, mm) != nullptr) {
+        return false;
+    }
+#endif // defined(GGML_USE_HIP)
+    // MMQ's own conditions reduce to this one for an MMVQ-eligible product.
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    return !(ggml_cuda_mul_mat_prefers_mmq(src0, src1, cc) &&
+             ggml_cuda_should_use_mmq(mm, cc, src1->ne[1], /*n_experts=*/0));
 }
 
 // When the node at `idx` (contiguous F32 rows) is read next by a quantized
@@ -5614,13 +5656,7 @@ static int ggml_cuda_try_cont_into_mmvq(ggml_backend_cuda_context & ctx, ggml_cg
         walk = walk->src[0];
     }
     if (walk != c || !ggml_is_contiguous(src1) || !ggml_cuda_elidable(cgraph, c, 1)) return -1;
-    // The plain MMVQ branch of ggml_cuda_mul_mat, nothing else.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-        ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (!ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
-        src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX || src0->type == GGML_TYPE_Q2_0_ROCMFP2 ||
-        bad_padding_clear || ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
-        ggml_mul_mat_is_grouped_src(mm) || src1->ne[1] > ggml_cuda_mmvq_max_ncols()) return -1;
+    if (!ggml_cuda_mul_mat_takes_mmvq(ctx, mm)) return -1;
     // Whole unpadded q8_1 rows on both sides.
     if (v->ne[0] % MATRIX_ROW_PADDING != 0 || src1->ne[0] % MATRIX_ROW_PADDING != 0 ||
         src1->ne[0] % v->ne[0] != 0) return -1;
@@ -5668,13 +5704,7 @@ static bool ggml_cuda_try_rope_q8(ggml_backend_cuda_context & ctx, ggml_cgraph *
         src1->ne[1] != T || src1->ne[2] != H / (G / D) || src1->ne[3] != 1 ||
         src1->nb[0] != sizeof(float) || src1->nb[1] != (size_t) (D * H) * sizeof(float) ||
         src1->nb[2] != (size_t) G * sizeof(float)) return false;
-    // The plain MMVQ branch of ggml_cuda_mul_mat, nothing else.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-        ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (!ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
-        src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX || src0->type == GGML_TYPE_Q2_0_ROCMFP2 ||
-        bad_padding_clear || ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
-        ggml_mul_mat_is_grouped_src(mm) || src1->ne[1] > ggml_cuda_mmvq_max_ncols()) return false;
+    if (!ggml_cuda_mul_mat_takes_mmvq(ctx, mm)) return false;
 
     ggml_backend_cuda_context::luce_q8_memo_entry ent;
     ent.src1_node = (const void *) src1;
@@ -5690,7 +5720,6 @@ static bool ggml_cuda_try_rope_q8(ggml_backend_cuda_context & ctx, ggml_cgraph *
 }
 
 static int ggml_cuda_try_ds4_hc_boundary(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
-    if (!ggml_cuda_ds4_hc_boundary_enabled()) return -1;
     const int n = cgraph->n_nodes;
     // The next node at or after j that launches something.
     auto next = [&](int j) {
