@@ -135,7 +135,7 @@ public:
         return routing_stats_.get();
     }
 
-    // ── Expert-parallel cluster (after maikzz32/lucebox-halo-cluster) ──
+    // ── Expert-parallel cluster ──
     // set_cluster(&cfg, nullptr) before init() builds this rank's shard
     // (init() does it from cfg_.cluster); set_cluster(&cfg, comm) once RCCL
     // is up only attaches the communicator.

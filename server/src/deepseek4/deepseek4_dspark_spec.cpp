@@ -337,8 +337,8 @@ bool spec_env_default_on(const char * name) {
 // to q2/q3. The controller takes the curve as a shape: it scales it to the
 // widths measured on this machine and measures a wider width before trusting
 // the curve's price for it, so a machine with a flatter curve (a two-box
-// cluster verifies q5 for 1.3x the q2 step, not 1.6x) widens on its own. The fused verify cache is
-// sized so every width stays resident across the ratio-4 phases.
+// cluster) widens on its own. The fused verify cache is sized so every width
+// stays resident across the ratio-4 phases.
 constexpr int kDs4AdaptiveMinWidth = 2;
 // Depths whose confidence-head score decides the width. The head was
 // calibrated on q<=4 traffic (three candidates); the fourth candidate of a q5
@@ -837,7 +837,7 @@ void spec_restore_window_rows(const Ds4VerifyWindowRows & rows, const DeepSeek4W
 // The split draft head's Markov weights on the target's device, for a rank
 // whose drafter sits elsewhere (--draft-device) or whose rows of markov_w2 do
 // not start at row 0: markov_w1 whole (the previous token's row is any row)
-// and the rank's rows of markov_w2. About 100 MB, copied once per drafter.
+// and the rank's rows of markov_w2, copied once per drafter.
 struct SplitMarkovCopies {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
@@ -1065,7 +1065,7 @@ bool run_deepseek4_dspark_spec_decode(
         const std::function<bool()> & is_cancelled,
         luce::cluster::Ds4ClusterHooks * cluster_hooks) {
     const int n_embd = target_w.n_embd;
-    // Cluster lockstep (from maikzz32's lucebox-halo-cluster). Only a real
+    // Cluster lockstep. Only a real
     // head/worker hook changes behaviour.
     const bool cluster_spec = cluster_hooks && cluster_hooks->is_cluster();
     const bool cluster_spec_head = cluster_spec && cluster_hooks->is_head();
@@ -1303,8 +1303,8 @@ bool run_deepseek4_dspark_spec_decode(
     const SpecClock::time_point run_t0 = SpecClock::now();
 
     // LUCE_CLUSTER_DRAFT_VOCAB_SPLIT=1 (two ranks): the draft head reads the
-    // target's 703 MB Q8_0 lm_head every step (~1.1 ms on the head's dGPU,
-    // while the worker's waits for the block). Split it like the verifier's
+    // target's whole lm_head every step on the head's dGPU while the worker's
+    // waits for the block. Split it like the verifier's
     // head (LUCE_CLUSTER_VOCAB_SPLIT): each rank projects its half of the
     // vocabulary and of the Markov bias, the head's hidden states reach the
     // worker exactly, and the ranks agree on every depth's token in the graph.
@@ -1501,7 +1501,7 @@ bool run_deepseek4_dspark_spec_decode(
                 // The head projects every candidate column through the
                 // vocabulary rows; batch-invariant products read those rows
                 // once for all columns on the single-column kernel (the RDNA4
-                // Q8_0 path: 1.67 -> 1.13 ms for four columns on gfx1201).
+                // Q8_0 path).
                 const ScopedCudaGraphOverrides head_products(
                     /*disable_graphs=*/false, /*mmvq_max_ncols=*/0,
                     /*skip_property_check=*/false, /*ds4_mix_mmv_max_tokens=*/0,

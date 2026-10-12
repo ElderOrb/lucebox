@@ -1463,8 +1463,7 @@ bool build_moe_hybrid_ffn_graph(
     // LUCE_MOE_Q8_HANDOFF=1 (secondary owner on a GPU): the secondary owner gets
     // its input as the q8_1 rows its quantized matvecs read anyway, quantized
     // once on the main owner. 5,120 floats become 160 blocks of 36 bytes per
-    // token, 3.6x fewer bytes across the link (on an R9700 behind PCIe 3.0 x4
-    // the per-layer handoff grows ~0.25 us per KB), and the secondary owner
+    // token, 3.6x fewer bytes across the link, and the secondary owner
     // skips its own quantization. Same kernel, same bytes: the result is unchanged.
     // Up to 8 tokens: every quantized type takes MMVQ there (decode, verify).
     ggml_tensor * inp_secondary = inp;

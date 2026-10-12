@@ -1142,7 +1142,7 @@ void log_deepseek4_step_telemetry(const char * phase,
 DeepSeek4Backend::DeepSeek4Backend(DeepSeek4BackendConfig cfg)
     : cfg_(std::move(cfg)) {}
 
-// ─── Expert-parallel cluster (after maikzz32/lucebox-halo-cluster) ────────
+// ─── Expert-parallel cluster ───────────────────────────────────────────
 
 bool DeepSeek4Backend::cluster_active() const {
     return hooks_ != nullptr && hooks_->is_cluster();
@@ -4825,7 +4825,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         }
     }
 
-    // Cluster lockstep (maikzz32/lucebox-halo-cluster): rank 0 samples and
+    // Cluster lockstep: rank 0 samples and
     // broadcasts every token with its stop flags; workers adopt them, so all
     // ranks leave the loop on the same step for the same reason.
     const bool cluster = cluster_active();

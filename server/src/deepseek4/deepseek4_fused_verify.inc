@@ -536,7 +536,7 @@ static bool ds4_build_fused_verify_graph(
         ? backend_pair_capabilities(backend, hybrid->cold_backend)
         : BackendPairCapabilities{true, true};
     const bool same_gpu_runtime = pair_capabilities.same_runtime;
-    // Expert-parallel cluster (from maikzz32's lucebox-halo-cluster): the
+    // Expert-parallel cluster: the
     // hybrid owners hold this rank's shard of the routed experts (hot on the
     // primary GPU, cold on the secondary), routes to other ranks' experts are
     // masked in the owner LUTs, the joined routed partial is summed across the

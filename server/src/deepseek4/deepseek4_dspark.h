@@ -338,7 +338,7 @@ bool run_deepseek4_dspark_spec_decode(
         DSparkSpecSampling * sampling = nullptr,
         // Polled before applying the budget or emitting another token.
         const std::function<bool()> & is_cancelled = {},
-        // Cluster lockstep hooks (from maikzz32's lucebox-halo-cluster): head/worker
+        // Cluster lockstep hooks: head/worker
         // hooks broadcast/receive DraftMsg and AcceptMsg; nullptr = one box.
         luce::cluster::Ds4ClusterHooks * cluster_hooks = nullptr);
 

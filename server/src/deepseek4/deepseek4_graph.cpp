@@ -2105,7 +2105,7 @@ struct DeepSeek4MlaLaneBindings {
     };
 
     HistoryMode history_mode = HistoryMode::ContiguousRing;
-    // Expert-parallel cluster head split (maikzz32/lucebox-halo-cluster):
+    // Expert-parallel cluster head split:
     // build query heads [head_begin, head_begin + head_count) only; 0 = all.
     // The output projection then yields a partial sum over this rank's
     // output groups, which the caller all-reduces.
@@ -6776,8 +6776,8 @@ struct DeepSeek4FusedDecodeCache {
 // runs the graph. The keys reach the device through a pinned buffer whose
 // upload waits on the stream for a word the worker raises once the rows are
 // decoded, so the host never blocks on the table reads (preads that mostly
-// miss the page cache: about 0.7 ms a step on the rank that holds the tables,
-// and every other rank waits for its broadcast). The first consumer is the
+// miss the page cache, on the rank that holds the tables, while every other
+// rank waits for its broadcast). The first consumer is the
 // Engram broadcast after layer 0's attention, which hides the read.
 class Ds4EngramAsync {
 public:
