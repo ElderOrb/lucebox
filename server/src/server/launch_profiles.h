@@ -276,7 +276,6 @@ inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
         {"LUCE_CLUSTER_DRAFT_VOCAB_SPLIT", "1"},
         {"LUCE_CLUSTER_DRAFT_SPLIT", "1"},
         {"LUCE_CLUSTER_WORKER_SKIP_DRAFT", "1"},
-        {"LUCE_CLUSTER_SLICE_WEIGHTS", "1"},
         // DS4.1 verify step: batched verify lanes, the drafter's context K/V
         // window, GPU argmax, the drafter swapped out for long prompts (a
         // cluster rank runs without the prefix cache, so no cached prefix has
@@ -289,7 +288,6 @@ inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
         {"LUCE_DS4_SCHED_DEDICATED_COPIES", "1"},
         {"LUCE_DS4_HC_BOUNDARY_SPLIT", "1"},
         {"LUCE_DS4_ENGRAM_PRECOMPUTE", "2560"},
-        {"LUCE_DS4_SHEXP_SLICE_VIEW", "1"},
         {"LUCE_DS4_TP_CAPTURE_CACHE_SLOTS", "64"},
         {"LUCE_DS4_TP_FUSED_CACHE_SLOTS", "64"},
         // Expert products: q8_1 inputs handed to the expert owners, grouped

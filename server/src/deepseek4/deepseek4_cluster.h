@@ -1,9 +1,8 @@
 // deepseek4_cluster.h - DeepSeek4 expert-parallel cluster runtime, after
 // maikzz32's lucebox-halo-cluster.
 //
-// Every rank loads the dense model (with LUCE_CLUSTER_SLICE_WEIGHTS, only the
-// attention heads and shared-expert slice it computes) and only its shard of
-// routed experts (owned + replicated, see cluster_expert_placement.h). Per MoE
+// Every rank loads only the dense slices it computes (its attention heads
+// and its shared-expert slice) and only its shard of routed experts (owned + replicated, see cluster_expert_placement.h). Per MoE
 // layer the rank evaluates its resident experts as an owner partial sum
 // through the existing hybrid machinery with cold owner
 // MoeHybridColdBackend::None, then ONE all-reduce (IClusterComm::
@@ -198,9 +197,6 @@ ggml_tensor * ds4_cluster_hybrid_exchange_nodes(ggml_context * ctx,
 // (on in cluster mode; =0 keeps attention replicated). Cached after the first
 // call.
 bool ds4_cluster_attention_parallel_enabled();
-// LUCE_CLUSTER_PREFILL_DEVICE_JOIN (default on): cluster prefill keeps the
-// device-resident hot+cold join and reduces in the HC-post graph.
-bool ds4_cluster_prefill_device_join_enabled();
 // Band-pipelined prefill on a cluster rank: one part's cold FFN runs beside
 // the next part's attention. On when every band of the pass has at least
 // kDs4ClusterPipelineMinBand rows; smaller bands split into parts too short

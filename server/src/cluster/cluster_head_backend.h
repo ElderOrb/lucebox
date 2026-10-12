@@ -7,12 +7,11 @@
 // call; every state-changing ModelBackend virtual (snapshot save/free,
 // park/unpark, free_drafter) is broadcast as a BackendOpMsg before it is
 // executed locally; after generate() it broadcasts RequestEnd and gathers
-// one RequestReport per worker into `last_report()`.
+// one RequestReport per worker.
 //
-// Failure policy (M1): any control-channel or collective failure broadcasts
-// Abort, aborts the communicator and, unless exit_on_abort is false, ends
-// the process with a non-zero status so a supervisor restarts all ranks
-// together. Communicator re-initialization is M4.
+// Failure policy: any control-channel or collective failure broadcasts
+// Abort, aborts the communicator and ends the process with a non-zero
+// status so a supervisor restarts all ranks together.
 
 #pragma once
 
@@ -21,8 +20,6 @@
 #include "cluster/cluster_control.h"
 #include "cluster/cluster_decision_hooks.h"
 #include "cluster/cluster_protocol.h"
-#include "common/cluster_view.h"
-#include "common/model_backend.h"
 #include "common/cluster_participant.h"
 #include "common/model_backend.h"
 
@@ -116,18 +113,6 @@ public:
     bool spark_bootstrap_finalize(const std::string & profile_path) override;
     void shutdown() override;
 
-    // ── Cluster introspection ────────────────────────────────────────
-    // Plain snapshots for the HTTP layer (common/cluster_view.h).
-    // telemetry describes the request that just finished and is read on the
-    // request thread; props is constant after init().
-
-    const ClusterRequestReport & last_report() const { return last_report_; }
-    const ClusterConfig & config() const { return cfg_; }
-    const std::vector<HelloMsg> & worker_identities() const { return hellos_; }
-    IClusterComm * comm() { return comm_.get(); }
-    bool fatal() const { return fatal_; }
-    void set_exit_on_abort(bool v) { exit_on_abort_ = v; }
-
     // Maps a GenerateRequest (plus optional restore slot) onto the wire
     // descriptor. Exposed for the unit test; see the .cpp for the exact
     // field mapping and the fields the protocol cannot carry yet.
@@ -180,11 +165,6 @@ private:
     std::atomic<bool>                 watchdog_stop_{false};
     std::atomic<bool>                 request_in_flight_{false};
     std::atomic<bool>                 exit_scheduled_{false};
-    // Why the cluster died, set by whichever thread noticed. Read by
-    // cluster_request_telemetry so the failed request's response carries it
-    // in usage.timings.cluster.error instead of looking like an empty answer.
-    mutable std::mutex                fault_mu_;
-    std::string                       fault_reason_;
     ClusterHeadControl                control_;
     std::unique_ptr<IClusterComm>     comm_;
     std::unique_ptr<HeadHooks>        hooks_;
@@ -194,7 +174,6 @@ private:
     ClusterRequestReport              last_report_;
     bool                              initialized_ = false;
     bool                              fatal_ = false;
-    bool                              exit_on_abort_ = true;
     bool                              shut_down_ = false;
 };
 

@@ -160,8 +160,8 @@ bool ClusterHeadBackend::init() {
     std::fprintf(stderr, "[cluster] head rank 0/%d identity build=%s model=%s placement=%s\n",
                  cfg_.size, identity_.build_sha.c_str(), identity_.model_sha.c_str(),
                  hex64(identity_.placement_hash).c_str());
-    // Launcher contract (scripts/cluster/launch_cluster.sh waits for this
-    // exact stdout prefix before it starts the workers).
+    // Launch scripts can wait for this exact stdout prefix before they start
+    // the workers.
     std::printf("cluster: listening on %s:%d, waiting for %d worker(s)\n",
                 cfg_.head_host.c_str(), cfg_.head_port, cfg_.size - 1);
     std::fflush(stdout);
@@ -269,10 +269,6 @@ void ClusterHeadBackend::print_ready_banner() const {
 void ClusterHeadBackend::fail_cluster(const std::string & reason, int code, uint64_t request_id) {
     if (fatal_) return;
     fatal_ = true;
-    {
-        std::lock_guard<std::mutex> lk(fault_mu_);
-        if (fault_reason_.empty()) fault_reason_ = reason;
-    }
     std::fprintf(stderr, "[cluster] head: FATAL (%d): %s\n", code, reason.c_str());
     AbortMsg abort;
     abort.rank = 0;
@@ -282,24 +278,18 @@ void ClusterHeadBackend::fail_cluster(const std::string & reason, int code, uint
     control_.broadcast(make_frame(abort), nullptr);
     if (comm_) comm_->abort();
     control_.close();
-    if (exit_on_abort_) {
-        std::fprintf(stderr, "[cluster] head: exiting so the supervisor restarts all ranks\n");
-        std::fflush(nullptr);
-        std::_Exit(3);
-    }
+    std::fprintf(stderr, "[cluster] head: exiting so the supervisor restarts all ranks\n");
+    std::fflush(nullptr);
+    std::_Exit(3);
 }
 
-// ─── M4: peer-failure watchdog ──────────────────────────────────────────
+// ─── Peer-failure watchdog ──────────────────────────────────────────────
 
 void ClusterHeadBackend::request_fatal_exit(const std::string & reason, int code,
                                             uint64_t request_id) {
     if (exit_scheduled_.exchange(true)) return;
     std::fprintf(stderr, "[cluster] head: FATAL (%d): %s\n", code, reason.c_str());
     fatal_ = true;
-    {
-        std::lock_guard<std::mutex> lk(fault_mu_);
-        if (fault_reason_.empty()) fault_reason_ = reason;
-    }
     // Abort the communicator FIRST: that is what makes a collective that is
     // already enqueued on the GPU return an error instead of waiting for a
     // rank that will never arrive. Without it the forward never returns.
@@ -310,7 +300,6 @@ void ClusterHeadBackend::request_fatal_exit(const std::string & reason, int code
     abort.request_id = request_id;
     abort.reason = reason;
     control_.broadcast(make_frame(abort), nullptr);
-    if (!exit_on_abort_) return;
     // Give the request thread time to unwind and the HTTP layer time to write
     // the error response, then hand over to the supervisor. Detached because
     // this may run from the watchdog itself.
@@ -569,7 +558,7 @@ common::ModelBackend::SnapshotRef ClusterHeadBackend::snapshot_ref(int slot) con
 bool ClusterHeadBackend::snapshot_adopt(int slot, ggml_context * ctx, ggml_backend_buffer_t buf,
                                         int cur_pos, int32_t last_tok) {
     // Adopting a deserialized snapshot on the head only would leave the
-    // workers without it; refusing keeps every rank identical (M4: ship it).
+    // workers without it; refusing keeps every rank identical.
     (void) slot; (void) ctx; (void) buf; (void) cur_pos; (void) last_tok;
     std::fprintf(stderr, "[cluster] head: snapshot_adopt is not replicated; refusing\n");
     return false;
