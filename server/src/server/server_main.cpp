@@ -608,7 +608,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                                                                                   : bargs.expert_placement;
             dst = path;
         } else if (std::strncmp(argv[i], "--cluster-", 10) == 0) {
-            // Expert-parallel cluster flags (maikzz32/lucebox-halo-cluster).
+            // Expert-parallel cluster flags.
             const char * flag = argv[i];
             const auto int_value = [&](int & out) {
                 if (i + 1 >= argc) return false;

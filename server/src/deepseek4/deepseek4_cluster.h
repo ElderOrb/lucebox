@@ -1,4 +1,5 @@
-// deepseek4_cluster.h - DeepSeek4 expert-parallel cluster runtime.
+// deepseek4_cluster.h - DeepSeek4 expert-parallel cluster runtime, after
+// maikzz32's lucebox-halo-cluster.
 //
 // Every rank loads the dense model (with LUCE_CLUSTER_SLICE_WEIGHTS, only the
 // attention heads and shared-expert slice it computes) and only its shard of
@@ -78,7 +79,7 @@ struct Ds4ClusterRuntime {
     int slot_validity_n_slots = 0;
     cluster::ClusterStepTelemetry telemetry;
     bool trace = false;
-    // Path 3b: a graph node cannot return an error, so the in-graph
+    // A graph node cannot return an error, so the in-graph
     // all-reduce records the first failure here and the forward fails after
     // the compute. Cleared before every graph that contains such a node.
     std::string node_error;
@@ -165,18 +166,7 @@ void ds4_cluster_mask_routes(const Ds4ClusterRuntime & rt,
                              int route_width,
                              int n_tokens);
 
-// All-reduce a device-resident F32 partial [n_embd, n_tokens] in place on the
-// backend stream. Stays stream-ordered (no host sync) unless rt.trace is set,
-// in which case it waits with cfg->timeout_ms and logs the layer. Updates
-// rt.telemetry and, when given, telemetry->cluster_allreduce_*.
-bool ds4_cluster_allreduce_layer(Ds4ClusterRuntime & rt,
-                                 ggml_backend_t backend,
-                                 ggml_tensor * partial,
-                                 int layer,
-                                 DeepSeek4StepTelemetry * telemetry,
-                                 std::string * err);
-
-// Path 3b: an all-reduce as an ordinary graph node. `partial` is summed
+// An all-reduce as an ordinary graph node. `partial` is summed
 // across the ranks on the executing backend's stream, so no host round trip
 // separates the kernels that produce it from those that consume the sum.
 // Returns `partial` unchanged for a single-rank runtime and nullptr when the
@@ -187,14 +177,6 @@ ggml_tensor * ds4_cluster_allreduce_node(ggml_context * ctx,
                                          ggml_tensor * partial,
                                          Ds4ClusterRuntime & rt,
                                          bool inplace = false);
-
-// The same sum-all-reduce as a raw callback, for graphs built outside the
-// deepseek4 layer. server/src/common/dspark_head.cpp needs it to combine the
-// vocabulary-sliced logits of the DSpark head, and must not gain a cluster
-// dependency to do so, so it takes an ggml_cluster_allreduce_fn and a void*
-// rather than the runtime itself. Pass `&rt` as the user pointer: errors land
-// in rt.node_error and byte counts in the usual telemetry.
-ggml_cluster_allreduce_fn ds4_cluster_allreduce_fn();
 
 // LUCE_CLUSTER_HYBRID_EXCHANGE=1: the decode FFN reduction of a rank whose
 // experts are split between its dGPU (hot + shared) and iGPU (cold) runs as
@@ -221,10 +203,9 @@ bool ds4_cluster_attention_parallel_enabled();
 bool ds4_cluster_prefill_device_join_enabled();
 // Band-pipelined prefill on a cluster rank: one part's cold FFN runs beside
 // the next part's attention. On when every band of the pass has at least
-// kDs4ClusterPipelineMinBand rows (two boxes, 2K prompt in one band: 649-669
-// -> 710-727 tok/s); smaller bands split into parts too short to pay for it
-// (512-row bands measured slower). LUCE_CLUSTER_PREFILL_PIPELINE=1 forces it
-// on, =0 off. A pure function of the bands, which every rank agrees on.
+// kDs4ClusterPipelineMinBand rows; smaller bands split into parts too short
+// to pay for the overlap. LUCE_CLUSTER_PREFILL_PIPELINE=1 forces it on, =0
+// off. A pure function of the bands, which every rank agrees on.
 constexpr int kDs4ClusterPipelineMinBand = 1536;
 bool ds4_cluster_prefill_pipeline_enabled(const std::vector<int> & bands);
 

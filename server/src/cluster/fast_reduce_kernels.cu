@@ -11,16 +11,15 @@
 //   set_flag,      the kernel form of the flags, kept for comparison
 //   wait_flags     (LUCE_CLUSTER_FAST_REDUCE_KERNEL_FLAGS=1).
 //
-// WHY THE COPY PATH MOVES THE PAYLOAD BY DMA. A kernel moving it cost 33 ms per
-// reduction against RCCL's 117 us. Pinned host memory is mapped uncached for
-// the GPU, so a kernel reading or writing bulk data there crawls; the copy
-// engine does not care, because it is not reading through the GPU's caches.
+// WHY THE COPY PATH MOVES THE PAYLOAD BY DMA. Pinned host memory is mapped
+// uncached for the GPU, so a kernel reading or writing bulk data there crawls;
+// the copy engine does not care, because it is not reading through the GPU's
+// caches.
 //
 // WHY THE FLAGS ARE PINNED AND NOT MANAGED. gfx1151 reports XNACK disabled, so
 // the GPU cannot take a page fault, and a managed page the CPU has touched
 // faults the moment a kernel reads it. Pinned pages never migrate, so they need
-// no fault to be reached -- and the round trip through one measures 0.79 us
-// (server/test/cluster_flag_latency.cu), which is what makes this worth doing.
+// no fault to be reached.
 //
 // A stream wait has no timeout of its own: the host's progress thread bounds it
 // (LUCE_CLUSTER_FAST_REDUCE_STALL_S) and releases the GPU when a peer is gone.
@@ -38,9 +37,7 @@ constexpr int kBlock = 256;
 // Ordering costs cache, and on this part it costs all of it. A system-scope
 // release writes the L2 back and a system-scope acquire invalidates it, so a
 // flag raised or spun on with the strong form evicts the weights the next layer
-// is about to read. Four of them per reduction, ninety-seven reductions per
-// step: measured, that alone was 34 ms per reduction against RCCL's 117 us,
-// while the same path with the announcements removed ran the step in 32.5 ms.
+// is about to read, several times per reduction.
 //
 // So each flag gets the weakest ordering that is still correct:
 //
@@ -164,9 +161,8 @@ __device__ __forceinline__ float fr_bf16_to_f32(uint16_t h) {
 // LUCE_CLUSTER_FAST_REDUCE_KPUB: the grid that wrote an exchange row publishes
 // its flag itself. Each block orders its writes at device scope and counts in;
 // the last makes every block's writes visible system-wide with ONE release and
-// stores the flag. Measured against a hipStreamWriteValue32 after the kernel:
-// publish + host ack 9-11 us instead of 16-18 on gfx1201, 3.4 instead of 6.3 on
-// gfx1151. A null flag publishes nothing. counter is this device's, zeroed, and
+// stores the flag, which is cheaper than a hipStreamWriteValue32 after the
+// kernel. A null flag publishes nothing. counter is this device's, zeroed, and
 // left zeroed for the next grid on the same stream.
 __device__ __forceinline__ void fr_publish_last_block(uint32_t * flag, uint32_t value, uint32_t * counter) {
     if (!flag) return;

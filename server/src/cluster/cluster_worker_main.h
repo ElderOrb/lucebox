@@ -1,5 +1,5 @@
-// cluster_worker_main.h - lockstep worker loop for ranks 1..N-1
-// (maikzz32/lucebox-halo-cluster). server_main builds the backend through the
+// cluster_worker_main.h - lockstep worker loop for ranks 1..N-1.
+// server_main builds the backend through the
 // regular factory (the DeepSeek4 backend loads only this rank's expert share)
 // and hands it over; the worker joins the head, brings up RCCL and replays
 // every request the head broadcasts. Returns the process exit code.

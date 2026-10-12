@@ -29,10 +29,6 @@
 namespace luce::cluster {
 
 inline constexpr uint32_t kFrameMagic      = 0x4C43424Cu;  // "LBCL"
-// 2: RequestMsg carries the inline snapshot position and separates the
-//    restore slot from the inline save slot, so the prefix cache can be
-//    replicated (a request may restore from one slot and check-point into
-//    another; before this the workers never took the inline snapshot at all).
 inline constexpr uint16_t kProtocolVersion = 2;
 inline constexpr size_t   kFrameHeaderBytes = 12;
 inline constexpr size_t   kMaxPayloadBytes  = 64ull * 1024ull * 1024ull;

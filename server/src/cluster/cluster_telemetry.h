@@ -1,10 +1,9 @@
 // cluster_telemetry.h - per-step timing counters shared by the head decorator,
 // the worker loop and the DeepSeek4 cluster graph path.
 //
-// Header-only and dependency-free so both the model code (Agent C) and the
-// decision hooks / worker main (Agent D) can accumulate into the same struct;
-// the head folds the per-rank totals into RequestReportMsg and
-// usage.timings.cluster.
+// Header-only and dependency-free so both the model code and the decision
+// hooks / worker main can accumulate into the same struct; the head folds the
+// per-rank totals into RequestReportMsg.
 
 #pragma once
 

@@ -1,16 +1,9 @@
 // fast_reduce.h - a lean all-reduce for the decode path's tiny payloads.
 //
-// WHY THIS EXISTS. A qwen4exp decode step on two nodes computes in 29.6 ms of
-// GPU work and takes 41.0. The difference is ninety-seven all-reduces of
-// 10 KiB each -- 117 us apiece. That is not the wire: ib_write_lat puts the
-// same payload at 13.65 us, and the round trip through a pinned flag between
-// the GPU and a host thread measures 0.79 us. It is what a general-purpose
-// collective costs per call, ninety-seven times, and it is the single reason
-// adding ranks to this model buys nothing: every axis worth sharding pays for
-// its bytes with reductions at about 11.9 MB each, and every axis this model
-// has sits on that line.
-//
-// So this replaces the collective for exactly the case it is bad at: a few
+// WHY THIS EXISTS. A decode step makes about a hundred reductions of a few
+// kilobytes each, and a general-purpose collective pays a fixed cost per call
+// that dwarfs what the wire needs for such a payload. So this replaces the
+// collective for exactly the case it is bad at: a few
 // kilobytes, latency-bound, on the critical path of every layer. Each rank
 // writes its partial straight into every peer's pre-registered buffer and adds
 // what arrives. There is no algorithm selection, no protocol negotiation and

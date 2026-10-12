@@ -235,8 +235,9 @@ static bool fast_reduce_lean() {
 
 // The kernel that writes an exchange row also publishes its flag (one
 // system-scope release by its grid's last block) instead of a
-// hipStreamWriteValue32 after it: about 0.6 ms less per two-box verify step,
-// same bits. LUCE_CLUSTER_FAST_REDUCE_KPUB=0 goes back to the stream writes.
+// hipStreamWriteValue32 after it, which saves a stream operation per row and
+// gives the same bits. LUCE_CLUSTER_FAST_REDUCE_KPUB=0 goes back to the stream
+// writes.
 static bool fast_reduce_kpub() {
     static const bool on = [] {
         const char * v = std::getenv("LUCE_CLUSTER_FAST_REDUCE_KPUB");
@@ -287,10 +288,9 @@ struct FastReduceImpl {
     uint32_t **    peer_flags = nullptr;    // [slots][size-1]
     uint32_t **    peer_flags_dev = nullptr;
 
-    // Device memory the peers' partials are copied into before they are added.
-    // Adding straight out of the pinned staging buffer is what made the first
-    // version 250 times slower than the collective it replaces: that memory is
-    // uncached for the GPU.
+    // Device memory the peers' partials are copied into before they are added:
+    // the pinned staging buffer is uncached for the GPU, so adding straight
+    // out of it is slow.
     float *        scratch = nullptr;       // [slots][size-1][max_elems]
 
     uint32_t * timed_out_host = nullptr;
@@ -817,10 +817,9 @@ bool FastReduce::submit(float * data, size_t n, void * stream, bool exact) {
     // A kernel cannot do this cheaply on gfx1151. Raising a flag the host will
     // see needs a system-scope release, which writes the L2 back; spinning on
     // one the host raised needs a system-scope acquire, which invalidates it.
-    // Either way the weights the next layer is about to read are gone, and
-    // measured that cost 34 ms per reduction -- while the same path with the
-    // flags removed ran the step in 32.5 ms. Weakening the ordering does not
-    // help: relaxed is cheap and the host then does not see the flag at all.
+    // Either way the weights the next layer is about to read are gone.
+    // Weakening the ordering does not help: relaxed is cheap and the host then
+    // does not see the flag at all.
     //
     // hipStreamWriteValue32 and hipStreamWaitValue32 are handled by the
     // command processor instead, so the shader cores and their caches are not
@@ -886,9 +885,7 @@ bool FastReduce::submit(float * data, size_t n, void * stream, bool exact) {
     }
 
     // Wait for the peers, then bring their partials into device memory before
-    // touching them: the staging buffers are uncached for the GPU, and adding
-    // straight out of them is what made the first version 250 times slower
-    // than the collective it replaces.
+    // touching them: the staging buffers are uncached for the GPU.
     if (kernel_flags) {
         fast_reduce_launch_wait_flags(s.peer_flags_dev + (size_t) slot * (size_t) n_peers,
                                       s.timed_out_dev, s.progress_dev,

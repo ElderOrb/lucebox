@@ -20,15 +20,6 @@
 
 namespace luce::common {
 
-// LUCE_CLUSTER_TRACE_COLL=1: one stderr line per collective (rank, sequence, kind, elements, stream), so the
-// two ranks' collective sequences can be diffed when a step hangs.
-static void trace_coll(int rank, const char * kind, size_t n, const void * stream) {
-    static const bool on = std::getenv("LUCE_CLUSTER_TRACE_COLL") != nullptr;
-    static unsigned long long seq = 0;
-    if (!on) return;
-    std::fprintf(stderr, "[coll] r%d #%llu %s n=%zu stream=%p\n", rank, seq++, kind, n, stream);
-}
-
 namespace {
 
 using ClusterClock = std::chrono::steady_clock;
@@ -47,11 +38,9 @@ void set_err(std::string * err, const std::string & msg) {
     if (err) *err = msg;
 }
 
-// Mixed ROCmFP qtypes need decode tables registered per resident tensor
-// (register_deepseek4_moe_hybrid_mix_tables), which today requires a
-// materialized GPU cold owner. Refuse instead of silently loading garbage.
-// Supporting them needs register_deepseek4_moe_hybrid_mix_tables to accept
-// hot-only storage (cold owner None).
+// Mixed ROCmFP qtypes keep their codebooks out of band, so the shard has to
+// register a decode table per resident tensor (ds4_cluster_init_experts).
+// Reports the first mixed expert tensor found.
 bool ds4_cluster_has_mix_experts(const DeepSeek4Weights & w, std::string * what) {
     for (const auto & L : w.layers) {
         const struct { ggml_tensor * t; int qtype; const char * name; } mix[] = {
@@ -105,7 +94,6 @@ bool allreduce_device(Ds4ClusterRuntime & rt,
     // enqueues on (cuda_ctx->stream()), so the collective is ordered after the
     // producing kernels.
     cluster::DeviceStream stream = ggml_backend_cuda_get_stream(backend);
-    trace_coll(rt.rank(), "host-allreduce", n, (const void *) stream);
 
     const uint64_t bytes_f32 = (uint64_t) n * sizeof(float);
     const cluster::AllreduceDType dtype = rt.cfg->allreduce_dtype;
@@ -551,7 +539,11 @@ void ds4_cluster_mask_routes(const Ds4ClusterRuntime & rt,
 
 // ─── All-reduce ─────────────────────────────────────────────────────────
 
-// Path 3b: invoked by GGML_MOE_FUSED_CLUSTER_ALLREDUCE while the graph runs.
+// Partials at least this large are prefill-sized and may take the compressed
+// RCCL paths below; decode-sized partials stay far below it.
+constexpr size_t kPrefillPartialMinElems = 262144;
+
+// Invoked by GGML_MOE_FUSED_CLUSTER_ALLREDUCE while the graph runs.
 // It enqueues the collective on the stream ggml handed us, which is the same
 // stream the surrounding kernels use, so ordering needs no host synchronize.
 static void ds4_cluster_allreduce_graph_callback(void * user, void * data,
@@ -573,9 +565,8 @@ static void ds4_cluster_allreduce_graph_callback(void * user, void * data,
         const char * v = std::getenv("LUCE_CLUSTER_PREFILL_Q8");
         return v && *v && std::strcmp(v, "0") != 0;
     }();
-    if (prefill_q8 && n >= (size_t) 262144 && n % cluster::kQ8ExchangeBlock == 0 && rt->scratch_f32 &&
+    if (prefill_q8 && n >= kPrefillPartialMinElems && n % cluster::kQ8ExchangeBlock == 0 && rt->scratch_f32 &&
         rt->scratch_elems * sizeof(float) >= (size_t) rt->comm->size() * cluster::q8_exchange_slot_bytes(n)) {
-        trace_coll(rt->rank(), "graph-allreduce-q8", n, stream);
         std::string errq;
         if (!rt->comm->allreduce_sum_q8_exchange(data, n, rt->scratch_f32->data,
                                                  (cluster::DeviceStream) stream, &errq)) {
@@ -586,8 +577,7 @@ static void ds4_cluster_allreduce_graph_callback(void * user, void * data,
         rt->telemetry.allreduce_bytes += (uint64_t) cluster::q8_exchange_slot_bytes(n);
         return;
     }
-    if (prefill_bf16 && n >= (size_t) 262144 && rt->scratch_bf16 && rt->scratch_elems >= n) {
-        trace_coll(rt->rank(), "graph-allreduce-bf16", n, stream);
+    if (prefill_bf16 && n >= kPrefillPartialMinElems && rt->scratch_bf16 && rt->scratch_elems >= n) {
         std::string err16;
         if (!rt->comm->allreduce_sum_bf16_compressed(data, n, rt->scratch_bf16->data,
                                                      (cluster::DeviceStream) stream, &err16)) {
@@ -599,12 +589,10 @@ static void ds4_cluster_allreduce_graph_callback(void * user, void * data,
         return;
     }
     if (rt->fast && rt->fast->ok() && rt->fast->submit((float *) data, n, stream)) {
-        trace_coll(rt->rank(), "fast-allreduce", n, stream);
         rt->telemetry.allreduce_calls += 1;
         rt->telemetry.allreduce_bytes += (uint64_t) n * sizeof(float);
         return;
     }
-    trace_coll(rt->rank(), "graph-allreduce", n, stream);
     std::string err;
     if (!rt->comm->allreduce_sum_f32(data, n, (cluster::DeviceStream) stream, &err)) {
         // Keep the first failure: the rest of the graph still runs, and the
@@ -689,10 +677,6 @@ ggml_tensor * ds4_cluster_hybrid_exchange_nodes(ggml_context * ctx,
     return imp;
 }
 
-ggml_cluster_allreduce_fn ds4_cluster_allreduce_fn() {
-    return &ds4_cluster_allreduce_graph_callback;
-}
-
 ggml_tensor * ds4_cluster_allreduce_node(ggml_context * ctx,
                                          ggml_tensor * partial,
                                          Ds4ClusterRuntime & rt,
@@ -710,28 +694,6 @@ ggml_tensor * ds4_cluster_allreduce_node(ggml_context * ctx,
                                          &ds4_cluster_allreduce_graph_callback, &rt)
         : ggml_cluster_allreduce(ctx, partial,
                                  &ds4_cluster_allreduce_graph_callback, &rt);
-}
-
-bool ds4_cluster_allreduce_layer(Ds4ClusterRuntime & rt,
-                                 ggml_backend_t backend,
-                                 ggml_tensor * partial,
-                                 int layer,
-                                 DeepSeek4StepTelemetry * telemetry,
-                                 std::string * err) {
-    if (!partial) {
-        set_err(err, "cluster all-reduce: null partial tensor");
-        return false;
-    }
-    if (partial->type != GGML_TYPE_F32 || !ggml_is_contiguous(partial)) {
-        set_err(err, "cluster all-reduce: partial must be contiguous F32");
-        return false;
-    }
-    const auto t0 = ClusterClock::now();
-    const size_t n = (size_t) ggml_nelements(partial);
-    const bool ok = allreduce_device(rt, backend, partial->data, n, layer,
-                                     /*force_wait=*/false, telemetry, err);
-    if (telemetry) telemetry->cluster_allreduce_us += us_since(t0);
-    return ok;
 }
 
 bool ds4_cluster_allreduce_layer_host(Ds4ClusterRuntime & rt,
@@ -767,18 +729,20 @@ bool ds4_cluster_allreduce_layer_host(Ds4ClusterRuntime & rt,
 
 namespace {
 
-void broadcast_graph_callback(void * user, void * data, size_t n, void * stream) {
+// A broadcast from rank 0 as an in-graph collective. `exact` keeps rank 0's
+// values bit for bit (f32 on the wire even where the fast reduce rounds its
+// payloads to bf16) and skips the upload hook, which belongs to the Engram
+// keys of the plain broadcast.
+void broadcast_in_graph(void * user, void * data, size_t n, void * stream, bool exact) {
     Ds4ClusterRuntime * rt = static_cast<Ds4ClusterRuntime *>(user);
     if (!rt || !rt->comm || rt->comm->size() <= 1 || n == 0 || !data) return;
-    if (rt->before_broadcast && !rt->before_broadcast(data, n, stream)) {
+    if (!exact && rt->before_broadcast && !rt->before_broadcast(data, n, stream)) {
         if (rt->node_error.empty()) rt->node_error = "upload before the in-graph broadcast failed";
     }
     if (rt->fast && rt->fast->ok() &&
-        rt->fast->submit_from_root((float *) data, n, stream, /*root=*/0)) {
-        trace_coll(rt->rank(), "fast-broadcast", n, stream);
+        rt->fast->submit_from_root((float *) data, n, stream, /*root=*/0, exact)) {
         return;
     }
-    trace_coll(rt->rank(), "graph-broadcast", n, stream);
     std::string err;
     if (!rt->comm->broadcast_bytes(data, n * sizeof(float), /*root=*/0,
                                    (cluster::DeviceStream) stream, &err)) {
@@ -788,24 +752,26 @@ void broadcast_graph_callback(void * user, void * data, size_t n, void * stream)
     }
 }
 
-// Rank 0's values bit for bit: f32 on the wire even where the fast reduce
-// rounds its payloads to bf16. No upload hook (that belongs to the Engram keys).
+void broadcast_graph_callback(void * user, void * data, size_t n, void * stream) {
+    broadcast_in_graph(user, data, n, stream, /*exact=*/false);
+}
+
 void broadcast_exact_graph_callback(void * user, void * data, size_t n, void * stream) {
-    Ds4ClusterRuntime * rt = static_cast<Ds4ClusterRuntime *>(user);
-    if (!rt || !rt->comm || rt->comm->size() <= 1 || n == 0 || !data) return;
-    if (rt->fast && rt->fast->ok() &&
-        rt->fast->submit_from_root((float *) data, n, stream, /*root=*/0, /*exact=*/true)) {
-        trace_coll(rt->rank(), "fast-broadcast-exact", n, stream);
-        return;
+    broadcast_in_graph(user, data, n, stream, /*exact=*/true);
+}
+
+// The in-graph collective node runs its callback in place on a copy of
+// `value`.
+ggml_tensor * broadcast_node(ggml_context * ctx, ggml_tensor * value, Ds4ClusterRuntime & rt,
+                             ggml_cluster_allreduce_fn callback) {
+    if (!ctx || !value) return nullptr;
+    if (rt.size() <= 1) return value;
+    if (value->type != GGML_TYPE_F32) {
+        std::fprintf(stderr, "[deepseek4-cluster] broadcast needs an F32 tensor\n");
+        return nullptr;
     }
-    trace_coll(rt->rank(), "graph-broadcast", n, stream);
-    std::string err;
-    if (!rt->comm->broadcast_bytes(data, n * sizeof(float), /*root=*/0,
-                                   (cluster::DeviceStream) stream, &err)) {
-        if (rt->node_error.empty()) {
-            rt->node_error = err.empty() ? "in-graph broadcast failed" : err;
-        }
-    }
+    if (!ggml_is_contiguous(value)) value = ggml_cont(ctx, value);
+    return ggml_cluster_allreduce(ctx, value, callback, &rt);
 }
 
 }  // namespace
@@ -813,29 +779,13 @@ void broadcast_exact_graph_callback(void * user, void * data, size_t n, void * s
 ggml_tensor * ds4_cluster_broadcast_exact_node(ggml_context * ctx,
                                                ggml_tensor * value,
                                                Ds4ClusterRuntime & rt) {
-    if (!ctx || !value) return nullptr;
-    if (rt.size() <= 1) return value;
-    if (value->type != GGML_TYPE_F32) {
-        std::fprintf(stderr, "[deepseek4-cluster] broadcast needs an F32 tensor\n");
-        return nullptr;
-    }
-    if (!ggml_is_contiguous(value)) value = ggml_cont(ctx, value);
-    return ggml_cluster_allreduce(ctx, value, &broadcast_exact_graph_callback, &rt);
+    return broadcast_node(ctx, value, rt, &broadcast_exact_graph_callback);
 }
 
 ggml_tensor * ds4_cluster_broadcast_node(ggml_context * ctx,
                                          ggml_tensor * value,
                                          Ds4ClusterRuntime & rt) {
-    if (!ctx || !value) return nullptr;
-    if (rt.size() <= 1) return value;
-    if (value->type != GGML_TYPE_F32) {
-        std::fprintf(stderr, "[deepseek4-cluster] broadcast needs an F32 tensor\n");
-        return nullptr;
-    }
-    if (!ggml_is_contiguous(value)) value = ggml_cont(ctx, value);
-    // The in-graph collective node runs its callback in place on a copy of
-    // `value`; this callback is a broadcast from rank 0.
-    return ggml_cluster_allreduce(ctx, value, &broadcast_graph_callback, &rt);
+    return broadcast_node(ctx, value, rt, &broadcast_graph_callback);
 }
 
 bool ds4_cluster_broadcast_host(Ds4ClusterRuntime & rt,
@@ -850,7 +800,6 @@ bool ds4_cluster_broadcast_host(Ds4ClusterRuntime & rt,
     }
     if (!rt.ensure_scratch(backend, n, err)) return false;
     cluster::DeviceStream stream = ggml_backend_cuda_get_stream(backend);
-    trace_coll(rt.rank(), "host-broadcast", n, (const void *) stream);
     ggml_backend_tensor_set(rt.scratch_f32, data, 0, n * sizeof(float));
     if (!rt.comm->broadcast_bytes(rt.scratch_f32->data, n * sizeof(float), 0, stream, err)) {
         return false;
