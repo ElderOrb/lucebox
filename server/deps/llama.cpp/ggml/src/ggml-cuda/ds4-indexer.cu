@@ -979,8 +979,10 @@ void ggml_cuda_op_ds4_indexer_score(
         ? ds4_env_flag_enabled(packed_small_name)
         : GGML_CUDA_CC_IS_RDNA3_5(device_info.cc) ||
           GGML_CUDA_CC_IS_RDNA4(device_info.cc);
+#if DS4_INDEXER_WMMA_AVAILABLE
     // Tokenwise (ggml_ds4_indexer_score_tokenwise): each token scored by the
-    // one-token kernel, whatever the multi-token kernels would pick.
+    // one-token kernel, whatever the multi-token kernels would pick. Without
+    // rocWMMA 2.x every score takes the scalar kernel below, one token each.
     if (ggml_get_op_params_i32(dst, 2) != 0 && wmma_capable && q->type == GGML_TYPE_F32) {
         const dim3 grid((unsigned) ((n_comp + 127) / 128), (unsigned) n_tokens, 1);
         ds4_indexer_score_decode_wmma_kernel<<<grid, 256, 0, stream>>>(
@@ -994,7 +996,6 @@ void ggml_cuda_op_ds4_indexer_score(
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-#if DS4_INDEXER_WMMA_AVAILABLE
 #if defined(GGML_USE_HIP)
     // The M32 switches are read per call on purpose: the unit tests toggle
     // them between graph computes inside one process. M32 defaults on for

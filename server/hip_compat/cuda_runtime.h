@@ -99,8 +99,8 @@ using cudaDeviceProp        = hipDeviceProp_t;
 // Pointer attributes — used by geometric_draft_topk_cuda.cu to confirm the
 // logits pointer is device memory and find which device it lives on. The
 // hipPointerAttribute_t `.type` member (an hipMemoryType) is spelled `type` on
-// ROCm >= 5.0; the AMD targets in scope (ROCm 6.4.x on the CI runner, 7.x per
-// the maintainer's discrete-RDNA3 guidance) all use `type`.
+// ROCm >= 5.0; the AMD targets in scope (ROCm 7.2 on the CI runner and in the
+// published image) all use `type`.
 using cudaPointerAttributes = hipPointerAttribute_t;
 #define cudaPointerGetAttributes            hipPointerGetAttributes
 #define cudaMemoryTypeDevice                hipMemoryTypeDevice

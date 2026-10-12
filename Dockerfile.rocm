@@ -3,18 +3,18 @@
 # ─── Stage 1: builder ───────────────────────────────────────────────────────
 # ROCm/HIP sibling of the CUDA Dockerfile. ROCM_VERSION / UBUNTU_VERSION /
 # LUCE_HIP_ARCHES are build args so the same Dockerfile can be repinned.
-#   • lucebox-hub:rocm  — ROCm 6.4.x, gfx1151 (+ optional fat gfx list)
+#   • lucebox-hub:rocm  — ROCm 7.2.4, gfx1151 (+ optional fat gfx list)
 # See docker-bake.hcl for the canonical invocation.
 #
-# NOTE: gfx1151 (Strix Halo / Ryzen AI MAX) needs ROCm >= 6.4.1. The default
-# stays on 6.4.1 because the 7.2.x stack has shown intermittent problems on
-# Strix Halo. The flip side: against a ROCm 7.x HOST driver the 6.4.x
-# userspace can segfault at model load (seen on gfx1151 + host ROCm 7.2.2:
-# SIGSEGV in backend creation, bogus 1.28 TB VRAM report) — in that case
-# rebuild with ROCM_VERSION=7.2.2 to match the host. Rule of thumb: keep the
-# base's major version aligned with the host driver.
-ARG ROCM_VERSION=6.4.1
-ARG UBUNTU_VERSION=22.04
+# NOTE: ROCm 7.2.4 is the stack the engine is built and tested on (the
+# Lucebox boxes and the AMD CI runner); the engine no longer builds on 6.x.
+# Keep the base's major version aligned with the host driver: a 6.4.x
+# userspace segfaults at model load against a ROCm 7.x host driver (seen on
+# gfx1151 + host ROCm 7.2.2: SIGSEGV in backend creation, bogus 1.28 TB VRAM
+# report). Ubuntu 24.04: ROCm 7.2's CMake package files need CMake >= 3.25,
+# and 22.04 ships 3.22.
+ARG ROCM_VERSION=7.2.4
+ARG UBUNTU_VERSION=24.04
 FROM rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION} AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -164,8 +164,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # version is fixed and no remote installer script runs at build time.
 COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /uvx /usr/local/bin/
 
+# Ubuntu 24.04 ships a Python 3.12 of its own; take uv's managed build anyway,
+# as the CUDA image does, so the interpreter lives under /opt/uv.
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python \
-    UV_TOOL_DIR=/opt/uv/tools
+    UV_TOOL_DIR=/opt/uv/tools \
+    UV_PYTHON_PREFERENCE=only-managed
 
 WORKDIR /opt/lucebox-hub
 

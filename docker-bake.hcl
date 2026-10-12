@@ -54,12 +54,10 @@ variable "LUCE_CUDA_ARCHES" { default = "75;80;86;89;90;120" }
 # gfx1201 explicitly.
 variable "LUCE_HIP_ARCHES" { default = "gfx1151" }
 
-# ROCm base-image tag for the rocm variant. gfx1151 needs >= 6.4.1. Default
-# stays 6.4.1 (7.2.x has shown intermittent problems on Strix Halo), but on a
-# ROCm 7.x HOST driver the 6.4.x userspace can segfault at model load — set
-# ROCM_VERSION=7.2.2 there. Keep the base aligned with the host driver (see
-# Dockerfile.rocm).
-variable "ROCM_VERSION" { default = "6.4.1" }
+# ROCm base-image tag for the rocm variant: 7.2.4, the stack the engine is
+# built and tested on. Keep it aligned with the host driver's major version
+# (see Dockerfile.rocm).
+variable "ROCM_VERSION" { default = "7.2.4" }
 
 # Image identity stamped into /opt/lucebox-hub/IMAGE_INFO at build time and
 # surfaced under /props.build at runtime (git_sha, image_tag, build_time).
@@ -141,7 +139,7 @@ target "_rocm-base" {
     dockerfile = "Dockerfile.rocm"
     args = {
         ROCM_VERSION      = ROCM_VERSION
-        UBUNTU_VERSION    = "22.04"
+        UBUNTU_VERSION    = "24.04"
         LUCE_HIP_ARCHES = LUCE_HIP_ARCHES
         GIT_SHA           = GIT_SHA
         IMAGE_TAG         = IMAGE_TAG
