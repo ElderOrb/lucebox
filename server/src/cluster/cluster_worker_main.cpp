@@ -356,7 +356,6 @@ int run_cluster_worker(const ClusterConfig & cfg,
     // shared_expert is placement-defining (set_cluster refuses a change after
     // init), so a mismatch is an operator error rather than a silent override.
     st.cfg.timeout_ms = welcome.timeout_ms ? welcome.timeout_ms : st.cfg.timeout_ms;
-    st.cfg.verify_hash_every = welcome.verify_hash_every;
     st.cfg.allreduce_dtype = (AllreduceDType) welcome.allreduce_dtype;
     if ((SharedExpertMode) welcome.shared_expert != st.cfg.shared_expert) {
         std::fprintf(stderr, "[cluster] worker %d: --cluster-shared-expert differs from the head "
@@ -398,9 +397,7 @@ int run_cluster_worker(const ClusterConfig & cfg,
     }
 
     WorkerHooksConfig hcfg;
-    hcfg.rank = st.cfg.rank;
     hcfg.timeout_ms = st.cfg.timeout_ms;
-    hcfg.verify_hash_every = st.cfg.verify_hash_every;
     st.hooks = std::make_unique<WorkerHooks>(st.control, hcfg);
     // Second set_cluster call: attach the communicator to the
     // runtime the factory created before init().

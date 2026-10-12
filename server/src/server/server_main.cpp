@@ -201,7 +201,6 @@ static void print_usage(const char * prog) {
         "  --cluster-allreduce-dtype f32|bf16|auto  (default: auto = f32)\n"
         "  --cluster-timeout-ms <ms>    Collective/control watchdog (default: 30000)\n"
         "  --cluster-replicate-hot <k>  Replicate each layer's k hottest experts on every rank\n"
-        "  --cluster-verify-hash <n>    Debug: cross-rank hidden-state hash every n steps\n"
         "  --cluster-selftest           Bootstrap, run the collective self-test, exit\n"
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
@@ -671,11 +670,6 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 }
             } else if (std::strcmp(flag, "--cluster-selftest") == 0) {
                 bargs.cluster.selftest = true;
-            } else if (std::strcmp(flag, "--cluster-verify-hash") == 0) {
-                if (!int_value(bargs.cluster.verify_hash_every) || bargs.cluster.verify_hash_every < 0) {
-                    std::fprintf(stderr, "[server] --cluster-verify-hash must be non-negative\n");
-                    return 2;
-                }
             } else {
                 std::fprintf(stderr, "[server] unknown or incomplete cluster flag %s\n", flag);
                 return 2;

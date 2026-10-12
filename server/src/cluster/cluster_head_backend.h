@@ -46,10 +46,6 @@ struct ClusterRequestReport {
     bool     complete = false;         // every worker reported
     std::vector<RequestReportMsg> ranks;
     uint64_t head_ctrl_wait_us = 0;
-    uint64_t hash_probes = 0;
-    uint64_t hash_mismatches = 0;
-    int      first_mismatch_rank = -1;
-    uint32_t first_mismatch_step = 0;
     std::string error;                 // non-empty when gathering failed
 };
 

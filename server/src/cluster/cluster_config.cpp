@@ -89,9 +89,6 @@ std::string ClusterConfig::validate() const {
     if (timeout_ms == 0) {
         return "--cluster-timeout-ms must be positive";
     }
-    if (verify_hash_every < 0) {
-        return "--cluster-verify-hash must be non-negative, got " + std::to_string(verify_hash_every);
-    }
     return {};
 }
 

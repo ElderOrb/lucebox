@@ -17,9 +17,7 @@
 //                  stays byte-identical.
 //   HeadHooks    - rank 0. The caller has already sampled (host sampler,
 //                  deterministic RNG on rank 0 only) and computed the flags;
-//                  the hook broadcasts DecisionMsg and, every
-//                  verify_hash_every steps, gathers HashProbe frames from the
-//                  workers and compares them with its own hash.
+//                  the hook broadcasts DecisionMsg.
 //   WorkerHooks  - ranks 1..N-1. Blocks on the head's frame with the
 //                  configured deadline, validates request_id/step, and hands
 //                  the head's token/flags back to the caller. Workers never
@@ -48,8 +46,6 @@ struct HookCounters {
     uint64_t decisions        = 0;   // Decision frames sent (head) / received (worker)
     uint64_t drafts           = 0;
     uint64_t accepts          = 0;
-    uint64_t hash_probes      = 0;
-    uint64_t hash_mismatches  = 0;   // head only
     uint64_t backend_ops      = 0;
     uint64_t ctrl_wait_us     = 0;   // time blocked on the control channel
 
@@ -101,13 +97,6 @@ struct Ds4ClusterHooks {
                                int32_t & accept, int32_t & bonus, uint8_t & flags,
                                std::string * err) = 0;
 
-    // Determinism probe (--cluster-verify-hash n). Worker sends its hashes;
-    // head gathers one HashProbe per worker and compares against its own.
-    // A mismatch is logged (first divergent rank and step) and counted; it
-    // is fatal only when strict mode is enabled on the head hooks.
-    virtual bool hash_probe(uint64_t req, uint32_t step, uint64_t hc_hash, uint64_t tok_hash,
-                            std::string * err) = 0;
-
     // Replicated backend mutation. Head: broadcast to all workers. Worker:
     // no-op (the worker main loop already executed the op it received).
     virtual bool backend_op(const BackendOpMsg & op, std::string * err) = 0;
@@ -117,11 +106,8 @@ struct Ds4ClusterHooks {
     // early-return semantics when no cluster is configured.
     virtual bool is_cluster() const = 0;
 
-    // Steps between hash probes; 0 = off.
-    virtual int verify_hash_every() const { return 0; }
-
-    virtual const HookCounters & counters() const { return counters_; }
-    virtual void reset_counters() { counters_.reset(); }
+    const HookCounters & counters() const { return counters_; }
+    void reset_counters() { counters_.reset(); }
 
     // The request id the head decorator / worker main loop assigned to the
     // generate() call currently in flight. The backend passes it back on
@@ -145,24 +131,16 @@ public:
     bool decide_accept(uint64_t, uint32_t, int32_t &, int32_t &, uint8_t &, std::string *) override {
         return true;
     }
-    bool hash_probe(uint64_t, uint32_t, uint64_t, uint64_t, std::string *) override { return true; }
     bool backend_op(const BackendOpMsg &, std::string *) override { return true; }
     bool is_head() const override { return true; }
     bool is_cluster() const override { return false; }
 };
 
 // ─── HeadHooks ─────────────────────────────────────────────────────────
-struct HeadHooksConfig {
-    uint32_t timeout_ms        = 30000;  // deadline for gather()
-    int      verify_hash_every = 0;
-    bool     strict_hash       = false;  // mismatch -> return false
-    bool     trace             = false;  // LUCE_CLUSTER_TRACE
-};
-
 class HeadHooks final : public Ds4ClusterHooks {
 public:
     // `control` must outlive the hooks.
-    HeadHooks(ClusterHeadControl & control, const HeadHooksConfig & cfg);
+    explicit HeadHooks(ClusterHeadControl & control);
 
     bool decide_next_token(uint64_t req, uint32_t step, const float * logits, int n_vocab,
                            const common::SamplerCfg & cfg, bool is_eos_candidate_unused,
@@ -171,30 +149,17 @@ public:
                       std::string * err) override;
     bool decide_accept(uint64_t req, uint32_t step, int32_t & accept, int32_t & bonus,
                        uint8_t & flags, std::string * err) override;
-    bool hash_probe(uint64_t req, uint32_t step, uint64_t hc_hash, uint64_t tok_hash,
-                    std::string * err) override;
     bool backend_op(const BackendOpMsg & op, std::string * err) override;
     bool is_head() const override { return true; }
     bool is_cluster() const override { return true; }
-    int verify_hash_every() const override { return cfg_.verify_hash_every; }
-
-    // First mismatch seen since reset_counters(); rank -1 = none.
-    int      first_mismatch_rank() const { return first_mismatch_rank_; }
-    uint32_t first_mismatch_step() const { return first_mismatch_step_; }
-    void reset_counters() override;
 
 private:
     ClusterHeadControl & control_;
-    HeadHooksConfig      cfg_;
-    int                  first_mismatch_rank_ = -1;
-    uint32_t             first_mismatch_step_ = 0;
 };
 
 // ─── WorkerHooks ───────────────────────────────────────────────────────
 struct WorkerHooksConfig {
-    int      rank              = -1;
-    uint32_t timeout_ms        = 30000;  // deadline for every blocking recv
-    int      verify_hash_every = 0;
+    uint32_t timeout_ms = 30000;  // deadline for every blocking recv
 };
 
 class WorkerHooks final : public Ds4ClusterHooks {
@@ -208,12 +173,9 @@ public:
                       std::string * err) override;
     bool decide_accept(uint64_t req, uint32_t step, int32_t & accept, int32_t & bonus,
                        uint8_t & flags, std::string * err) override;
-    bool hash_probe(uint64_t req, uint32_t step, uint64_t hc_hash, uint64_t tok_hash,
-                    std::string * err) override;
     bool backend_op(const BackendOpMsg &, std::string *) override { return true; }
     bool is_head() const override { return false; }
     bool is_cluster() const override { return true; }
-    int verify_hash_every() const override { return cfg_.verify_hash_every; }
 
     // When a recv expected a Decision/Draft/Accept but got a different frame
     // (RequestEnd because the head failed the request, Abort, Shutdown), the
@@ -236,9 +198,5 @@ private:
     bool                   aborted_ = false;
     std::string            abort_reason_;
 };
-
-// FNV-1a over a float buffer / token vector; shared by backend and tests.
-uint64_t hash_floats(const float * data, size_t n);
-uint64_t hash_tokens(const std::vector<int32_t> & tokens);
 
 }  // namespace luce::cluster

@@ -73,8 +73,8 @@ public:
     // first failing rank).
     bool broadcast(const Frame & frame, std::string * err);
     bool recv_from(int rank, Frame & frame, uint32_t deadline_ms, std::string * err);
-    // Collects one frame of the given type from every worker (e.g. all
-    // HashProbe or RequestReport messages); out[rank-1] is filled.
+    // Collects one frame of the given type from every worker (e.g. every
+    // RequestReport); out[rank-1] is filled.
     bool gather(MsgType type, uint32_t deadline_ms, std::vector<Frame> & out, std::string * err);
 
     int  n_workers() const;

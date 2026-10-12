@@ -192,7 +192,6 @@ bool ClusterHeadBackend::init() {
     welcome.timeout_ms = cfg_.timeout_ms;
     welcome.allreduce_dtype = (uint8_t) cfg_.allreduce_dtype;
     welcome.shared_expert = (uint8_t) cfg_.shared_expert;
-    welcome.verify_hash_every = cfg_.verify_hash_every;
     welcome.rank_hostnames.resize((size_t) cfg_.size);
     welcome.rank_hostnames[0] = identity_.hostname;
     for (const HelloMsg & h : hellos_) {
@@ -236,12 +235,7 @@ bool ClusterHeadBackend::init() {
         std::exit(ok ? 0 : 1);
     }
 
-    HeadHooksConfig hcfg;
-    hcfg.timeout_ms = cfg_.timeout_ms;
-    hcfg.verify_hash_every = cfg_.verify_hash_every;
-    hcfg.strict_hash = false;
-    hcfg.trace = cluster_env_trace();
-    hooks_ = std::make_unique<HeadHooks>(control_, hcfg);
+    hooks_ = std::make_unique<HeadHooks>(control_);
 
     // Second set_cluster call: attaches the communicator to the
     // runtime the factory created before init(); placement-defining fields
@@ -265,9 +259,8 @@ bool ClusterHeadBackend::init() {
 
 void ClusterHeadBackend::print_ready_banner() const {
     inner_->print_ready_banner();
-    std::printf("[cluster] head ready: size=%d workers=%d rccl=%s verify_hash_every=%d\n",
-                cfg_.size, control_.n_workers(), rccl_version_string().c_str(),
-                cfg_.verify_hash_every);
+    std::printf("[cluster] head ready: size=%d workers=%d rccl=%s\n",
+                cfg_.size, control_.n_workers(), rccl_version_string().c_str());
     std::fflush(stdout);
 }
 
@@ -482,10 +475,6 @@ bool ClusterHeadBackend::gather_reports(uint64_t request_id, uint32_t steps) {
     if (head_device_bytes > peak_device_bytes_) peak_device_bytes_ = head_device_bytes;
     head.peak_device_bytes = peak_device_bytes_;
     last_report_.head_ctrl_wait_us = head.ctrl_wait_us;
-    last_report_.hash_probes = hooks_->counters().hash_probes;
-    last_report_.hash_mismatches = hooks_->counters().hash_mismatches;
-    last_report_.first_mismatch_rank = hooks_->first_mismatch_rank();
-    last_report_.first_mismatch_step = hooks_->first_mismatch_step();
 
     std::vector<Frame> frames;
     std::string err;

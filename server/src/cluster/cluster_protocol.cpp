@@ -230,7 +230,6 @@ const char * msg_type_name(MsgType type) {
         case MsgType::Decision:      return "Decision";
         case MsgType::Draft:         return "Draft";
         case MsgType::Accept:        return "Accept";
-        case MsgType::HashProbe:     return "HashProbe";
         case MsgType::RequestReport: return "RequestReport";
         case MsgType::BackendOp:     return "BackendOp";
         case MsgType::RequestEnd:    return "RequestEnd";
@@ -264,7 +263,6 @@ void WelcomeMsg::encode(ByteWriter & w) const {
     w.u32(timeout_ms);
     w.u8(allreduce_dtype);
     w.u8(shared_expert);
-    w.i32(verify_hash_every);
     w.u32((uint32_t)rank_hostnames.size());
     for (const std::string & h : rank_hostnames) w.str(h);
 }
@@ -276,7 +274,7 @@ bool WelcomeMsg::decode(ByteReader & r, WelcomeMsg & out) {
     if (id.size() != kRcclUniqueIdBytes) return false;
     std::memcpy(out.rccl_unique_id.data(), id.data(), kRcclUniqueIdBytes);
     if (!r.u64(out.placement_hash) || !r.u32(out.timeout_ms) || !r.u8(out.allreduce_dtype) ||
-        !r.u8(out.shared_expert) || !r.i32(out.verify_hash_every)) {
+        !r.u8(out.shared_expert)) {
         return false;
     }
     uint32_t n = 0;
@@ -382,21 +380,6 @@ void AcceptMsg::encode(ByteWriter & w) const {
 bool AcceptMsg::decode(ByteReader & r, AcceptMsg & out) {
     return r.u64(out.request_id) && r.u32(out.step) && r.i32(out.accept) &&
            r.i32(out.bonus) && r.u8(out.flags);
-}
-
-void HashProbeMsg::encode(ByteWriter & w) const {
-    w.u64(request_id);
-    w.u32(step);
-    w.i32(rank);
-    w.u64(hc_state_hash);
-    w.u64(token_hash);
-    w.i32(first_divergent_layer);
-}
-
-bool HashProbeMsg::decode(ByteReader & r, HashProbeMsg & out) {
-    return r.u64(out.request_id) && r.u32(out.step) && r.i32(out.rank) &&
-           r.u64(out.hc_state_hash) && r.u64(out.token_hash) &&
-           r.i32(out.first_divergent_layer);
 }
 
 void RequestReportMsg::encode(ByteWriter & w) const {

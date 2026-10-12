@@ -75,9 +75,6 @@ struct ClusterConfig {
     AllreduceDType allreduce_dtype = AllreduceDType::Auto;
     uint32_t       timeout_ms      = kClusterDefaultTimeoutMs;  // --cluster-timeout-ms
 
-    // Debug: cross-rank hidden-state hash every n steps (0 = off).
-    int verify_hash_every = 0;
-
     // --cluster-selftest: bootstrap, run the collective self-test, exit.
     bool selftest = false;
 

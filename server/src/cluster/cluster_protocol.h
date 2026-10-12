@@ -29,7 +29,7 @@
 namespace luce::cluster {
 
 inline constexpr uint32_t kFrameMagic      = 0x4C43424Cu;  // "LBCL"
-inline constexpr uint16_t kProtocolVersion = 2;
+inline constexpr uint16_t kProtocolVersion = 3;
 inline constexpr size_t   kFrameHeaderBytes = 12;
 inline constexpr size_t   kMaxPayloadBytes  = 64ull * 1024ull * 1024ull;
 inline constexpr size_t   kRcclUniqueIdBytes = 128;  // == NCCL_UNIQUE_ID_BYTES
@@ -43,7 +43,6 @@ enum class MsgType : uint16_t {
     Decision      = 6,   // head -> workers, AR: sampled token + stop flags
     Draft         = 7,   // head -> workers, DSpark: proposed tokens for verify
     Accept        = 8,   // head -> workers, DSpark: accepted count + bonus token
-    HashProbe     = 9,   // worker -> head (and head local), determinism check
     RequestReport = 10,  // worker -> head, per-request telemetry
     BackendOp     = 11,  // head -> workers, snapshot/park/etc. replicated call
     RequestEnd    = 12,  // head -> workers, generation finished (normal path)
@@ -148,7 +147,6 @@ struct WelcomeMsg {
     uint32_t timeout_ms = 0;
     uint8_t  allreduce_dtype = 0;   // AllreduceDType as u8
     uint8_t  shared_expert   = 0;   // SharedExpertMode as u8
-    int32_t  verify_hash_every = 0;
     std::vector<std::string> rank_hostnames;  // index = rank
 
     static MsgType type() { return MsgType::Welcome; }
@@ -271,20 +269,6 @@ struct AcceptMsg {
     static bool decode(ByteReader & r, AcceptMsg & out);
 };
 
-// Determinism probe (--cluster-verify-hash n).
-struct HashProbeMsg {
-    uint64_t request_id = 0;
-    uint32_t step = 0;
-    int32_t  rank = -1;
-    uint64_t hc_state_hash = 0;   // FNV-1a over the final-layer HC state bytes
-    uint64_t token_hash = 0;      // FNV-1a over accepted token ids so far
-    int32_t  first_divergent_layer = -1;  // filled only under LUCE_CLUSTER_TRACE
-
-    static MsgType type() { return MsgType::HashProbe; }
-    void encode(ByteWriter & w) const;
-    static bool decode(ByteReader & r, HashProbeMsg & out);
-};
-
 // Per-request telemetry sent by every worker after RequestEnd; the head
 // merges it into usage.timings.cluster.
 struct RequestReportMsg {
@@ -364,7 +348,7 @@ bool parse_frame(const Frame & f, Msg & out) {
     return r.at_end();
 }
 
-// FNV-1a 64-bit, used for placement hashes and determinism probes.
+// FNV-1a 64-bit, used for placement and model-path hashes.
 uint64_t fnv1a64(const void * data, size_t n, uint64_t seed = 0xcbf29ce484222325ull);
 
 }  // namespace luce::cluster

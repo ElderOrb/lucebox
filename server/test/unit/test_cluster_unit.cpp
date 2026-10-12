@@ -242,23 +242,22 @@ TEST_CASE(ClusterUnitFixture, Fnv1a64KnownVectors) {
     // Chaining with the previous hash as seed equals hashing the concatenation.
     const uint64_t h1 = fnv1a64("foo", 3);
     CHECK_EQUAL(fnv1a64("bar", 3, h1), fnv1a64("foobar", 6));
-
-    const std::vector<int32_t> toks = {1, 2, 3};
-    CHECK_EQUAL(hash_tokens(toks), fnv1a64(toks.data(), toks.size() * sizeof(int32_t)));
-    CHECK_EQUAL(hash_tokens({}), fnv1a64(nullptr, 0));
-    const float fl[2] = {1.0f, -2.0f};
-    CHECK_EQUAL(hash_floats(fl, 2), fnv1a64(fl, sizeof(fl)));
-    CHECK_EQUAL(hash_floats(nullptr, 0), fnv1a64(nullptr, 0));
 }
 
 TEST_CASE(ClusterUnitFixture, MsgTypeNamesAreDistinct) {
+    const MsgType types[] = {
+        MsgType::Hello, MsgType::Welcome, MsgType::Heartbeat, MsgType::Abort,
+        MsgType::Request, MsgType::Decision, MsgType::Draft, MsgType::Accept,
+        MsgType::RequestReport, MsgType::BackendOp, MsgType::RequestEnd, MsgType::Shutdown,
+    };
     std::set<std::string> names;
-    for (uint16_t t = 1; t <= 13; t++) {
-        const char * n = msg_type_name((MsgType) t);
+    for (MsgType t : types) {
+        const char * n = msg_type_name(t);
         REQUIRE_NOT_NULL(n);
+        CHECK(std::string(n) != "Unknown");
         names.insert(n);
     }
-    CHECK_EQUAL(names.size(), (size_t) 13);
+    CHECK_EQUAL(names.size(), sizeof(types) / sizeof(types[0]));
 }
 
 // ─── Protocol: messages ─────────────────────────────────────────────────
@@ -294,7 +293,6 @@ TEST_CASE(ClusterUnitFixture, HelloWelcomeRoundTrip) {
     w.timeout_ms = 30000;
     w.allreduce_dtype = 2;
     w.shared_expert = 1;
-    w.verify_hash_every = 8;
     w.rank_hostnames = {"halo-0", "halo-1", "", "halo-3"};
     WelcomeMsg wo;
     check_roundtrip_and_truncation(w, wo);
@@ -304,7 +302,6 @@ TEST_CASE(ClusterUnitFixture, HelloWelcomeRoundTrip) {
     CHECK_EQUAL(wo.timeout_ms, 30000u);
     CHECK_EQUAL(wo.allreduce_dtype, 2);
     CHECK_EQUAL(wo.shared_expert, 1);
-    CHECK_EQUAL(wo.verify_hash_every, 8);
     REQUIRE_EQUAL(wo.rank_hostnames.size(), (size_t) 4);
     CHECK(wo.rank_hostnames[2].empty());
     CHECK_EQUAL(wo.rank_hostnames[3], std::string("halo-3"));
@@ -468,21 +465,7 @@ TEST_CASE(ClusterUnitFixture, DecisionDraftAcceptRoundTrip) {
     CHECK_EQUAL(ac_out.flags, (uint8_t) kDecisionStop);
 }
 
-TEST_CASE(ClusterUnitFixture, HashProbeReportBackendOpRequestEndRoundTrip) {
-    HashProbeMsg hp;
-    hp.request_id = 1;
-    hp.step = 8;
-    hp.rank = 2;
-    hp.hc_state_hash = 0xAAAAAAAAAAAAAAAAull;
-    hp.token_hash = 0x5555555555555555ull;
-    hp.first_divergent_layer = 17;
-    HashProbeMsg hp_out;
-    check_roundtrip_and_truncation(hp, hp_out);
-    CHECK_EQUAL(hp_out.rank, 2);
-    CHECK_EQUAL(hp_out.hc_state_hash, hp.hc_state_hash);
-    CHECK_EQUAL(hp_out.token_hash, hp.token_hash);
-    CHECK_EQUAL(hp_out.first_divergent_layer, 17);
-
+TEST_CASE(ClusterUnitFixture, ReportBackendOpRequestEndRoundTrip) {
     RequestReportMsg rr;
     rr.request_id = 1;
     rr.rank = 1;
@@ -886,7 +869,6 @@ TEST_CASE(ClusterUnitFixture, LocalHooksAreTransparent) {
     LocalHooks h;
     CHECK(h.is_head());
     CHECK_FALSE(h.is_cluster());
-    CHECK_EQUAL(h.verify_hash_every(), 0);
     int32_t token = 123;
     uint8_t flags = kDecisionEos;
     luce::common::SamplerCfg cfg;
@@ -902,7 +884,6 @@ TEST_CASE(ClusterUnitFixture, LocalHooksAreTransparent) {
     CHECK(h.decide_accept(1, 0, accept, bonus, flags, &err));
     CHECK_EQUAL(accept, 2);
     CHECK_EQUAL(bonus, 9);
-    CHECK(h.hash_probe(1, 0, 1, 2, &err));
     CHECK(h.backend_op(BackendOpMsg{}, &err));
     h.set_current_request(77);
     CHECK_EQUAL(h.current_request(), 77u);
@@ -950,7 +931,6 @@ struct LoopbackPair {
         WelcomeMsg send;
         send.size = 2;
         send.timeout_ms = 5000;
-        send.verify_hash_every = 4;
         send.rank_hostnames = {"head", "worker"};
         std::atomic<bool> w_ok{false};
         std::thread wt([&] {
@@ -975,7 +955,7 @@ TEST_CASE(ClusterUnitFixture, ControlHandshakeAcceptsMatchingIdentity) {
     CHECK_EQUAL(lp.hellos[0].rank, 1);
     CHECK_EQUAL(lp.hellos[0].hostname, std::string("worker"));
     CHECK_EQUAL(lp.welcome.size, 2);
-    CHECK_EQUAL(lp.welcome.verify_hash_every, 4);
+    CHECK_EQUAL(lp.welcome.timeout_ms, 5000u);
     CHECK_EQUAL(lp.head.n_workers(), 1);
     CHECK(lp.head.all_alive());
     CHECK(lp.worker.alive());
@@ -1013,18 +993,12 @@ TEST_CASE(ClusterUnitFixture, HeadAndWorkerHooksOverLoopback) {
     if (lp.port == 0) SKIP("no loopback port available");
     REQUIRE(lp.handshake(lp.worker_id));
 
-    HeadHooksConfig hc;
-    hc.timeout_ms = 5000;
-    hc.verify_hash_every = 4;
-    HeadHooks head(lp.head, hc);
+    HeadHooks head(lp.head);
     WorkerHooksConfig wc;
-    wc.rank = 1;
     wc.timeout_ms = 5000;
-    wc.verify_hash_every = 4;
     WorkerHooks worker(lp.worker, wc);
     CHECK(head.is_head());  CHECK(head.is_cluster());
     CHECK_FALSE(worker.is_head()); CHECK(worker.is_cluster());
-    CHECK_EQUAL(worker.verify_hash_every(), 4);
 
     const uint64_t req = 42;
     head.set_current_request(req);
@@ -1032,18 +1006,16 @@ TEST_CASE(ClusterUnitFixture, HeadAndWorkerHooksOverLoopback) {
     luce::common::SamplerCfg scfg;
     const float logits[4] = {0.1f, 0.9f, 0.2f, 0.3f};
 
-    SECTION("decision, draft, accept, hash probe and backend op") {
+    SECTION("decision, draft, accept and backend op") {
         std::string w_err;
         int32_t w_tok = -1; uint8_t w_flags = 0;
         std::vector<int32_t> w_draft;
         int32_t w_accept = -1, w_bonus = -1; uint8_t w_aflags = 0;
-        bool w_dec = false, w_dr = false, w_ac = false, w_hp = false, w_hp2 = false;
+        bool w_dec = false, w_dr = false, w_ac = false;
         std::thread wt([&] {
             w_dec = worker.decide_next_token(req, 0, nullptr, 0, scfg, false, w_tok, w_flags, &w_err);
             w_dr  = worker.decide_draft(req, 1, 100, w_draft, &w_err);
             w_ac  = worker.decide_accept(req, 1, w_accept, w_bonus, w_aflags, &w_err);
-            w_hp  = worker.hash_probe(req, 4, 0xAAAA, 0xBBBB, &w_err);   // matches
-            w_hp2 = worker.hash_probe(req, 8, 0xAAAA, 0xCCCC, &w_err);   // token hash differs
         });
 
         std::string h_err;
@@ -1054,25 +1026,15 @@ TEST_CASE(ClusterUnitFixture, HeadAndWorkerHooksOverLoopback) {
         REQUIRE(head.decide_draft(req, 1, 100, draft, &h_err));
         int32_t accept = 3, bonus = 11; uint8_t aflags = 0;
         REQUIRE(head.decide_accept(req, 1, accept, bonus, aflags, &h_err));
-        REQUIRE(head.hash_probe(req, 4, 0xAAAA, 0xBBBB, &h_err));
-        CHECK_EQUAL(head.counters().hash_mismatches, 0u);
-        CHECK_EQUAL(head.first_mismatch_rank(), -1);
-        REQUIRE(head.hash_probe(req, 8, 0xAAAA, 0xBBBB, &h_err));  // non-strict: logged, not fatal
-        CHECK_EQUAL(head.counters().hash_mismatches, 1u);
-        CHECK_EQUAL(head.first_mismatch_rank(), 1);
-        CHECK_EQUAL(head.first_mismatch_step(), 8u);
         wt.join();
 
         CHECK(w_dec); CHECK_EQUAL(w_tok, 7); CHECK_EQUAL(w_flags, flags);
         CHECK(w_dr);  CHECK(w_draft == draft);
         CHECK(w_ac);  CHECK_EQUAL(w_accept, 3); CHECK_EQUAL(w_bonus, 11);
-        CHECK(w_hp); CHECK(w_hp2);
         CHECK_EQUAL(head.counters().decisions, 1u);
         CHECK_EQUAL(head.counters().drafts, 1u);
         CHECK_EQUAL(head.counters().accepts, 1u);
-        CHECK_EQUAL(head.counters().hash_probes, 2u);
         CHECK_EQUAL(worker.counters().decisions, 1u);
-        CHECK_EQUAL(worker.counters().hash_probes, 2u);
 
         // Backend op reaches the worker as a plain frame (the worker main
         // loop executes it; WorkerHooks::backend_op is a no-op).
@@ -1162,9 +1124,8 @@ TEST_CASE(ClusterUnitFixture, EmptyDraftBlockIsTheEndMarker) {
     if (lp.port == 0) SKIP("no loopback port available");
     REQUIRE(lp.handshake(lp.worker_id));
 
-    HeadHooksConfig hc; hc.timeout_ms = 5000;
-    HeadHooks head(lp.head, hc);
-    WorkerHooksConfig wc; wc.rank = 1; wc.timeout_ms = 5000;
+    HeadHooks head(lp.head);
+    WorkerHooksConfig wc; wc.timeout_ms = 5000;
     WorkerHooks worker(lp.worker, wc);
 
     const uint64_t req = 9;
@@ -1204,18 +1165,16 @@ TEST_CASE(ClusterUnitFixture, EmptyDraftMsgRoundTrip) {
     CHECK(got.tokens.empty());
 }
 
-TEST_CASE(ClusterUnitFixture, HeadHooksFailWhenWorkerGone) {
+TEST_CASE(ClusterUnitFixture, HeadGatherFailsWhenWorkerGone) {
     LoopbackPair lp;
     if (lp.port == 0) SKIP("no loopback port available");
     REQUIRE(lp.handshake(lp.worker_id));
     lp.worker.close();
 
-    HeadHooksConfig hc;
-    hc.timeout_ms = 500;
-    HeadHooks head(lp.head, hc);
+    std::vector<Frame> frames;
     std::string err;
     // A gather with no live worker must return false within the deadline.
-    CHECK_FALSE(head.hash_probe(1, 0, 1, 2, &err));
+    CHECK_FALSE(lp.head.gather(MsgType::RequestReport, 500, frames, &err));
     CHECK_FALSE(err.empty());
     lp.head.close();
 }
