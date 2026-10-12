@@ -605,13 +605,9 @@ static void ds4_cluster_allreduce_graph_callback(void * user, void * data,
 static void ds4_hyb_fail(Ds4ClusterRuntime * rt, const char * what) {
     if (rt->node_error.empty()) rt->node_error = std::string("hybrid exchange: ") + what + " failed";
 }
-static void ds4_hyb_export0_cb(void * user, void * data, size_t n, void * stream) {
+static void ds4_hyb_export_cb(void * user, void * data, size_t n, void * stream) {
     auto * rt = static_cast<Ds4ClusterRuntime *>(user);
-    if (!rt || !rt->fast || !rt->fast->hyb_export((const float *) data, n, stream, 0, rt->hyb_export0++)) ds4_hyb_fail(rt, "export (hot)");
-}
-static void ds4_hyb_export1_cb(void * user, void * data, size_t n, void * stream) {
-    auto * rt = static_cast<Ds4ClusterRuntime *>(user);
-    if (!rt || !rt->fast || !rt->fast->hyb_export((const float *) data, n, stream, 1, rt->hyb_export1++)) ds4_hyb_fail(rt, "export (shared)");
+    if (!rt || !rt->fast || !rt->fast->hyb_export((const float *) data, n, stream, rt->hyb_export++)) ds4_hyb_fail(rt, "export");
 }
 static void ds4_hyb_combine_cb(void * user, void * data, size_t n, void * stream) {
     auto * rt = static_cast<Ds4ClusterRuntime *>(user);
@@ -637,35 +633,20 @@ ggml_tensor * ds4_cluster_hybrid_exchange_nodes(ggml_context * ctx,
                                                 ggml_tensor * cold,
                                                 Ds4ClusterRuntime & rt,
                                                 ggml_tensor ** combine_node,
-                                                ggml_tensor ** export_hot_node,
-                                                ggml_tensor ** export_shared_node) {
-    if (!ctx || !hot || !shared || !cold || !combine_node || !export_hot_node || !export_shared_node) return nullptr;
+                                                ggml_tensor ** export_node) {
+    if (!ctx || !hot || !shared || !cold || !combine_node || !export_node) return nullptr;
     for (ggml_tensor * t : {hot, shared, cold}) {
         if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || ggml_nelements(t) != ggml_nelements(hot)) return nullptr;
     }
     // In place throughout: each node passes its own tensor to its callback.
-    // LUCE_CLUSTER_HYBRID_ONE_EXPORT=1: export hot + shared as one partial
-    // (half the dGPU link bytes; the iGPU adds cold + (hot + shared)).
-    static const bool one_export = [] {
-        const char * v = std::getenv("LUCE_CLUSTER_HYBRID_ONE_EXPORT");
-        return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    ggml_tensor * ex0 = nullptr;
-    ggml_tensor * ex1 = nullptr;
-    if (one_export) {
-        ggml_tensor * hs = ggml_add(ctx, hot, shared);
-        ex1 = ggml_cluster_allreduce_inplace(ctx, hs, &ds4_hyb_export0_cb, &rt);
-        ex0 = ex1;
-    } else {
-        ex0 = ggml_cluster_allreduce_inplace(ctx, hot, &ds4_hyb_export0_cb, &rt);
-        ex1 = ggml_cluster_allreduce_inplace(ctx, shared, &ds4_hyb_export1_cb, &rt);
-    }
+    // The dGPU exports hot + shared as one partial (one crossing of its link),
+    // the iGPU adds cold + (hot + shared) and exchanges, and the import
+    // overwrites the exported partial with the reduced sum.
+    ggml_tensor * ex = ggml_cluster_allreduce_inplace(ctx, ggml_add(ctx, hot, shared), &ds4_hyb_export_cb, &rt);
     ggml_tensor * comb = ggml_cluster_allreduce_inplace(ctx, cold, &ds4_hyb_combine_cb, &rt);
-    // The import overwrites the exported shared partial with the reduced sum.
-    ggml_tensor * imp = ggml_cluster_allreduce_inplace(ctx, ex1, &ds4_hyb_import_cb, &rt);
+    ggml_tensor * imp = ggml_cluster_allreduce_inplace(ctx, ex, &ds4_hyb_import_cb, &rt);
     *combine_node = comb;
-    *export_hot_node = ex0;
-    *export_shared_node = ex1;
+    *export_node = ex;
     return imp;
 }
 

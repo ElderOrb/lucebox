@@ -33,32 +33,15 @@
 
 namespace luce::cluster {
 
-// The kernels live in fast_reduce_kernels.cu (LANGUAGE HIP).
-void fast_reduce_launch_pack(const float * src, void * dst, int n, int bf16, hipStream_t stream);
-void fast_reduce_launch_pack_pub(const float * src, void * dst, int n, int bf16,
-                                 uint32_t * flag, uint32_t value, uint32_t * counter, hipStream_t stream);
-void fast_reduce_launch_hyb_combine_pub(const float * cold, const float * hot, const float * shared, void * own_row,
-                                        int n, int bf16, uint32_t * flag, uint32_t value, uint32_t * counter,
-                                        hipStream_t stream);
-void fast_reduce_launch_hyb_final_pub(const void * own_row, const void * peer_row, float * dst, int n, int bf16,
-                                      uint32_t * flag, uint32_t value, uint32_t * counter, hipStream_t stream);
-void fast_reduce_launch_add_zc(float * dst, const void * peer, int n, int bf16, hipStream_t stream);
-void fast_reduce_launch_hyb_combine(const float * cold, const float * hot, const float * shared, void * own_row,
-                                    int n, int bf16, hipStream_t stream);
-void fast_reduce_launch_hyb_final(const void * own_row, const void * peer_row, float * dst, int n, int bf16,
-                                  hipStream_t stream);
-void fast_reduce_launch_set_flag(uint32_t * pub_flag, uint32_t * slot_done,
-                                 uint32_t * progress, uint32_t seq,
-                                 uint32_t slot_span, uint64_t spin_limit,
-                                 hipStream_t stream);
-void fast_reduce_launch_wait_flags(uint32_t * const * peer_flags,
-                                   uint32_t * timed_out, uint32_t * progress,
-                                   uint32_t seq, int n_peers,
-                                   uint64_t spin_limit, hipStream_t stream);
-void fast_reduce_launch_add(float * dst, const float * scratch, int n_peers,
-                            int n, int stride, uint32_t * slot_done,
-                            uint32_t * progress, uint32_t seq,
-                            hipStream_t stream);
+// The kernels live in fast_reduce_kernels.cu (LANGUAGE HIP). A kernel that
+// writes an exchange row also raises the row's flag from its last block.
+void fast_reduce_launch_pack(const float * src, void * dst, int n, int bf16,
+                             uint32_t * flag, uint32_t value, uint32_t * counter, hipStream_t stream);
+void fast_reduce_launch_add(float * dst, const void * peer, int n, int bf16, hipStream_t stream);
+void fast_reduce_launch_hyb_combine(const float * cold, const float * hot, void * own_row, int n,
+                                    uint32_t * flag, uint32_t value, uint32_t * counter, hipStream_t stream);
+void fast_reduce_launch_hyb_final(const void * own_row, const void * peer_row, float * dst, int n,
+                                  uint32_t * flag, uint32_t value, uint32_t * counter, hipStream_t stream);
 
 namespace {
 
@@ -196,54 +179,10 @@ bool exchange(const FastReduce::Config & cfg, const Endpoint & mine,
 
 }  // namespace
 
-// A switch is on when set to anything but empty or "0". Cluster mode sets the
-// measured configuration's switches by default (launch_profiles.h), so "0" is
-// how an operator turns one off.
+// A switch is on when set to anything but empty or "0".
 static bool fr_env_on(const char * name) {
     const char * v = std::getenv(name);
     return v && *v && std::strcmp(v, "0") != 0;
-}
-
-// Two ranks with LUCE_CLUSTER_FAST_REDUCE_ZC=1 (and the stream flags) take the
-// zero-copy path: pack into the pinned row, add the peer's row straight out of
-// pinned memory. It needs no device scratch.
-static bool fr_zero_copy(int size) {
-    static const bool zc = fr_env_on("LUCE_CLUSTER_FAST_REDUCE_ZC") &&
-                           !fr_env_on("LUCE_CLUSTER_FAST_REDUCE_KERNEL_FLAGS");
-    return zc && size == 2;
-}
-
-// A row crosses the cable as bf16 exactly when the zero-copy path packs it so
-// (LUCE_CLUSTER_FAST_REDUCE_BF16); the copy-engine path publishes f32. The
-// progress thread sizes every RDMA write by the same rule.
-static bool fr_bf16_wire(int size) {
-    static const bool bf16 = fr_env_on("LUCE_CLUSTER_FAST_REDUCE_BF16");
-    return bf16 && fr_zero_copy(size);
-}
-
-// LUCE_CLUSTER_FAST_REDUCE_LEAN=1 drops the per-reduction slot-reuse waits and
-// done writes on every stream-flag path. Neither carries data: the
-// ranks advance in lockstep (a rank publishes reduction q only after it added
-// the peer's row of q - 1), so a slot comes round again only after both ranks
-// consumed it 256 reductions earlier, and the GPU's own stream orders its
-// writes behind its reads. On a discrete GPU each of these stream operations
-// is a blit kernel with its own dispatch gap, four per layer.
-static bool fast_reduce_lean() {
-    static const bool lean = fr_env_on("LUCE_CLUSTER_FAST_REDUCE_LEAN");
-    return lean;
-}
-
-// The kernel that writes an exchange row also publishes its flag (one
-// system-scope release by its grid's last block) instead of a
-// hipStreamWriteValue32 after it, which saves a stream operation per row and
-// gives the same bits. LUCE_CLUSTER_FAST_REDUCE_KPUB=0 goes back to the stream
-// writes.
-static bool fast_reduce_kpub() {
-    static const bool on = [] {
-        const char * v = std::getenv("LUCE_CLUSTER_FAST_REDUCE_KPUB");
-        return !(v && v[0] == '0' && v[1] == '\0');
-    }();
-    return on;
 }
 
 struct FastReduceImpl {
@@ -279,26 +218,9 @@ struct FastReduceImpl {
     // ordinary store, which is the path the probe measured at 0.79 us. This is
     // the same reason a general collective has a proxy thread at all.
     uint32_t * flag_host = nullptr;         // [slots][size] arrival | [slots][size] visible
-                                            // | [slots] pub | [slots] done
+                                            // | [slots] pub | [slots] hybrid export | [slots] hybrid final
     uint32_t * flag_dev = nullptr;
 
-    // Device-visible pointer table for the flags, one row per slot. The
-    // payloads need no such table: they are moved by the copy engine, which
-    // takes its addresses from the host.
-    uint32_t **    peer_flags = nullptr;    // [slots][size-1]
-    uint32_t **    peer_flags_dev = nullptr;
-
-    // Device memory the peers' partials are copied into before they are added:
-    // the pinned staging buffer is uncached for the GPU, so adding straight
-    // out of it is slow.
-    float *        scratch = nullptr;       // [slots][size-1][max_elems]
-
-    uint32_t * timed_out_host = nullptr;
-    uint32_t * timed_out_dev = nullptr;
-    // seq*4 + {1 published, 2 waiting, 3 done}: which reduction the GPU is in
-    // and what it is doing there.
-    uint32_t * progress_host = nullptr;
-    uint32_t * progress_dev = nullptr;
 
     // Payload length per reduction, on its own much larger ring. It cannot
     // share the slot ring: it is written when the host *enqueues* a reduction
@@ -312,7 +234,7 @@ struct FastReduceImpl {
     // Set by the stall watchdog: every later submit becomes a no-op so the GPU
     // never parks on a peer that is gone, and the process exits once idle.
     std::atomic<bool> failed{false};
-    // Hybrid exchange buffers, pinned: [part 0 = hot | part 1 = shared | 2 = final][slots][hyb_elems].
+    // Hybrid exchange buffers, pinned: [part 0 = the dGPU's export | part 1 = the final sum][slots][hyb_elems].
     float *  hyb_host = nullptr;
     float *  hyb_dev = nullptr;
     int      hyb_elems = 0;
@@ -339,17 +261,13 @@ struct FastReduceImpl {
     size_t pub_off(int slot) const {
         return 2u * (size_t) cfg.slots * (size_t) cfg.size + (size_t) slot;
     }
-    size_t done_off(int slot) const {
-        return pub_off(0) + (size_t) cfg.slots + (size_t) slot;
-    }
     uint32_t * arrival_flag(int slot, int peer) { return flag_host + arrival_off(slot, peer); }
     uint32_t * visible_flag(int slot, int peer) { return flag_host + visible_off(slot, peer); }
     uint32_t * pub_flag(int slot) { return flag_host + pub_off(slot); }
-    uint32_t * done_flag(int slot) { return flag_host + done_off(slot); }
-    size_t hybh_off(int slot) const { return done_off(0) + (size_t) cfg.slots + (size_t) slot; }
+    size_t hybh_off(int slot) const { return pub_off(0) + (size_t) cfg.slots + (size_t) slot; }
     size_t hybf_off(int slot) const { return hybh_off(0) + (size_t) cfg.slots + (size_t) slot; }
     size_t flag_count() const {
-        return 2u * (size_t) cfg.size * (size_t) cfg.slots + 4u * (size_t) cfg.slots;
+        return 2u * (size_t) cfg.size * (size_t) cfg.slots + 3u * (size_t) cfg.slots;
     }
 };
 
@@ -376,15 +294,15 @@ uint32_t * FastReduceImpl::pub_counter(hipStream_t stm, int slot, int kind) {
 FastReduce::~FastReduce() { shutdown(); }
 
 bool FastReduce::ok() const { return p_ && p_->up; }
-uint64_t FastReduce::submitted() const { return p_ ? p_->seq.load() : 0; }
-uint64_t FastReduce::timed_out() const {
-    return (p_ && p_->timed_out_host) ? *p_->timed_out_host : 0;
-}
 
 bool FastReduce::init(const Config & cfg, std::string * err) {
     auto & s = *p_;
     s.cfg = cfg;
     if (cfg.size <= 1) { s.up = false; return true; }
+    if (cfg.size != 2) {
+        if (err) *err = "fast-reduce: a two-rank exchange, " + std::to_string(cfg.size) + " ranks keep RCCL";
+        return false;
+    }
 
     auto bail = [&](const std::string & what) {
         if (err) *err = "fast-reduce: " + what;
@@ -426,20 +344,10 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
         return bail("hipHostMalloc for the flag region failed");
     }
     std::memset(s.flag_host, 0, s.flag_count() * sizeof(uint32_t));
-    if (hipHostMalloc((void **) &s.timed_out_host, sizeof(uint32_t) * 16,
-                      hipHostMallocDefault) != hipSuccess) {
-        return bail("hipHostMalloc for the timeout word failed");
-    }
-    *s.timed_out_host = 0;
-    if (hipHostMalloc((void **) &s.progress_host, sizeof(uint32_t) * 16,
-                      hipHostMallocDefault) != hipSuccess) {
-        return bail("hipHostMalloc for the progress word failed");
-    }
-    *s.progress_host = 0;
-    if (fr_env_on("LUCE_CLUSTER_HYBRID_EXCHANGE") && cfg.size == 2) {
+    if (fr_env_on("LUCE_CLUSTER_HYBRID_EXCHANGE")) {
         // Decode widths only: 5120 x 6 lanes fits; prefill keeps its own path.
         s.hyb_elems = std::min(cfg.max_elems, 32768);
-        const size_t bytes = (size_t) 3 * (size_t) cfg.slots * (size_t) s.hyb_elems * sizeof(float);
+        const size_t bytes = (size_t) 2 * (size_t) cfg.slots * (size_t) s.hyb_elems * sizeof(float);
         float * h = nullptr;
         if (hipHostMalloc((void **) &h, bytes, hipHostMallocDefault) != hipSuccess) {
             return bail("hipHostMalloc for the hybrid exchange failed");
@@ -453,9 +361,7 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
     }
 
     if (hipHostGetDevicePointer((void **) &s.data_dev, s.data_host, 0) != hipSuccess ||
-        hipHostGetDevicePointer((void **) &s.flag_dev, s.flag_host, 0) != hipSuccess ||
-        hipHostGetDevicePointer((void **) &s.timed_out_dev, s.timed_out_host, 0) != hipSuccess ||
-        hipHostGetDevicePointer((void **) &s.progress_dev, s.progress_host, 0) != hipSuccess) {
+        hipHostGetDevicePointer((void **) &s.flag_dev, s.flag_host, 0) != hipSuccess) {
         return bail("hipHostGetDevicePointer failed");
     }
 
@@ -517,15 +423,16 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
     if (!exchange(cfg, mine, table, err)) { shutdown(); return false; }
     s.peers = table;
 
+    // LUCE_CLUSTER_FAST_REDUCE_MTU: the path MTU (default 4096, what a direct
+    // ConnectX link runs).
+    const char * mtu_env = std::getenv("LUCE_CLUSTER_FAST_REDUCE_MTU");
+    const int mtu = mtu_env ? std::atoi(mtu_env) : 4096;
+
     for (int r = 0; r < cfg.size; ++r) {
         if (r == cfg.rank) continue;
         ibv_qp_attr a{};
         a.qp_state = IBV_QPS_RTR;
-        // LUCE_CLUSTER_FAST_REDUCE_MTU=1024|2048|4096 (default 4096: the direct ConnectX link runs 4096).
-        {
-            static const int mtu_env = std::getenv("LUCE_CLUSTER_FAST_REDUCE_MTU") ? std::atoi(std::getenv("LUCE_CLUSTER_FAST_REDUCE_MTU")) : 4096;
-            a.path_mtu = mtu_env >= 4096 ? IBV_MTU_4096 : (mtu_env >= 2048 ? IBV_MTU_2048 : IBV_MTU_1024);
-        }
+        a.path_mtu = mtu >= 4096 ? IBV_MTU_4096 : (mtu >= 2048 ? IBV_MTU_2048 : IBV_MTU_1024);
         a.dest_qp_num = s.peers[(size_t) r].qpn[cfg.rank];
         a.rq_psn = 0;
         a.max_dest_rd_atomic = 1;
@@ -555,36 +462,16 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
         }
     }
 
-    // ── pointer tables, one row per slot ──────────────────────────────────
-    const int n_peers = cfg.size - 1;
-    const size_t rows = (size_t) cfg.slots * (size_t) n_peers;
-    if (hipHostMalloc((void **) &s.peer_flags, rows * sizeof(uint32_t *),
-                      hipHostMallocDefault) != hipSuccess) {
-        return bail("hipHostMalloc for the flag table failed");
-    }
-    for (int slot = 0; slot < cfg.slots; ++slot) {
-        int k = 0;
-        for (int r = 0; r < cfg.size; ++r) {
-            if (r == cfg.rank) continue;
-            s.peer_flags[(size_t) slot * (size_t) n_peers + (size_t) k] =
-                s.flag_dev + s.visible_off(slot, r);
-            ++k;
-        }
-    }
-    if (hipHostGetDevicePointer((void **) &s.peer_flags_dev, s.peer_flags, 0) != hipSuccess) {
-        return bail("hipHostGetDevicePointer for the flag table failed");
-    }
-    if (!fr_zero_copy(cfg.size) &&
-        hipMalloc((void **) &s.scratch,
-                  rows * (size_t) cfg.max_elems * sizeof(float)) != hipSuccess) {
-        return bail("hipMalloc for the peer scratch failed");
-    }
-
     s.pending_n.assign((size_t) FastReduceImpl::kPendingRing, 0);
 
     // ── progress ──────────────────────────────────────────────────────────
+    // LUCE_CLUSTER_FAST_REDUCE_STALL_S: how long a reduction may wait before
+    // the rank releases its GPU and exits (0 turns the watchdog off).
+    const char * stall_env = std::getenv("LUCE_CLUSTER_FAST_REDUCE_STALL_S");
+    const double stall_s = stall_env ? std::atof(stall_env) : 20.0;
+
     s.up = true;
-    s.progress = std::thread([&s]() {
+    s.progress = std::thread([&s, stall_s]() {
         uint64_t next = 1;
         std::vector<ibv_wc> wc(64);
         // Stall release: every flag a stream can be parked on for reduction q,
@@ -607,16 +494,15 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
         // peer's own watchdog ends the other rank.
         auto release_and_exit = [&s, &release_one](uint64_t first) {
             s.failed.store(true);
+            // Nothing reports a finished reduction, so keep releasing for the
+            // whole grace period; late submits are released too.
             const auto drain_t0 = std::chrono::steady_clock::now();
-            bool drained = false;   // the lean paths write no done flags: wait the full time
-            while (!drained && std::chrono::duration<double>(std::chrono::steady_clock::now() - drain_t0).count() < 15.0) {
+            while (std::chrono::duration<double>(std::chrono::steady_clock::now() - drain_t0).count() < 15.0) {
                 const uint64_t last = std::max(first, s.seq.load());
-                for (uint64_t q = first; q <= last; ++q) release_one(q);   // late submits too
-                drained = *(volatile uint32_t *) s.done_flag((int) (last % (uint64_t) s.cfg.slots)) == (uint32_t) last;
-                if (!drained) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                for (uint64_t q = first; q <= last; ++q) release_one(q);
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
-            std::fprintf(stderr, "[fast-reduce] rank %d: %s, exiting\n", s.cfg.rank,
-                         drained ? "GPU drained" : "GPU released");
+            std::fprintf(stderr, "[fast-reduce] rank %d: GPU released, exiting\n", s.cfg.rank);
             std::fflush(nullptr);
             std::_Exit(4);
         };
@@ -636,8 +522,6 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
             // server waits here between requests and that time is no stall.
             bool handed_out = false;
             auto handed_t0 = wait_t0;
-            static const double stall_s = std::getenv("LUCE_CLUSTER_FAST_REDUCE_STALL_S")
-                ? std::atof(std::getenv("LUCE_CLUSTER_FAST_REDUCE_STALL_S")) : 20.0;
             while (*pub != (uint32_t) next) {
                 if (s.stop.load(std::memory_order_relaxed)) return;
                 if (++spins < 200000ull) continue;
@@ -661,20 +545,16 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
                 }
                 if (next <= 1) continue;
                 // The GPU published reduction p = next-1 and is waiting on the
-                // peers' flags for it. Done long ago is the normal idle case;
-                // published but not done means a peer never delivered.
+                // peer's flag for it. Arrived long ago is the normal idle case;
+                // published but not arrived means a peer never delivered.
                 const uint64_t p = next - 1;
                 const int ps = (int) (p % (uint64_t) s.cfg.slots);
-                if (*(volatile uint32_t *) s.done_flag(ps) == (uint32_t) p) continue;
-                if (fast_reduce_lean()) {
-                    bool arrived = true;
-                    for (int r = 0; r < s.cfg.size; ++r) {
-                        if (r == s.cfg.rank) continue;
-                        const uint32_t v = *(volatile uint32_t *) s.visible_flag(ps, r);
-                        if (v != (uint32_t) p) arrived = false;
-                    }
-                    if (arrived) continue;
+                bool arrived = true;
+                for (int r = 0; r < s.cfg.size; ++r) {
+                    if (r == s.cfg.rank) continue;
+                    if (*(volatile uint32_t *) s.visible_flag(ps, r) != (uint32_t) p) arrived = false;
                 }
+                if (arrived) continue;
                 const double waited = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - wait_t0).count();
                 if (waited > 5.0 && !moaned) {
@@ -687,7 +567,7 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
                     }
                     std::fprintf(stderr,
                                  "[fast-reduce] rank %d: reduction %llu published %.1f s ago, "
-                                 "not done; peer flags%s (want %llu); host submitted %llu\n",
+                                 "not arrived; peer flags%s (want %llu); host submitted %llu\n",
                                  s.cfg.rank, (unsigned long long) p, waited, vis.c_str(),
                                  (unsigned long long) p,
                                  (unsigned long long) s.seq.load());
@@ -711,7 +591,7 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
                 ibv_sge sge{};
                 sge.addr = (uint64_t) (uintptr_t) (s.data_host +
                     (size_t) slot * s.slot_stride() + (size_t) s.cfg.rank * s.cfg.max_elems);
-                const bool bf16_row = fr_bf16_wire(s.cfg.size) && !exact_row;
+                const bool bf16_row = !exact_row;
                 sge.length = (uint32_t) ((size_t) n * (bf16_row ? 2u : sizeof(float)));
                 sge.lkey = s.mr_data->lkey;
 
@@ -779,11 +659,8 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
             // Nothing to carry across any more: the peer's own stream is
             // waiting on the word this rank's NIC wrote.
             if (next <= 3 || next % 4096 == 0) {
-                std::fprintf(stderr,
-                             "[fast-reduce] seq %llu delivered (%d floats), "
-                             "gpu timeouts up to seq %u\n",
-                             (unsigned long long) next, n,
-                             *(volatile uint32_t *) s.timed_out_host);
+                std::fprintf(stderr, "[fast-reduce] seq %llu delivered (%d floats)\n",
+                             (unsigned long long) next, n);
             }
             ++next;
         }
@@ -804,123 +681,31 @@ bool FastReduce::submit(float * data, size_t n, void * stream, bool exact) {
     // any possible read. An exact row (f32 on a bf16 wire) is stored negated.
     s.pending_n[(size_t) (seq % (uint64_t) FastReduceImpl::kPendingRing)] = exact ? -(int) n : (int) n;
 
-    const int n_peers = s.cfg.size - 1;
+    // The wait is a stream operation, not a kernel spin. On gfx1151 a kernel
+    // spinning on a flag the host raised needs a system-scope acquire, which
+    // invalidates the L2 the next layer is about to read; hipStreamWaitValue32
+    // is handled by the command processor, outside the shader caches.
+    //
+    // No slot-reuse wait is needed: the ranks advance in lockstep (a rank
+    // publishes reduction q only after it added the peer's row of q - 1), so a
+    // slot comes round again only after both ranks consumed it `slots`
+    // reductions earlier, and the stream orders this GPU's writes behind its
+    // reads.
+    //
+    // Pack straight into the pinned row the NIC sends from (the kernel raises
+    // the flag), wait for the peer's row, add it straight out of pinned memory.
     auto stm = (hipStream_t) stream;
-
-    // Loads, not cycles: roughly 100 ms of system-scope reads. What it waits
-    // on takes about fourteen microseconds, so this only fires when something
-    // is wrong -- and when it does it has to fire, not spin forever.
-    constexpr uint64_t kSpin = 200000ull;
-
-    // Publish and wait are stream operations, not kernels.
-    //
-    // A kernel cannot do this cheaply on gfx1151. Raising a flag the host will
-    // see needs a system-scope release, which writes the L2 back; spinning on
-    // one the host raised needs a system-scope acquire, which invalidates it.
-    // Either way the weights the next layer is about to read are gone.
-    // Weakening the ordering does not help: relaxed is cheap and the host then
-    // does not see the flag at all.
-    //
-    // hipStreamWriteValue32 and hipStreamWaitValue32 are handled by the
-    // command processor instead, so the shader cores and their caches are not
-    // involved at all -- which is what this needs and what a kernel cannot be.
-    // LUCE_CLUSTER_FAST_REDUCE_KERNEL_FLAGS=1 restores the kernel form for
-    // comparison.
-    static const bool kernel_flags = fr_env_on("LUCE_CLUSTER_FAST_REDUCE_KERNEL_FLAGS");
-
-    // Do not write into a slot the progress thread has not finished with. The
-    // kernel form waited on this; the stream form has to as well, or the GPU --
-    // which runs a whole step's reductions ahead of the host -- laps the ring
-    // and overwrites a payload that has not been sent. That is what made the
-    // third request of a run stop rather than the first.
-    // The previous user of this slot was seq - slots, and it leaves exactly that
-    // value behind. Asking for anything higher is a wait nothing can satisfy.
-    if (!kernel_flags && !fast_reduce_lean() && seq > (uint64_t) s.cfg.slots) {
-        const uint32_t need = (uint32_t) (seq - (uint64_t) s.cfg.slots);
-        if (hipStreamWaitValue32(stm, s.flag_dev + s.done_off(slot), need,
-                                 hipStreamWaitValueGte, 0xffffffffu) != hipSuccess) {
-            return false;
-        }
-    }
-
-    // Zero-copy (discrete GPU): pack straight into the pinned row, publish, wait
-    // for the peer, add its row straight out of pinned memory, mark the slot done.
-    const int wire_bf16 = !exact && fr_bf16_wire(s.cfg.size) ? 1 : 0;
-    if (fr_zero_copy(s.cfg.size)) {
-        float * own_row = s.data_dev + (size_t) slot * s.slot_stride() + (size_t) s.cfg.rank * s.cfg.max_elems;
-        const int peer = 1 - s.cfg.rank;
-        const float * peer_row = s.data_dev + (size_t) slot * s.slot_stride() + (size_t) peer * s.cfg.max_elems;
-        if (fast_reduce_kpub()) {
-            uint32_t * ctr = s.pub_counter(stm, slot, 0);
-            if (!ctr) return false;
-            fast_reduce_launch_pack_pub(data, own_row, (int) n, wire_bf16,
-                                        s.flag_dev + s.pub_off(slot), (uint32_t) seq, ctr, stm);
-        } else {
-            fast_reduce_launch_pack(data, own_row, (int) n, wire_bf16, stm);
-            if (hipStreamWriteValue32(stm, s.flag_dev + s.pub_off(slot), (uint32_t) seq, 0) != hipSuccess) return false;
-        }
-        if (hipStreamWaitValue32(stm, s.flag_dev + s.visible_off(slot, peer), (uint32_t) seq,
-                                 hipStreamWaitValueEq, 0xffffffffu) != hipSuccess) return false;
-        fast_reduce_launch_add_zc(data, peer_row, (int) n, wire_bf16, stm);
-        if (fast_reduce_lean()) return true;
-        return hipStreamWriteValue32(stm, s.flag_dev + s.done_off(slot), (uint32_t) seq, 0) == hipSuccess;
-    }
-
-    // Publish: the copy engine moves the partial into the pinned staging
-    // buffer, then the flag is written. Both are on the stream, so the flag
-    // cannot precede the data it announces.
-    if (hipMemcpyAsync(s.data_host + (size_t) slot * s.slot_stride() +
-                           (size_t) s.cfg.rank * s.cfg.max_elems,
-                       data, n * sizeof(float), hipMemcpyDefault, stm) != hipSuccess) {
-        return false;
-    }
-    if (kernel_flags) {
-        fast_reduce_launch_set_flag(s.flag_dev + s.pub_off(slot),
-                                    s.flag_dev + s.done_off(slot),
-                                    s.progress_dev, (uint32_t) seq,
-                                    (uint32_t) (s.cfg.slots - 2), kSpin, stm);
-    } else if (hipStreamWriteValue32(stm, s.flag_dev + s.pub_off(slot),
-                                     (uint32_t) seq, 0) != hipSuccess) {
-        return false;
-    }
-
-    // Wait for the peers, then bring their partials into device memory before
-    // touching them: the staging buffers are uncached for the GPU.
-    if (kernel_flags) {
-        fast_reduce_launch_wait_flags(s.peer_flags_dev + (size_t) slot * (size_t) n_peers,
-                                      s.timed_out_dev, s.progress_dev,
-                                      (uint32_t) seq, n_peers, kSpin, stm);
-    } else {
-        for (int r = 0; r < s.cfg.size; ++r) {
-            if (r == s.cfg.rank) continue;
-            if (hipStreamWaitValue32(stm, s.flag_dev + s.visible_off(slot, r),
-                                     (uint32_t) seq, hipStreamWaitValueEq,
-                                     0xffffffffu) != hipSuccess) {
-                return false;
-            }
-        }
-    }
-    float * scratch_row = s.scratch +
-        ((size_t) slot * (size_t) n_peers) * (size_t) s.cfg.max_elems;
-    int k = 0;
-    for (int r = 0; r < s.cfg.size; ++r) {
-        if (r == s.cfg.rank) continue;
-        if (hipMemcpyAsync(scratch_row + (size_t) k * (size_t) s.cfg.max_elems,
-                           s.data_host + (size_t) slot * s.slot_stride() +
-                               (size_t) r * s.cfg.max_elems,
-                           n * sizeof(float), hipMemcpyDefault, stm) != hipSuccess) {
-            return false;
-        }
-        ++k;
-    }
-    fast_reduce_launch_add(data, scratch_row, n_peers, (int) n, s.cfg.max_elems,
-                           !kernel_flags ? nullptr : s.flag_dev + s.done_off(slot),
-                           s.progress_dev, (uint32_t) seq, stm);
-    if (!kernel_flags && !fast_reduce_lean() &&
-        hipStreamWriteValue32(stm, s.flag_dev + s.done_off(slot),
-                              (uint32_t) seq, 0) != hipSuccess) {
-        return false;
-    }
+    const int wire_bf16 = exact ? 0 : 1;
+    const int peer = 1 - s.cfg.rank;
+    float * own_row = s.data_dev + (size_t) slot * s.slot_stride() + (size_t) s.cfg.rank * s.cfg.max_elems;
+    const float * peer_row = s.data_dev + (size_t) slot * s.slot_stride() + (size_t) peer * s.cfg.max_elems;
+    uint32_t * ctr = s.pub_counter(stm, slot, 0);
+    if (!ctr) return false;
+    fast_reduce_launch_pack(data, own_row, (int) n, wire_bf16,
+                            s.flag_dev + s.pub_off(slot), (uint32_t) seq, ctr, stm);
+    if (hipStreamWaitValue32(stm, s.flag_dev + s.visible_off(slot, peer), (uint32_t) seq,
+                             hipStreamWaitValueEq, 0xffffffffu) != hipSuccess) return false;
+    fast_reduce_launch_add(data, peer_row, (int) n, wire_bf16, stm);
     return true;
 }
 
@@ -939,31 +724,17 @@ static uint64_t hyb_seq_for(FastReduceImpl & s, uint64_t k, size_t n) {
     return seq;
 }
 
-bool FastReduce::hyb_export(const float * data, size_t n, void * stream, int part, uint64_t k) {
+bool FastReduce::hyb_export(const float * data, size_t n, void * stream, uint64_t k) {
     auto & s = *p_;
     if (s.failed.load(std::memory_order_relaxed)) return true;
-    if (!s.hyb_host || n == 0 || n > (size_t) s.hyb_elems || part < 0 || part > 1) return false;
+    if (!s.hyb_host || n == 0 || n > (size_t) s.hyb_elems) return false;
     const uint64_t seq = hyb_seq_for(s, k, n);
     const int slot = (int) (seq % (uint64_t) s.cfg.slots);
     auto stm = (hipStream_t) stream;
-    if (part == 0 && !fast_reduce_lean() && seq > (uint64_t) s.cfg.slots) {
-        const uint32_t need = (uint32_t) (seq - (uint64_t) s.cfg.slots);
-        if (hipStreamWaitValue32(stm, s.flag_dev + s.done_off(slot), need,
-                                 hipStreamWaitValueGte, 0xffffffffu) != hipSuccess) return false;
-    }
-    static const bool one_export = fr_env_on("LUCE_CLUSTER_HYBRID_ONE_EXPORT");
-    const bool last_part = part == 1 || one_export;
-    if (last_part && fast_reduce_kpub()) {
-        uint32_t * ctr = s.pub_counter(stm, slot, 1);
-        if (!ctr) return false;
-        fast_reduce_launch_pack_pub(data, s.hyb_part(part, slot), (int) n, 0,
-                                    s.flag_dev + s.hybh_off(slot), (uint32_t) seq, ctr, stm);
-        return true;
-    }
-    fast_reduce_launch_pack(data, s.hyb_part(part, slot), (int) n, 0, stm);
-    if (last_part) {
-        return hipStreamWriteValue32(stm, s.flag_dev + s.hybh_off(slot), (uint32_t) seq, 0) == hipSuccess;
-    }
+    uint32_t * ctr = s.pub_counter(stm, slot, 1);
+    if (!ctr) return false;
+    fast_reduce_launch_pack(data, s.hyb_part(0, slot), (int) n, 0,
+                            s.flag_dev + s.hybh_off(slot), (uint32_t) seq, ctr, stm);
     return true;
 }
 
@@ -971,7 +742,6 @@ bool FastReduce::hyb_combine(const float * data, size_t n, void * stream, uint64
     auto & s = *p_;
     if (s.failed.load(std::memory_order_relaxed)) return true;
     if (!s.hyb_host || n == 0 || n > (size_t) s.hyb_elems) return false;
-    const int wire_bf16 = fr_bf16_wire(s.cfg.size) ? 1 : 0;
     const uint64_t seq = hyb_seq_for(s, k, n);
     const int slot = (int) (seq % (uint64_t) s.cfg.slots);
     const int peer = 1 - s.cfg.rank;
@@ -980,26 +750,16 @@ bool FastReduce::hyb_combine(const float * data, size_t n, void * stream, uint64
     auto stm = (hipStream_t) stream;
     if (hipStreamWaitValue32(stm, s.flag_dev + s.hybh_off(slot), (uint32_t) seq,
                              hipStreamWaitValueEq, 0xffffffffu) != hipSuccess) return false;
-    static const bool one_export = fr_env_on("LUCE_CLUSTER_HYBRID_ONE_EXPORT");
-    if (fast_reduce_kpub()) {
-        uint32_t * ctr_pub = s.pub_counter(stm, slot, 2);
-        uint32_t * ctr_fin = s.pub_counter(stm, slot, 3);
-        if (!ctr_pub || !ctr_fin) return false;
-        fast_reduce_launch_hyb_combine_pub(data, s.hyb_part(0, slot), one_export ? nullptr : s.hyb_part(1, slot),
-                                           own_row, (int) n, wire_bf16,
-                                           s.flag_dev + s.pub_off(slot), (uint32_t) seq, ctr_pub, stm);
-        if (hipStreamWaitValue32(stm, s.flag_dev + s.visible_off(slot, peer), (uint32_t) seq,
-                                 hipStreamWaitValueEq, 0xffffffffu) != hipSuccess) return false;
-        fast_reduce_launch_hyb_final_pub(own_row, peer_row, s.hyb_part(2, slot), (int) n, wire_bf16,
-                                         s.flag_dev + s.hybf_off(slot), (uint32_t) seq, ctr_fin, stm);
-        return true;
-    }
-    fast_reduce_launch_hyb_combine(data, s.hyb_part(0, slot), one_export ? nullptr : s.hyb_part(1, slot), own_row, (int) n, wire_bf16, stm);
-    if (hipStreamWriteValue32(stm, s.flag_dev + s.pub_off(slot), (uint32_t) seq, 0) != hipSuccess) return false;
+    uint32_t * ctr_pub = s.pub_counter(stm, slot, 2);
+    uint32_t * ctr_fin = s.pub_counter(stm, slot, 3);
+    if (!ctr_pub || !ctr_fin) return false;
+    fast_reduce_launch_hyb_combine(data, s.hyb_part(0, slot), own_row, (int) n,
+                                   s.flag_dev + s.pub_off(slot), (uint32_t) seq, ctr_pub, stm);
     if (hipStreamWaitValue32(stm, s.flag_dev + s.visible_off(slot, peer), (uint32_t) seq,
                              hipStreamWaitValueEq, 0xffffffffu) != hipSuccess) return false;
-    fast_reduce_launch_hyb_final(own_row, peer_row, s.hyb_part(2, slot), (int) n, wire_bf16, stm);
-    return hipStreamWriteValue32(stm, s.flag_dev + s.hybf_off(slot), (uint32_t) seq, 0) == hipSuccess;
+    fast_reduce_launch_hyb_final(own_row, peer_row, s.hyb_part(1, slot), (int) n,
+                                 s.flag_dev + s.hybf_off(slot), (uint32_t) seq, ctr_fin, stm);
+    return true;
 }
 
 bool FastReduce::hyb_import(float * data, size_t n, void * stream, uint64_t k) {
@@ -1011,14 +771,7 @@ bool FastReduce::hyb_import(float * data, size_t n, void * stream, uint64_t k) {
     auto stm = (hipStream_t) stream;
     if (hipStreamWaitValue32(stm, s.flag_dev + s.hybf_off(slot), (uint32_t) seq,
                              hipStreamWaitValueEq, 0xffffffffu) != hipSuccess) return false;
-    static const bool import_dma = !fr_env_on("LUCE_CLUSTER_HYBRID_IMPORT_KERNEL");
-    if (import_dma) {
-        if (hipMemcpyAsync(data, s.hyb_part(2, slot), n * sizeof(float), hipMemcpyHostToDevice, stm) != hipSuccess) return false;
-    } else {
-        fast_reduce_launch_pack(s.hyb_part(2, slot), data, (int) n, 0, stm);
-    }
-    if (fast_reduce_lean()) return true;
-    return hipStreamWriteValue32(stm, s.flag_dev + s.done_off(slot), (uint32_t) seq, 0) == hipSuccess;
+    return hipMemcpyAsync(data, s.hyb_part(1, slot), n * sizeof(float), hipMemcpyHostToDevice, stm) == hipSuccess;
 }
 
 bool FastReduce::submit_from_root(float * data, size_t n, void * stream, int root, bool exact) {
@@ -1054,12 +807,8 @@ void FastReduce::shutdown() {
         }
     }
     s.pub_counters.clear();
-    if (s.peer_flags) { (void) hipHostFree(s.peer_flags); s.peer_flags = nullptr; }
-    if (s.scratch) { (void) hipFree(s.scratch); s.scratch = nullptr; }
     if (s.data_host) { (void) hipHostFree(s.data_host); s.data_host = nullptr; }
     if (s.flag_host) { (void) hipHostFree(s.flag_host); s.flag_host = nullptr; }
-    if (s.timed_out_host) { (void) hipHostFree(s.timed_out_host); s.timed_out_host = nullptr; }
-    if (s.progress_host) { (void) hipHostFree(s.progress_host); s.progress_host = nullptr; }
     if (s.hyb_host) { (void) hipHostFree(s.hyb_host); s.hyb_host = nullptr; }
 }
 
@@ -1084,11 +833,9 @@ bool FastReduce::ok() const { return false; }
 bool FastReduce::submit(float *, size_t, void *, bool) { return false; }
 bool FastReduce::submit_from_root(float *, size_t, void *, int, bool) { return false; }
 bool FastReduce::hyb_available() const { return false; }
-bool FastReduce::hyb_export(const float *, size_t, void *, int, uint64_t) { return false; }
+bool FastReduce::hyb_export(const float *, size_t, void *, uint64_t) { return false; }
 bool FastReduce::hyb_combine(const float *, size_t, void *, uint64_t) { return false; }
 bool FastReduce::hyb_import(float *, size_t, void *, uint64_t) { return false; }
-uint64_t FastReduce::submitted() const { return 0; }
-uint64_t FastReduce::timed_out() const { return 0; }
 
 }  // namespace luce::cluster
 

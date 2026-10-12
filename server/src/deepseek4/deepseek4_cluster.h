@@ -66,7 +66,7 @@ struct Ds4ClusterRuntime {
     // assume every rank runs every exchange for the life of the process: a
     // step that fails on one rank leaves its peer waiting, and the stall
     // watchdog then ends both ranks.
-    uint64_t hyb_export0 = 0, hyb_export1 = 0, hyb_combine = 0, hyb_import = 0;
+    uint64_t hyb_export = 0, hyb_combine = 0, hyb_import = 0;
     cluster::ClusterExpertPlacement placement;
     // Rank-local hot set (owned + replicated experts) for the hybrid storage.
     MoeHybridPlacement rank_placement;
@@ -190,8 +190,7 @@ ggml_tensor * ds4_cluster_hybrid_exchange_nodes(ggml_context * ctx,
                                                 ggml_tensor * cold,
                                                 Ds4ClusterRuntime & rt,
                                                 ggml_tensor ** combine_node,
-                                                ggml_tensor ** export_hot_node,
-                                                ggml_tensor ** export_shared_node);
+                                                ggml_tensor ** export_node);
 
 // LUCE_CLUSTER_ATTENTION_PARALLEL: split the attention heads across the ranks
 // (on in cluster mode; =0 keeps attention replicated). Cached after the first

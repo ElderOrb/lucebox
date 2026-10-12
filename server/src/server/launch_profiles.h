@@ -258,12 +258,8 @@ inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
         // wire, no slot-reuse waits; the hybrid exchange reduces the iGPU's
         // cold partial with the R9700's hot + shared partial in one export.
         {"LUCE_CLUSTER_FAST_REDUCE", "1"},
-        {"LUCE_CLUSTER_FAST_REDUCE_ZC", "1"},
-        {"LUCE_CLUSTER_FAST_REDUCE_BF16", "1"},
-        {"LUCE_CLUSTER_FAST_REDUCE_LEAN", "1"},
         {"LUCE_CLUSTER_FAST_REDUCE_STALL_S", "15"},
         {"LUCE_CLUSTER_HYBRID_EXCHANGE", "1"},
-        {"LUCE_CLUSTER_HYBRID_ONE_EXPORT", "1"},
         // Prefill-sized reductions stay on RCCL: 8-bit blocks, or bf16 with
         // LUCE_CLUSTER_PREFILL_Q8=0.
         {"LUCE_CLUSTER_PREFILL_Q8", "1"},

@@ -1638,19 +1638,16 @@ static bool ds4_build_fused_verify_graph(
                     // imports the sum (no device join, one link crossing
                     // each way on the dGPU).
                     ggml_tensor * combine = nullptr;
-                    ggml_tensor * export_hot = nullptr;
-                    ggml_tensor * export_shared = nullptr;
+                    ggml_tensor * exported = nullptr;
                     ggml_tensor * sum = ds4_cluster_hybrid_exchange_nodes(
                         ctx, hyb_ex_inputs->main_output, shared, hyb_ex_inputs->peer_raw,
-                        *cluster_rt, &combine, &export_hot, &export_shared);
+                        *cluster_rt, &combine, &exported);
                     if (!sum) return false;
-                    ggml_build_forward_expand(gf, export_hot);
-                    ggml_build_forward_expand(gf, export_shared);
-                    cluster_nodes.push_back(export_shared);
+                    ggml_build_forward_expand(gf, exported);
+                    cluster_nodes.push_back(exported);
                     ggml_set_output(combine);
                     ggml_build_forward_expand(gf, combine);
                     hyb_ex_inputs->cold_nodes.push_back(combine);
-                    cluster_nodes.push_back(export_hot);
                     // An upcoming Engram layer's projection chunk, in the wait
                     // for the iGPU's sum (ahead of the import in the stream).
                     int engram_e = -1;
