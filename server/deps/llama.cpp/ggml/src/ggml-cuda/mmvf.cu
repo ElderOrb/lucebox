@@ -677,13 +677,13 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
-// Skinny-K single-column F16 matvec (K = 64/128/256 over many rows). The
-// generic kernel gives every row its own block, so a K=256 row is a single
-// 512-byte trip and the launch is bound by block scheduling (~360 GB/s on
-// gfx1201 for the DSpark Markov head, vocab 129280 x rank 256). Here every lane
-// loads 16 bytes, K/8 lanes share a row and one wave covers several rows, which
-// streams the matrix at ~540 GB/s. Sums accumulate in F32, so values can differ
-// from the generic F16-accumulating path in the last bits.
+// Skinny-K single-column F16 matvec (K = 64/128/256 over many rows, such as
+// the DSpark Markov head). The generic kernel gives every row its own block,
+// so a short row is a single trip and the launch is bound by block
+// scheduling. Here every lane loads 16 bytes, K/8 lanes share a row and one
+// wave covers several rows. Sums accumulate in F32, so values can differ from
+// the generic F16-accumulating path in the last bits; it runs on RDNA4 only,
+// the GPU it was tuned on, and every other device keeps the generic kernel.
 template <int K>
 static __global__ void __launch_bounds__(256) mul_mat_vec_f16_skinny(
         const half * __restrict__ x, const float * __restrict__ y, const float * __restrict__ x_bias,
@@ -726,18 +726,12 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_f16_skinny(
     }
 }
 
-static bool mmvf_skinny_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("LUCE_CUDA_MMVF_SKINNY");
-        return !(value && value[0] == '0');
-    }();
-    return enabled;
-}
-
 // Returns true when the skinny kernel handled the product.
 static bool mul_mat_vec_f16_skinny_try(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
                                        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion, cudaStream_t stream) {
-    if (src0->type != GGML_TYPE_F16 || ids || !mmvf_skinny_enabled()) {
+#if defined(GGML_USE_HIP)
+    const int device = ggml_cuda_get_device();
+    if (src0->type != GGML_TYPE_F16 || ids || !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) {
         return false;
     }
     if (fusion && (fusion->gate || fusion->gate_bias)) {
@@ -758,7 +752,6 @@ static bool mul_mat_vec_f16_skinny_try(const ggml_tensor * src0, const ggml_tens
     }
     const float * x_bias = fusion && fusion->x_bias ? (const float *) fusion->x_bias->data : nullptr;
 
-    const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     const int64_t rows_per_block = (256 / warp_size) * (warp_size / (K / 8));
     const int64_t nblocks = std::min<int64_t>((nrows + rows_per_block - 1) / rows_per_block, 4096);
@@ -773,6 +766,10 @@ static bool mul_mat_vec_f16_skinny_try(const ggml_tensor * src0, const ggml_tens
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
+#else
+    GGML_UNUSED_VARS(src0, src1, ids, dst, fusion, stream);
+    return false;
+#endif // defined(GGML_USE_HIP)
 }
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
