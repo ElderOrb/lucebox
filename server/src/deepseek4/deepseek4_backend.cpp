@@ -3634,11 +3634,9 @@ bool DeepSeek4Backend::init_hybrid_model() {
     TargetLoadPlan plan;
     plan.skip_expert_tensors = true;
     plan.load_ds4_image_bias = !cfg_.mmproj_path.empty();
-    // LUCE_CLUSTER_SLICE_WEIGHTS=1: a cluster rank loads only the dense
-    // slices its head split and shared-expert shard read (about 3.3 GB less
-    // on the primary GPU for DS4.1 on two ranks, for more hot experts).
-    if (cluster_ && cluster_->cfg && cluster_->cfg->size > 1 &&
-        env_flag_enabled("LUCE_CLUSTER_SLICE_WEIGHTS")) {
+    // A cluster rank loads only the dense slices its head split and
+    // shared-expert shard read, which leaves room for more hot experts.
+    if (cluster_ && cluster_->cfg && cluster_->cfg->size > 1) {
         plan.slice_rank = cluster_->cfg->rank;
         plan.slice_ranks = cluster_->cfg->size;
         plan.slice_attention = ds4_cluster_attention_parallel_enabled();

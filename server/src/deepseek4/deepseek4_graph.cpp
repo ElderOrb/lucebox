@@ -2257,8 +2257,8 @@ static DeepSeek4PreparedProjectedLane build_mla_qkv_projection(
     // contiguous and a codebook registry keyed by pointer still resolves it.
     const int n_head = head_count > 0 ? head_count : w.n_head;
     if (head_count == 0 && w.cluster_heads_local > 0) {
-        GGML_ABORT("deepseek4: this rank holds only its attention heads "
-                   "(LUCE_CLUSTER_SLICE_WEIGHTS) but a graph attends with all of them");
+        GGML_ABORT("deepseek4: this cluster rank holds only its attention heads "
+                   "but a graph attends with all of them");
     }
     ggml_tensor * q_b_w = head_count > 0
         ? ggml_view_2d(ctx, L.attn_q_b, L.attn_q_b->ne[0], (int64_t) n_head * w.head_dim,
@@ -2414,19 +2414,6 @@ static bool ds4_segmented_kv_enabled(const DeepSeek4Weights & w) {
 // one op chain per lane plus the concatenation of their contexts.
 static bool ds4_lane_batch_enabled() {
     static const bool enabled = ds4_env_flag("LUCE_DS4_LANE_BATCH");
-    return enabled;
-}
-
-// A lane batch runs a ratio-1 kv source's compressor for every lane in one
-// width-q pass (LUCE_DS4_LANE_BATCH_COMP=0 keeps one pass per lane). Ratio 1
-// keeps no state: each lane's latent and index key are per-column products,
-// and the MMVF block size does not depend on the column count on RDNA4, so
-// the batched pass writes the rows the lanes would have written.
-static bool ds4_lane_batch_comp_enabled() {
-    static const bool enabled = [] {
-        const char * v = std::getenv("LUCE_DS4_LANE_BATCH_COMP");
-        return !v || std::strcmp(v, "0") != 0;
-    }();
     return enabled;
 }
 
@@ -4709,17 +4696,18 @@ static ggml_tensor * build_shared_ffn(
     return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
 }
 
-// Cluster shared-expert sharding (maikzz32/lucebox-halo-cluster): build only
-// the intermediate range [ff_begin, ff_begin + ff_count) of the shared
-// expert. The result is a PARTIAL SUM of the shared expert over that range,
-// because the down projection contracts over the intermediate axis - so the
-// caller must add it to the routed partial BEFORE the all-reduce, and the
-// reduction then sums both contributions in one message.
+// Cluster shared-expert sharding: build only the intermediate range
+// [ff_begin, ff_begin + ff_count) of the shared expert. The result is a
+// partial sum of the shared expert over that range, because the down
+// projection contracts over the intermediate axis, so the caller adds it to
+// the routed partial before the all-reduce and the reduction sums both in one
+// message.
 //
-// gate and up are sliced by output row, which is a contiguous view. `down`
-// contracts over the intermediate axis, so slicing it would need a strided
-// view of every row; instead the local intermediate is zero-padded back to
-// full width and the full `down` is applied. The zeros contribute nothing.
+// gate and up are sliced by output row, a contiguous view. When the range
+// falls on whole quant blocks of `down`, `down` is taken as a column view (row
+// stride unchanged) so only the slice's weights are read. Otherwise (the
+// drafter's shared expert) the intermediate is zero-padded back to full width
+// and the whole `down` is applied; the zeros contribute nothing.
 static ggml_tensor * build_shared_ffn_slice(
         ggml_context * ctx,
         ggml_tensor * cur,
@@ -4741,19 +4729,16 @@ static ggml_tensor * build_shared_ffn_slice(
     ggml_tensor * gate_sh = ggml_mul_mat(ctx, row_slice(L.ffn_gate_shexp), cur);
     ggml_tensor * up_sh   = ggml_mul_mat(ctx, row_slice(L.ffn_up_shexp), cur);
     ggml_tensor * mid_sh  = build_clamped_swiglu(ctx, gate_sh, up_sh, w.swiglu_clamp_exp);
-    // LUCE_DS4_SHEXP_SLICE_VIEW=1: contract over this rank's slice only,
-    // through a column view of down (row stride unchanged): half the down
-    // weights read and no zero padding. Bit-identical to the padded product
-    // on the RDNA4 Q8_0 matvec, which gives the slice's blocks the lanes they
-    // take in the whole rows (ggml_backend_cuda_mul_mat_whole_row_lanes);
-    // other kernels sum the slice in their own order.
-    static const bool slice_view = [] {
-        const char * v = std::getenv("LUCE_DS4_SHEXP_SLICE_VIEW");
-        return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    if (slice_view && (int64_t) ff_count != n_ff &&
-        ff_begin % ggml_blck_size(L.ffn_down_shexp->type) == 0 &&
-        ff_count % ggml_blck_size(L.ffn_down_shexp->type) == 0) {
+    if ((int64_t) ff_count == n_ff) {
+        // The layer holds only this slice (a sliced load).
+        return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
+    }
+    const int64_t blck = ggml_blck_size(L.ffn_down_shexp->type);
+    if (ff_begin % blck == 0 && ff_count % blck == 0) {
+        // On the RDNA4 Q8_0 matvec the slice's blocks keep the lanes they take
+        // in the whole rows, so the product equals the whole rows times the
+        // intermediate zero-padded outside the slice; other kernels sum the
+        // slice in their own order.
         ggml_tensor * down = ggml_view_2d(ctx, L.ffn_down_shexp, ff_count, L.ffn_down_shexp->ne[1],
                                           L.ffn_down_shexp->nb[1],
                                           ggml_row_size(L.ffn_down_shexp->type, ff_begin));
@@ -4761,16 +4746,13 @@ static ggml_tensor * build_shared_ffn_slice(
         ggml_backend_cuda_mul_mat_whole_row_lanes(out);
         return out;
     }
-    if ((int64_t) ff_count != n_ff) {
-        ggml_tensor * zeros = ggml_scale(ctx, mid_sh, 0.0f);
-        ggml_tensor * padded = nullptr;
-        for (int64_t off = 0; off < n_ff; off += ff_count) {
-            ggml_tensor * piece = (off == (int64_t) ff_begin) ? mid_sh : zeros;
-            padded = padded ? ggml_concat(ctx, padded, piece, 0) : piece;
-        }
-        mid_sh = padded;
+    ggml_tensor * zeros = ggml_scale(ctx, mid_sh, 0.0f);
+    ggml_tensor * padded = nullptr;
+    for (int64_t off = 0; off < n_ff; off += ff_count) {
+        ggml_tensor * piece = (off == (int64_t) ff_begin) ? mid_sh : zeros;
+        padded = padded ? ggml_concat(ctx, padded, piece, 0) : piece;
     }
-    return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
+    return ggml_mul_mat(ctx, L.ffn_down_shexp, padded);
 }
 
 bool init_deepseek4_streamed_expert_cache(
@@ -6915,25 +6897,6 @@ private:
     size_t job_floats_ = 0;
 };
 
-// LUCE_DS4_ENGRAM_ASYNC=0 keeps the in-line verify Engram read.
-static bool ds4_engram_async_enabled() {
-    static const bool enabled = [] {
-        const char * v = std::getenv("LUCE_DS4_ENGRAM_ASYNC");
-        return !(v && v[0] == '0' && v[1] == '\0');
-    }();
-    return enabled;
-}
-
-// LUCE_DS4_PINNED_STEP_IO=0 keeps the blocking per-tensor verify uploads and
-// readbacks.
-static bool ds4_pinned_step_io_enabled() {
-    static const bool enabled = [] {
-        const char * v = std::getenv("LUCE_DS4_PINNED_STEP_IO");
-        return !(v && v[0] == '0' && v[1] == '\0');
-    }();
-    return enabled;
-}
-
 struct Ds4FusedVerifyCache {
     // Resident verifier shapes for the adaptive-width profile: four widths
     // (q2..q5) across the four ratio-4 phases plus the q5 two-boundary and
@@ -8111,8 +8074,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     // the reduction, which needs the normalized activation back on the host.
     // With the device join the reduction is a graph node in HC-post instead.
     const bool cluster_device_join =
-        cluster_rt && cluster_rt->size() > 1 && device_outputs && device_outputs->valid() &&
-        ds4_cluster_prefill_device_join_enabled();
+        cluster_rt && cluster_rt->size() > 1 && device_outputs && device_outputs->valid();
     const bool device_ffn_input =
         (!cluster_rt || cluster_device_join) && device_input_enabled && layer_storage.n_streamed == 0 &&
         !expert_compute && moe_expert_major_prefill_enabled(n_tokens) &&
@@ -12300,7 +12262,6 @@ bool deepseek4_step_layer_range(
                     !device_input_env || !*device_input_env ||
                     std::strcmp(device_input_env, "0") != 0;
                 const bool ffn_device_join_possible =
-                    (!cache.cluster_rt || ds4_cluster_prefill_device_join_enabled()) &&
                     device_input_enabled &&
                     moe_expert_major_prefill_enabled(n_tokens) &&
                     layer_storage.cold_backend_kind ==
@@ -13339,7 +13300,7 @@ static ggml_tensor * build_dspark_moe_split(ggml_context * ctx,
     ggml_tensor * routed = ggml_moe_combine_masked(ctx, down_e, routing.weights, expert_valid,
                                                    routing.selected);
     ggml_tensor * shared = build_shared_ffn_slice(ctx, cur, w, L, shexp_begin, shexp_count);
-    return ggml_add(ctx, routed, shared);
+    return shared ? ggml_add(ctx, routed, shared) : nullptr;
 }
 
 // Read a small F32 GPU tensor (HC scale, [k]) into host floats.
@@ -13360,9 +13321,8 @@ static void ds4_read_f32(ggml_tensor * t, float * dst, int k) {
 namespace {
 
 // Cache DSpark context KV projections across speculative steps. Only newly
-// committed target-feature columns are projected on the draft GPU; the final
-// normed+RoPE KV window is small enough (<1 MiB at n_swa=128) to retain in a
-// host-side ring and upload as one compact draft-graph input.
+// committed target-feature columns are projected on the draft GPU, into a
+// normed+RoPE KV window kept on that device.
 // One projection graph for a given count of new columns.
 struct DsparkContextKvGraph {
     int n_cols = -1;
@@ -13391,11 +13351,10 @@ struct DsparkContextKvProjector {
 
     int end_pos = -1;
     int valid = 0;
-    std::vector<float> host_kv;
-    std::vector<float> projected;
-    PinnedStage stage;   // inputs and the readback of one projection
+    std::vector<float> host_kv;   // the all-zero window before any context
+    PinnedStage stage;   // inputs of one projection
 
-    // The window stays on the draft device (LUCE_DS4_DRAFT_DEVICE_CONTEXT),
+    // The window stays on the draft device,
     // [head_dim, n_swa, n_layer] F32 with the valid rows end-aligned (the
     // layout the draft graph reads), double-buffered so each step's shift and
     // append is one batched copy from one buffer into the other.
@@ -13411,28 +13370,17 @@ struct DsparkContextKvProjector {
     }
 };
 
-// Default on; LUCE_DS4_DRAFT_DEVICE_CONTEXT=0 keeps the host-side window.
-static bool dspark_device_context_enabled() {
-    static const bool on = [] {
-        const char * v = std::getenv("LUCE_DS4_DRAFT_DEVICE_CONTEXT");
-        return !(v && v[0] == '0' && v[1] == '\0');
-    }();
-    return on;
-}
-
 thread_local DsparkContextKvProjector g_dspark_ctx_kv;
 
-// Projects n_cols new feature columns to the drafter's per-layer context K/V.
-// out != null: read the [head_dim, n_cols, n_layer] result back (one wait).
-// out == null: leave it on the device in *dev_out, queued on backend's stream.
+// Projects n_cols new feature columns to the drafter's per-layer context K/V,
+// [head_dim, n_cols, n_layer] in *dev_out, queued on backend's stream.
 static bool dspark_project_context_columns(
         ggml_backend_t backend,
         const DSparkDrafter & d,
         const float * features,
         int n_cols,
         int first_pos,
-        std::vector<float> * out,
-        ggml_tensor ** dev_out = nullptr) {
+        ggml_tensor ** dev_out) {
     if (!backend || !features || n_cols <= 0) return false;
     const DeepSeek4Weights & w = d.core;
     const int n_embd = w.n_embd;
@@ -13493,34 +13441,20 @@ static bool dspark_project_context_columns(
         G.n_cols = n_cols;
     }
 
-    // Inputs and the readback go through pinned slices: one wait in all.
+    // The inputs go through pinned slices; without the pinned block the stage
+    // falls back to blocking copies.
     const size_t in_bytes = sizeof(float) * (size_t) fc_in * n_cols;
-    const size_t out_bytes = sizeof(float) * (size_t) head_dim * n_cols * w.n_layer;
-    const bool pinned = ds4_pinned_step_io_enabled() &&
-        P.stage.reserve(backend, in_bytes + out_bytes + sizeof(int32_t) * (size_t) n_cols + 4096);
+    P.stage.reserve(backend, in_bytes + sizeof(int32_t) * (size_t) n_cols + 4096);
     P.stage.reset();
     std::vector<int32_t> pos((size_t) n_cols);
     for (int i = 0; i < n_cols; ++i) pos[(size_t) i] = first_pos + i;
-    if (pinned) {
-        P.stage.set(backend, G.inp_features, features, 0, in_bytes);
-        P.stage.set(backend, G.positions, pos.data(), 0, sizeof(int32_t) * pos.size());
-    } else {
-        ggml_backend_tensor_set(G.inp_features, features, 0, in_bytes);
-        ggml_backend_tensor_set(G.positions, pos.data(), 0, sizeof(int32_t) * pos.size());
-    }
+    P.stage.set(backend, G.inp_features, features, 0, in_bytes);
+    P.stage.set(backend, G.positions, pos.data(), 0, sizeof(int32_t) * pos.size());
     if (ggml_backend_graph_compute_async(backend, G.gf) != GGML_STATUS_SUCCESS) {
         ggml_backend_synchronize(backend);
         return false;
     }
-    if (!out) {
-        if (dev_out) *dev_out = G.out;
-        return true;
-    }
-    out->resize((size_t) head_dim * n_cols * w.n_layer);
-    const void * src = pinned ? P.stage.get(backend, G.out, 0, out_bytes) : nullptr;
-    ggml_backend_synchronize(backend);
-    if (src) std::memcpy(out->data(), src, out_bytes);
-    else ggml_backend_tensor_get(G.out, out->data(), 0, out_bytes);
+    *dev_out = G.out;
     return true;
 }
 
@@ -13531,13 +13465,13 @@ static bool dspark_update_context_kv_cache(
         int ctx_len,
         int committed,
         const std::vector<float> ** out_host_kv,
-        ggml_tensor ** out_dev_kv = nullptr) {
+        ggml_tensor ** out_dev_kv) {
     const DeepSeek4Weights & w = d.core;
     const int n_swa = w.n_swa;
     const int head_dim = w.head_dim;
     const int fc_in = d.n_target_layers * w.n_embd;
     DsparkContextKvProjector & P = g_dspark_ctx_kv;
-    if (out_dev_kv && dspark_device_context_enabled() && ctx_len > 0) {
+    if (ctx_len > 0) {
         if (!ctx_features || ctx_len > n_swa) return false;
         // Two device windows, valid rows end-aligned. Zeroed when (re)made;
         // the valid span only grows until it fills, so the rows ahead of it
@@ -13574,7 +13508,7 @@ static bool dspark_update_context_kv_cache(
         const float * new_features = ctx_features + (size_t) (ctx_len - n_new) * fc_in;
         ggml_tensor * projected = nullptr;
         if (!dspark_project_context_columns(backend, d, new_features, n_new, first_new_pos,
-                                            nullptr, &projected) || !projected) {
+                                            &projected) || !projected) {
             return false;
         }
         const int keep = std::max(0, std::min(P.valid, n_swa - n_new));
@@ -13606,58 +13540,10 @@ static bool dspark_update_context_kv_cache(
         *out_host_kv = nullptr;
         return true;
     }
-    if (ctx_len <= 0) {
-        P.end_pos = committed;
-        P.valid = 0;
-        P.host_kv.assign((size_t) w.n_layer * n_swa * head_dim, 0.0f);
-        *out_host_kv = &P.host_kv;
-        return true;
-    }
-    if (!ctx_features || ctx_len > n_swa) return false;
-
-    int n_new = committed - P.end_pos;
-    const bool rebuild =
-        P.drafter != (const void *) &d || P.backend != backend ||
-        P.end_pos < 0 ||
-        n_new <= 0 || n_new > ctx_len ||
-        std::min(n_swa, P.valid + n_new) != ctx_len ||
-        P.host_kv.size() != (size_t) w.n_layer * n_swa * head_dim;
-    if (rebuild) {
-        P.host_kv.assign((size_t) w.n_layer * n_swa * head_dim, 0.0f);
-        P.valid = 0;
-        n_new = ctx_len;
-    }
-
-    const int first_new_pos = committed - n_new;
-    const float * new_features =
-        ctx_features + (size_t) (ctx_len - n_new) * fc_in;
-    if (!dspark_project_context_columns(
-            backend, d, new_features, n_new, first_new_pos, &P.projected)) {
-        return false;
-    }
-
-    const int keep = std::max(0, std::min(P.valid, n_swa - n_new));
-    const int drop = P.valid - keep;
-    for (int il = 0; il < w.n_layer; ++il) {
-        float * layer_cache = P.host_kv.data() +
-            (size_t) il * n_swa * head_dim;
-        if (keep > 0 && drop > 0) {
-            std::memmove(
-                layer_cache,
-                layer_cache + (size_t) drop * head_dim,
-                sizeof(float) * (size_t) keep * head_dim);
-        }
-        const float * layer_new = P.projected.data() +
-            (size_t) il * n_new * head_dim;
-        std::memcpy(
-            layer_cache + (size_t) keep * head_dim,
-            layer_new,
-            sizeof(float) * (size_t) n_new * head_dim);
-    }
-    P.valid = keep + n_new;
+    // No committed context yet: an all-zero window, which the mask hides.
     P.end_pos = committed;
-    P.drafter = (const void *) &d;
-    if (P.valid != ctx_len) return false;
+    P.valid = 0;
+    P.host_kv.assign((size_t) w.n_layer * n_swa * head_dim, 0.0f);
     *out_host_kv = &P.host_kv;
     return true;
 }
@@ -14013,8 +13899,7 @@ static bool deepseek4_dspark_draft_forward_impl(
     // ── Set inputs + compute (cached graph) ─────────────────────────────
     // Every upload and readback of the forward goes through pinned slices,
     // so it costs one wait instead of a round trip per tensor.
-    const bool pinned_io = ds4_pinned_step_io_enabled() &&
-        C.stage.reserve(backend,
+    const bool pinned_io = C.stage.reserve(backend,
             (C.inp_noise ? ggml_nbytes(C.inp_noise) : 0) +
             (C.inp_ctx ? ggml_nbytes(C.inp_ctx) : 0) +
             (C.inp_ctx_kv ? ggml_nbytes(C.inp_ctx_kv) : 0) +
@@ -14023,9 +13908,9 @@ static bool deepseek4_dspark_draft_forward_impl(
             (C.expert_lut ? ggml_nbytes(C.expert_lut) + ggml_nbytes(C.expert_valid) : 0) +
             2 * (C.out ? ggml_nbytes(C.out) : 0) + 8192);
     C.stage.reset();
+    // Without the pinned block the stage falls back to blocking copies.
     const auto set_in = [&](ggml_tensor * t, const void * data, size_t bytes) {
-        if (pinned_io) C.stage.set(backend, t, data, 0, bytes);
-        else ggml_backend_tensor_set(t, data, 0, bytes);
+        C.stage.set(backend, t, data, 0, bytes);
     };
     set_in(C.inp_noise, noise_embed, sizeof(float) * (size_t) n_embd * block);
     if (upload_context) {
@@ -14141,8 +14026,8 @@ static bool deepseek4_dspark_draft_forward_impl(
     const size_t hidden_bytes = sizeof(float) * (size_t) n_embd * block;
     out_hidden->resize((size_t) n_embd * block);
     if (confidence_hidden) confidence_hidden->resize((size_t) n_embd * block);
-    const void * hidden_src = pinned_io ? C.stage.get(backend, C.out, 0, hidden_bytes) : nullptr;
-    const void * conf_src = pinned_io && confidence_hidden
+    const void * hidden_src = C.stage.get(backend, C.out, 0, hidden_bytes);
+    const void * conf_src = confidence_hidden
         ? C.stage.get(backend, C.confidence_out, 0, hidden_bytes) : nullptr;
     ggml_backend_synchronize(backend);
     if (hidden_src) std::memcpy(out_hidden->data(), hidden_src, hidden_bytes);

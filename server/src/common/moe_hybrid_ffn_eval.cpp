@@ -1067,21 +1067,11 @@ static bool moe_owner_takes_coarse_op(const MoeOwnerGraphSpec & owner, const Moe
     return split || fused;
 }
 
-// LUCE_MOE_MASKED_COMBINE=0 keeps the separate route-mask get_rows and mul,
-// the weighting mul and the route-sum repeat_back.
 // LUCE_MOE_Q8_HANDOFF=1: see build_moe_hybrid_ffn_graph.
 static bool moe_q8_handoff_enabled() {
     static const bool on = [] {
         const char * v = std::getenv("LUCE_MOE_Q8_HANDOFF");
         return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    return on;
-}
-
-static bool moe_masked_combine_enabled() {
-    static const bool on = [] {
-        const char * v = std::getenv("LUCE_MOE_MASKED_COMBINE");
-        return !(v && v[0] == '0' && v[1] == '\0');
     }();
     return on;
 }
@@ -1451,7 +1441,7 @@ bool build_moe_hybrid_ffn_graph(
     // The route mask rides in the owner's combine on the GPU owners (where
     // the fused combine is allowed) when the branch reduces its own routes.
     const auto mask_in_combine = [&](const MoeOwnerGraphSpec & owner) {
-        return moe_masked_combine_enabled() && allow_fused_combine &&
+        return allow_fused_combine &&
                !canonical_route_join && dynamic_main_slots_x4 == 0 &&
                !moe_owner_branch_tokenwise(owner, n_tokens) &&
                !moe_owner_takes_coarse_op(owner, desc);

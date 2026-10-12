@@ -1080,16 +1080,6 @@ bool run_deepseek4_dspark_spec_decode(
     const bool worker_skips_draft = cluster_spec && !cluster_spec_head && !draft_split &&
         spec_env_flag("LUCE_CLUSTER_WORKER_SKIP_DRAFT");
     const uint64_t cluster_req = cluster_hooks ? cluster_hooks->current_request() : 0;
-    // LUCE_CLUSTER_WORKER_KEEPALIVE=1: between its verify and the head's next
-    // draft a worker's GPU is idle for milliseconds, and its first launch after
-    // that started ~1 ms late (wake-up), which the head then waited for at the
-    // first exchange. One sleeping wave keeps it awake until the draft arrives.
-    const bool worker_keepalive = cluster_spec && !cluster_spec_head && !draft_split &&
-        spec_env_flag("LUCE_CLUSTER_WORKER_KEEPALIVE");
-    struct KeepaliveOff {
-        ggml_backend_t backend; bool on;
-        ~KeepaliveOff() { if (on) ggml_backend_cuda_keepalive(backend, false, 0); }
-    } keepalive_off{backend, worker_keepalive};
     // A cluster request that drafts carries no thinking budget (the head
     // decodes budgeted requests AR) and the head alone stops early (an empty
     // draft block tells the workers): every rank must keep the same tokens.
@@ -1579,11 +1569,6 @@ bool run_deepseek4_dspark_spec_decode(
         // (it then waits for the head's block below with its share already
         // queued) and on a head step that did not project (forced tokens).
         if (draft_vocab_split && !split_head_ran) {
-            // A worker's keepalive wave may share a hardware queue with the
-            // compute stream and would hold the head's graph until the wave's
-            // cap (~40 ms a step): stop it, queue the graph, then queue the
-            // wave behind it.
-            if (worker_keepalive) ggml_backend_cuda_keepalive(backend, false, 0);
             std::vector<int32_t> unused_tok;
             if (!run_split_head((cluster_spec_head || draft_split) ? padded_hidden.data() : nullptr,
                                 /*read=*/cluster_spec_head, unused_tok, nullptr, nullptr)) {
@@ -1591,7 +1576,6 @@ bool run_deepseek4_dspark_spec_decode(
                 ok = false;
                 break;
             }
-            if (worker_keepalive) ggml_backend_cuda_keepalive(backend, true, 40);
         }
         // Cluster lockstep: the head's draft block is authoritative. Every
         // rank drafts (the drafter forwards run concurrently on all ranks, so
@@ -1610,7 +1594,6 @@ bool run_deepseek4_dspark_spec_decode(
             std::string err;
             const bool got_draft =
                 cluster_hooks->decide_draft(cluster_req, (uint32_t) steps, pos, draft_tok, &err);
-            if (worker_keepalive) ggml_backend_cuda_keepalive(backend, false, 0);
             if (!got_draft) {
                 std::fprintf(stderr, "[ds4-spec] cluster draft missing: %s\n", err.c_str());
                 ok = false;
@@ -1694,7 +1677,6 @@ bool run_deepseek4_dspark_spec_decode(
         const bool verify_ok =
             target.verify_batch(draft_tok, pos, verify_last, &tgt_am);
         tm_verify += spec_ms_since(t0);
-        if (worker_keepalive) ggml_backend_cuda_keepalive(backend, true, 40);
         if (probe_inflight) {
             const SpecClock::time_point probe_t0 = SpecClock::now();
             deepseek4_dspark_draft_wait(drafter_backend);

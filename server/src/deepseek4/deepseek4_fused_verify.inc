@@ -593,7 +593,7 @@ static bool ds4_build_fused_verify_graph(
     ex.rawrows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.rawrows);
     ex.saved_rawrows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);
     ggml_set_input(ex.saved_rawrows);
-    if (ds4_lane_batch_comp_enabled() && !paged_mode && q > 1) {
+    if (!paged_mode && q > 1) {
         ex.pos_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q);
         ggml_set_input(ex.pos_rows);
     }
@@ -1096,13 +1096,8 @@ static bool ds4_build_fused_verify_graph(
         }
         // Past top_k compressed rows the lanes attend over V4.1's shared
         // top-k: the index source selects for all lanes in one chain and the
-        // layers after it reuse that selection (LUCE_DS4_LANE_BATCH_SELECT=0
-        // keeps one chain per lane and concatenates their selections).
-        static const bool lane_batch_select = [] {
-            const char * value = std::getenv("LUCE_DS4_LANE_BATCH_SELECT");
-            return !value || std::strcmp(value, "0") != 0;
-        }();
-        const bool external_selection = lane_batch && lane_batch_select &&
+        // layers after it reuse that selection.
+        const bool external_selection = lane_batch &&
             lane_batch_padded > w.n_indexer_top_k;
         std::vector<DeepSeek4LaneDeferral> deferrals(lane_batch ? (size_t) n_lanes : 0u);
         for (DeepSeek4LaneDeferral & deferral : deferrals) {
@@ -1121,7 +1116,7 @@ static bool ds4_build_fused_verify_graph(
         // state writes and pooling still run per lane, in lane order. F16
         // MMVF picks its block size from K alone at these shapes, so every
         // column is the product the lane would have computed.
-        if (lane_batch && ratio > 1 && ds4_lane_batch_comp_enabled() && attn_lane_q == 1 &&
+        if (lane_batch && ratio > 1 && attn_lane_q == 1 &&
             L.attn_compressor_kv && L.attn_compressor_gate &&
             L.attn_compressor_kv->type == GGML_TYPE_F16 &&
             L.attn_compressor_gate->type == GGML_TYPE_F16 &&
@@ -2275,7 +2270,7 @@ static int ds4_try_fused_verify_step(
     // With pinned step I/O the mask bundle and the readbacks go through pinned
     // slices (one wait for all of them, below) and the Engram rows are read on
     // a worker while the graph already runs.
-    const bool pinned_io = ds4_pinned_step_io_enabled() &&
+    const bool pinned_io =
         vc.stage.reserve(backend, ds4_fused_stage_bytes(w, *fg, *ex, q, hooks));
     vc.stage.reset();
     // The async read needs a place in the stream right before its consumer:
@@ -2286,8 +2281,7 @@ static int ds4_try_fused_verify_step(
     bool engram_async = false;
     if (ex->engram_keys) {
         const DeepSeek4EngramRuntime * engram = w.engram_runtime.get();
-        if (pinned_io && engram_rt && engram && token_ids && ds4_engram_async_enabled() &&
-            ex->engram_keys->buffer) {
+        if (pinned_io && engram_rt && engram && token_ids && ex->engram_keys->buffer) {
             if (!vc.engram_async) vc.engram_async = std::make_unique<Ds4EngramAsync>();
             engram_async = vc.engram_async->start(
                 backend, w, cache.engram_tokens, token_ids, kv_start, q,
@@ -2482,16 +2476,10 @@ static int ds4_try_fused_verify_step(
             for (const MaskRange & range : next_negative) {
                 std::fill(maskv.begin() + range.first,
                           maskv.begin() + range.second, -1.0e30f);
-                if (pinned_io) {
-                    vc.stage.set(backend, fg->mask_bundle, maskv.data() + range.first,
-                                 range.first * sizeof(float),
-                                 (range.second - range.first) * sizeof(float));
-                } else {
-                    ggml_backend_tensor_set(
-                        fg->mask_bundle, maskv.data() + range.first,
-                        range.first * sizeof(float),
-                        (range.second - range.first) * sizeof(float));
-                }
+                // Without the pinned block the stage falls back to blocking copies.
+                vc.stage.set(backend, fg->mask_bundle, maskv.data() + range.first,
+                             range.first * sizeof(float),
+                             (range.second - range.first) * sizeof(float));
             }
         }
     }
