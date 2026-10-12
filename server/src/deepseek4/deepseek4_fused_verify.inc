@@ -455,6 +455,9 @@ static bool ds4_build_fused_verify_graph(
         bool have_token_ids,
         const std::vector<int> & capture_ids,
         MoeHybridStorage * hybrid,
+        // Cluster greedy verify: the head covers this rank's vocabulary half
+        // and the ranks agree on the argmax (part of the slot's shape key).
+        bool vocab_split,
         std::vector<int64_t> && shape_key,
         DeepSeek4PagedCache * paged_cache = nullptr,
         const std::vector<std::vector<DeepSeek4GatheredLaneRows>> * paged_rows = nullptr,
@@ -520,7 +523,8 @@ static bool ds4_build_fused_verify_graph(
     }
     step_graph_free(fg.sg);
     fg.reset_nodes();
-    { const bool keep_vocab_split = ex.vocab_split; ex.reset(); ex.vocab_split = keep_vocab_split; }
+    ex.reset();
+    ex.vocab_split = vocab_split;
     fg.hash_ids.assign((size_t) w.n_layer, nullptr);
     ex.boundary_checkpoint.layers.resize((size_t) w.n_layer);
     if (hybrid) {
@@ -1741,6 +1745,12 @@ static bool ds4_build_fused_verify_graph(
         const int64_t half = ((V / 2) + 255) / 256 * 256;
         const int64_t r0 = rank == 0 ? 0 : half;
         const int64_t nr = rank == 0 ? half : V - half;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "[ds4-fused-verify] vocab split: rank %d takes the argmax over rows "
+                         "%lld..%lld of %lld\n", rank, (long long) r0, (long long) (r0 + nr), (long long) V);
+        }
         ggml_tensor * out_rows = ggml_view_2d(ctx, w.output, w.output->ne[0], nr, w.output->nb[1],
                                               (size_t) r0 * w.output->nb[1]);
         fg.logits = ds4_mul_mat_columns(ctx, out_rows, out_normed, projection_columns);   // [nr, q]
@@ -1752,9 +1762,9 @@ static bool ds4_build_fused_verify_graph(
         ggml_set_output(ex.argmax);
         ggml_build_forward_expand(gf, ex.argmax);
     } else {
-    fg.logits = ds4_mul_mat_columns(ctx, w.output, out_normed, projection_columns);   // [n_vocab, q]
-    ggml_set_output(fg.logits);
-    ggml_build_forward_expand(gf, fg.logits);
+        fg.logits = ds4_mul_mat_columns(ctx, w.output, out_normed, projection_columns);   // [n_vocab, q]
+        ggml_set_output(fg.logits);
+        ggml_build_forward_expand(gf, fg.logits);
     }
     if (!ex.vocab_split && (paged_mode || ds4_env_flag("LUCE_DS4_GPU_ARGMAX_VERIFY"))) {
         ex.argmax = ggml_argmax(ctx, fg.logits);
@@ -2187,13 +2197,6 @@ static int ds4_try_fused_verify_step(
     const bool vocab_split = vocab_split_env && hybrid && hooks->prefer_argmax_only && hooks->argmax_out &&
                              cache.cluster_rt && cache.cluster_rt->size() == 2;
     key.push_back(vocab_split ? 1 : 0);
-    static bool vocab_split_reported = false;
-    if (vocab_split_env && !vocab_split_reported) {
-        vocab_split_reported = true;
-        std::fprintf(stderr, "[ds4-fused-verify] vocab split %d (hybrid %d argmax_only %d argmax_out %d cluster %d)\n",
-                     vocab_split ? 1 : 0, hybrid ? 1 : 0, hooks->prefer_argmax_only ? 1 : 0,
-                     hooks->argmax_out ? 1 : 0, cache.cluster_rt ? cache.cluster_rt->size() : 0);
-    }
     const int n_lanes = ds4_fused_attention_lanes(w, q);
     const int attn_lane_q = q / n_lanes;
     for (int il = 0; il < w.n_layer; ++il) {
@@ -2252,13 +2255,12 @@ static int ds4_try_fused_verify_step(
         // that state is live can replay kernels against stale allocations.
         fg->destroy(vc.backend, vc.peer_backend);
         ex->reset();
-        ex->vocab_split = vocab_split;
 
         const auto build_t0 = Ds4TimingClock::now();
         if (!ds4_build_fused_verify_graph(mc, *fg, *ex, backend, w, &cache,
                                           hc_weights, hc_out_weights, hash_tables,
                                           kv_start, q, token_ids != nullptr,
-                                          *hooks->capture_layer_ids, hybrid,
+                                          *hooks->capture_layer_ids, hybrid, vocab_split,
                                           std::move(key))) {
             fg->destroy(vc.backend, vc.peer_backend);
             ex->reset();
@@ -2377,12 +2379,6 @@ static int ds4_try_fused_verify_step(
     }
     ds4_fv_set(fg->i64_bundle, i64v.data(), sizeof(int64_t) * i64v.size());
 
-    static const bool set_timing = std::getenv("LUCE_DS4_SET_TIMING") != nullptr;
-    static double st_inputs = 0, st_mask = 0, st_hash = 0, st_sync = 0; static int st_n = 0;
-    auto st_now = [] { return std::chrono::steady_clock::now(); };
-    auto st_us = [](auto a, auto b) { return std::chrono::duration<double, std::micro>(b - a).count(); };
-    const auto st_t1 = st_now();
-    st_inputs += st_us(set_t0, st_t1);
     // Causal mask values.  At long context this tensor is multi-megabyte,
     // while only the ring slots overwritten by this q-wide batch and the
     // padded compressed tail change between verifier steps.  Build those
@@ -2500,8 +2496,6 @@ static int ds4_try_fused_verify_step(
         }
     }
 
-    const auto st_t2 = st_now();
-    st_mask += st_us(st_t1, st_t2);
     if (token_ids) {
         for (int il = 0; il < w.n_layer; ++il) {
             ggml_tensor * hids = fg->hash_ids[(size_t) il];
@@ -2529,14 +2523,7 @@ static int ds4_try_fused_verify_step(
     // the peer device with a blocking copy that is not ordered behind this
     // stream. The Engram keys are queued after it: their upload waits on the
     // GPU for the worker, not on the host.
-    const auto st_t3 = st_now();
-    st_hash += st_us(st_t2, st_t3);
     if (pinned_io) ggml_backend_synchronize(backend);
-    st_sync += st_us(st_t3, st_now());
-    if (set_timing && ++st_n % 64 == 0) {
-        std::fprintf(stderr, "[ds4-set-t] per verify over %d: inputs %.0f mask %.0f hash %.0f sync %.0f us (pinned %d)\n",
-                     st_n, st_inputs / st_n, st_mask / st_n, st_hash / st_n, st_sync / st_n, pinned_io ? 1 : 0);
-    }
     // The root's broadcast sends the keys: its callback queues the upload
     // behind the worker's word, so layer 0 runs while the rows are read.
     // The other ranks' keys are overwritten by the broadcast, their worker

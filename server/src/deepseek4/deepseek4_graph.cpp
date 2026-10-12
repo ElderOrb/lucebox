@@ -6996,7 +6996,7 @@ struct Ds4FusedVerifyCache {
         }
         ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap,q], token-major
         ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
-        bool vocab_split = false;         // the head covers this rank's vocabulary half (argmax only)
+        bool vocab_split = false;         // built with the cluster vocabulary split head
         DeepSeek4SpecBoundaryCheckpoint boundary_checkpoint;
         // Tokenwise verify: the compressor window row each token wrote, per
         // window-state layer (window_layers), [row, layer-major token] for
@@ -10235,7 +10235,7 @@ bool deepseek4_paged_gathered_step(
                 mc, *fg, *ex, backend, w, nullptr,
                 rt->model.hc_layer_weights, rt->model.hc_output_weights,
                 rt->model.hash_routing_tables, 0, (int) lanes,
-                token_ids != nullptr, {}, hybrid, std::move(key),
+                token_ids != nullptr, {}, hybrid, /*vocab_split=*/false, std::move(key),
                 &cache, &prepared, bucket_history)) {
             std::fprintf(stderr,
                 "[deepseek4-paged] failed to build gathered graph "
