@@ -188,11 +188,6 @@ GGML_BACKEND_API void ggml_backend_cuda_copy_batch_async(ggml_backend_t backend,
 // Graph copy runs issued as one batched launch on the calling thread (see
 // GGML_CUDA_DISABLE_COPY_BATCH); for tests and profiling.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_copy_batch_run_count(void);
-// Keeps the backend's GPU out of its idle power state: on starts one wave that
-// sleeps in a loop on a stream of its own (at most max_ms), off releases it.
-// For a process that leaves the GPU idle for milliseconds between launches and
-// pays the wake-up (about 1 ms on RDNA4) at the next one. HIP only.
-GGML_BACKEND_API void ggml_backend_cuda_keepalive(ggml_backend_t backend, bool on, int max_ms);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);

@@ -4628,64 +4628,6 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     return true;
 }
 
-#if defined(GGML_USE_HIP)
-static __global__ void ggml_cuda_keepalive_kernel(const volatile unsigned int * stop, unsigned int epoch,
-                                                  unsigned long long max_ticks) {
-    const unsigned long long t0 = wall_clock64();
-    while (*stop != epoch) {
-        __builtin_amdgcn_s_sleep(100);
-        if (wall_clock64() - t0 > max_ticks) break;
-    }
-}
-#endif
-
-void ggml_backend_cuda_keepalive(ggml_backend_t backend, bool on, int max_ms) {
-#if defined(GGML_USE_HIP)
-    if (!ggml_backend_is_cuda(backend)) {
-        return;
-    }
-    struct state {
-        cudaStream_t stream = nullptr;
-        unsigned int * flag = nullptr;   // pinned host word the kernel polls
-        unsigned int epoch = 0;
-        bool running = false;
-        unsigned long long ticks_per_ms = 0;
-    };
-    static state states[GGML_CUDA_MAX_DEVICES];
-    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
-    state & s = states[ctx->device];
-    if (on) {
-        if (s.running) {
-            return;
-        }
-        ggml_cuda_set_device(ctx->device);
-        if (!s.stream) {
-            CUDA_CHECK(cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking));
-            CUDA_CHECK(cudaMallocHost((void **) &s.flag, sizeof(unsigned int)));
-            *s.flag = 0;
-            int khz = 0;
-            if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, ctx->device) != hipSuccess || khz <= 0) {
-                khz = 100000;
-            }
-            s.ticks_per_ms = (unsigned long long) khz;
-        }
-        s.epoch++;
-        ggml_cuda_keepalive_kernel<<<1, 32, 0, s.stream>>>(s.flag, s.epoch,
-                                                            s.ticks_per_ms * (unsigned long long) std::max(1, max_ms));
-        CUDA_CHECK(cudaGetLastError());
-        s.running = true;
-    } else {
-        if (!s.running) {
-            return;
-        }
-        __atomic_store_n(s.flag, s.epoch, __ATOMIC_RELEASE);
-        s.running = false;
-    }
-#else
-    GGML_UNUSED(backend); GGML_UNUSED(on); GGML_UNUSED(max_ms);
-#endif
-}
-
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
