@@ -17,6 +17,7 @@
 #include "client_send_buffer.h"
 #include "common/model_backend.h"
 #include "common/concurrency/paged_kv_offload.h"
+#include "common/output_constraint.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -292,6 +293,23 @@ bool should_clamp_flowkv_disk_cache(
 // Agent clients append system notes (a context budget, reminders) after
 // the tool results; those notes are append-only history too.
 bool ends_with_tool_result(const std::vector<ChatMessage> & messages);
+// Structured output. The format object a request asks its output to follow:
+// response_format (chat completions), text.format (responses) or
+// output_format (messages); null when it asks for none. Read from the body
+// text as ordered JSON, so the grammar keeps the schema's property order.
+nlohmann::ordered_json request_output_format(const std::string & body);
+// The JSON schema a format object asks for. False with `error` set for an
+// unsupported format type; true with a null schema for plain text.
+bool output_format_schema(const nlohmann::ordered_json & format,
+                          nlohmann::ordered_json & schema, std::string & error);
+// Whether tool_choice obliges the reply to call a tool ("required", or a
+// named function in any of the three APIs).
+bool tool_choice_requires_call(const json & tool_choice);
+// The grammar for a constrained reply: optional leading whitespace, then the
+// schema's JSON (when a schema is given) or a tool call that starts with one
+// of `tool_openers` (when given). Throws on a schema it cannot convert.
+std::string output_constraint_grammar(const nlohmann::ordered_json & schema,
+                                      const std::vector<std::string> & tool_openers);
 bool canonical_turn_matches_checkpoint(
     const std::vector<int32_t> & prompt,
     const std::vector<int32_t> & completed_turn,
@@ -344,6 +362,9 @@ struct ParsedRequest {
     json                      messages;
     // Original request body (for upstream proxy forwarding)
     json                      raw_body;
+    // Structured output format (http_detail::request_output_format), null
+    // when the request asks for none.
+    nlohmann::ordered_json    output_format;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -648,6 +669,12 @@ private:
         std::string & rendered, std::string & error);
     bool validate_request_context(SocketHandle fd, const ParsedRequest & req,
                                   bool send_failure = true);
+    // Constrain the reply to the request's structured output format and
+    // tool_choice (common/output_constraint.h). False after sending a 400
+    // for a format it cannot serve.
+    bool attach_output_constraint(SocketHandle fd, ParsedRequest & req);
+    // Every token's text, built on first use and shared by all requests.
+    std::shared_ptr<const ConstraintVocab> output_constraint_vocab();
     void log_parsed_request(const ParsedRequest & req) const;
     RoutingAdmission enqueue_request_and_wait(SocketHandle fd, ParsedRequest req,
                                   bool report_admission = false);
@@ -678,6 +705,8 @@ private:
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
     ServerConfig     config_;
     ChatFormat       chat_format_;
+    std::once_flag   constraint_vocab_once_;
+    std::shared_ptr<const ConstraintVocab> constraint_vocab_;
     PFlashDrafterIpcClient pflash_remote_;
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;

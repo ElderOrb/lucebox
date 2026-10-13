@@ -80,8 +80,8 @@ Successful requests expose the measured result under `usage.timings`:
 | `n` | int | — | Number of completions | ❌ TODO |
 | `logprobs` | bool | — | Return log probabilities | ❌ TODO |
 | `top_logprobs` | int | — | Number of top logprobs per token | ❌ TODO |
-| `response_format` | object | — | JSON mode / structured output | ❌ TODO |
-| `tool_choice` | string/object | — | Tool choice / force tool usage | ✅ |
+| `response_format` | object | — | Structured output: `json_object`, or `json_schema` with a schema the reply follows exactly (grammar-constrained decoding) | ✅ |
+| `tool_choice` | string/object | — | Tool choice; `required` or a named function forces a tool call | ✅ |
 | `logit_bias` | object | — | Per-token logit adjustments | ❌ TODO |
 | `user` | string | — | End-user identifier (tracking) | ❌ TODO |
 | `stream_options` | object | — | Streaming options (e.g. include_usage) | ❌ TODO 🔴 |
@@ -124,7 +124,8 @@ Successful requests expose the measured result under `usage.timings`:
 | `presence_penalty` | float | 0.0 | Penalize present tokens | ✅ |
 | `thinking` | object | — | Thinking mode (`{"type":"enabled"}`) | ✅ |
 | `tools` | array | — | Tool definitions | ✅ |
-| `tool_choice` | string/object | — | Tool choice / force tool usage | ✅ |
+| `tool_choice` | string/object | — | Tool choice; `any` or a named tool forces a tool call | ✅ |
+| `output_format` | object | — | Structured output (`{"type":"json_schema","schema":{...}}`) | ✅ |
 | `stop_sequences` | array | — | Stop sequences | ✅ |
 | `metadata` | object | — | Request metadata (tracing) | ❌ TODO |
 
@@ -159,7 +160,7 @@ Follows Anthropic Messages API structure with `content` blocks:
 | `parallel_tool_calls` | bool | — | Allow parallel tool calls | ❌ TODO 🔴 |
 | `store` | bool | — | Persist response | ❌ TODO 🔴 |
 | `include` | array | — | Include extra response fields | ❌ TODO 🔴 |
-| `text` | object | — | Structured output / JSON schema | ❌ TODO 🔴 |
+| `text` | object | — | Structured output (`{"format":{"type":"json_schema","schema":{...}}}`) | ✅ |
 | `service_tier` | string | — | Routing hint | ❌ TODO 🔴 |
 | `previous_response_id` | string | — | Multi-turn chaining | ❌ TODO |
 
@@ -247,14 +248,12 @@ support causes errors or silent feature degradation.
 | **`parallel_tool_calls`** | Codex (Responses API) | Codex always sends `true`. Can accept and ignore (we serialize calls). |
 | **`store`** | Codex (Responses API) | Controls response persistence. Accept field; can be no-op locally. |
 | **`include`** | Codex (Responses API) | Controls what's included in response events. Accept field. |
-| **`text` (structured output)** | Codex (Responses API) | JSON schema output formatting (`{"format":{"type":"json_schema","schema":{...}}}`). Needed for structured tool outputs. |
 | **`service_tier`** | Codex (Responses API) | Routing hint (e.g., `"default"`). Accept and ignore. |
 
 ### 🟡 Medium Priority
 
 | Feature | Used By | Notes |
 |---------|---------|-------|
-| **`response_format`** | Chat Completions API | JSON mode / structured output (OpenAI Chat format). |
 | **`metadata`** | Claude Code (Anthropic) | Request metadata for tracing. Accept and ignore. |
 | **`stream_options`** | Some OpenAI clients | `{"include_usage": true}` — usage in final streaming chunk. |
 | **Input validation** | — | Clamp penalty ranges [-2,2], reject invalid params with 400. |

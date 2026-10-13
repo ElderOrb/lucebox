@@ -12,12 +12,15 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace luce::common {
+
+class OutputConstraint;
 
 struct SamplerCfg {
     float    temp       = 0.0f;
@@ -34,15 +37,23 @@ struct SamplerCfg {
     float    freq_pen   = 0.0f;
     float    pres_pen   = 0.0f;
 
-    // True when any logit modifier is active (penalties or stochastic sampling).
-    // Backends should use CPU sample_logits() path when this returns true.
+    // Structured output (common/output_constraint.h): the request's tokens
+    // follow a grammar. Shared by every copy of the config, so the sampler
+    // and the commit point see one position.
+    std::shared_ptr<OutputConstraint> constraint;
+
+    // True when any logit modifier is active (penalties, stochastic sampling
+    // or a grammar). Backends should use CPU sample_logits() path when this
+    // returns true.
     bool needs_logit_processing() const {
-        return temp > 0.0f || rep_pen > 1.0f || freq_pen != 0.0f || pres_pen != 0.0f;
+        return temp > 0.0f || rep_pen > 1.0f || freq_pen != 0.0f || pres_pen != 0.0f ||
+               constraint != nullptr;
     }
 };
 
 // Returns the chosen token id. cfg.temp == 0 -> caller should use argmax;
 // the chain assumes a positive temperature and falls back to a small floor.
+// With cfg.constraint the token is one the grammar allows at its position.
 int sample_logits(const float * logits_in,
                   int vocab,
                   const SamplerCfg & cfg,
@@ -52,7 +63,8 @@ int sample_logits(const float * logits_in,
 // The distribution sample_logits draws from, after the whole chain (penalties,
 // top_k, temperature, top_p) as (probability, token) pairs summing to 1. With
 // temp <= 0 it is the single post-penalty argmax. Speculative sampling uses it
-// to accept a drafted token with the target's own probability.
+// to accept a drafted token with the target's own probability. A constraint
+// masks the distribution at its current position only.
 void sampler_distribution(const float * logits_in,
                           int vocab,
                           const SamplerCfg & cfg,

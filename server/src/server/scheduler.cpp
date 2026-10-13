@@ -10,6 +10,7 @@
 
 #include "http_server.h"
 #include "common/concurrency/seq_engine.h"
+#include "common/output_constraint.h"
 #include "parallel_prefix_txn.h"
 #include "response_error.h"
 
@@ -215,6 +216,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // slot — on EOS, gen cap, stop-sequence hit, or degenerate repetition.
     auto advance_slot = [&](SchedSlot & s, int32_t tok) {
         tok = s.budget.apply(tok).token;
+        // The grammar moves with the token fed back, the budget's included.
+        if (OutputConstraint * constraint = s.job->req.sampler.constraint.get()) {
+            constraint->accept(tok);
+        }
         s.gen_tokens.push_back(tok);
         const bool cont = deliver_generation_token(
             s.job, s.job->req, *s.emitter, tok, s.completion_tokens,
@@ -884,8 +889,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 const auto & s = slots[(size_t)i];
                 if (!s.job || parked(i)) continue;
                 if (!s.prefilling) {
+                    // A grammar masks one position at a time: no bursts.
                     step_plan.decode.push_back(
-                        {i, s.pending_tok, s.budget.settled()});
+                        {i, s.pending_tok,
+                         s.budget.settled() && !s.job->req.sampler.constraint});
                 } else {
                     prefill_candidates.push_back({i, s.admission_order});
                 }

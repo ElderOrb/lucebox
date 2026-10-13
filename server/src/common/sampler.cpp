@@ -2,6 +2,8 @@
 
 #include "sampler.h"
 
+#include "output_constraint.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -135,13 +137,11 @@ void apply_sampler_penalties(const SamplerCfg & cfg, const std::vector<int32_t> 
     }
 }
 
-}  // namespace
-
-int sample_logits(const float * logits_in,
-                  int vocab,
-                  const SamplerCfg & cfg,
-                  const std::vector<int32_t> & history,
-                  std::mt19937_64 & rng) {
+int sample_logits_chain(const float * logits_in,
+                        int vocab,
+                        const SamplerCfg & cfg,
+                        const std::vector<int32_t> & history,
+                        std::mt19937_64 & rng) {
     // Draw the single uniform up front, exactly once, and only when we will
     // actually sample (temp>0; greedy returns before any draw). It is then
     // threaded through every path below — the full-GPU draw, the GPU-assisted
@@ -261,6 +261,30 @@ int sample_logits(const float * logits_in,
     return draw_from_weights(cand, r_uniform);
 }
 
+}  // namespace
+
+int sample_logits(const float * logits_in,
+                  int vocab,
+                  const SamplerCfg & cfg,
+                  const std::vector<int32_t> & history,
+                  std::mt19937_64 & rng) {
+    const int token = sample_logits_chain(logits_in, vocab, cfg, history, rng);
+    OutputConstraint * constraint = cfg.constraint.get();
+    if (!constraint || !constraint->engaged() || constraint->allows(token)) return token;
+    // The grammar rejects the draw: draw again from the tokens it allows.
+    // Drawing first and masking only on a miss leaves each allowed token
+    // with exactly its masked probability. A rejected draw is the request
+    // writing its reply, so the redraw keeps to the reply and leaves a tool
+    // call out, unless a tool call is all the grammar allows.
+    thread_local std::vector<float> masked;
+    masked.assign(logits_in, logits_in + vocab);
+    if (constraint->mask(masked.data(), vocab, /*content_only=*/true) == 0) {
+        masked.assign(logits_in, logits_in + vocab);
+        if (constraint->mask(masked.data(), vocab) == 0) return token;
+    }
+    return sample_logits_chain(masked.data(), vocab, cfg, history, rng);
+}
+
 void sampler_distribution(const float * logits_in,
                           int vocab,
                           const SamplerCfg & cfg,
@@ -275,6 +299,7 @@ void sampler_distribution(const float * logits_in,
     thread_local std::vector<float> z;
     thread_local std::vector<double> zd;
     z.assign(logits_in, logits_in + vocab);
+    if (cfg.constraint && cfg.constraint->engaged()) cfg.constraint->mask(z.data(), vocab);
     apply_sampler_penalties(cfg, history, vocab, [&](int t) -> float & { return z[(size_t) t]; });
     if (cfg.temp <= 0.0f) {
         const int best = (int) (std::max_element(z.begin(), z.end()) - z.begin());

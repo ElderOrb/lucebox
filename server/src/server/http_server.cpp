@@ -26,6 +26,8 @@
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
+#include "tool_parser.h"
+#include "json_schema_grammar.h"
 #include "pin_friendly_prompt.h"
 #include "common/kv_rotation.h"
 #include "common/sha1.h"
@@ -2200,6 +2202,165 @@ json HttpServer::model_routing_status() {
             {"queue_limit", config_.routing_queue_limit}, {"models", models}};
 }
 
+// ─── Structured output ──────────────────────────────────────────────────
+
+namespace http_detail {
+
+nlohmann::ordered_json request_output_format(const std::string & body) {
+    if (body.find("\"response_format\"") == std::string::npos &&
+        body.find("\"output_format\"") == std::string::npos &&
+        body.find("\"format\"") == std::string::npos) {
+        return nullptr;
+    }
+    const auto ordered = nlohmann::ordered_json::parse(body, nullptr, false);
+    if (!ordered.is_object()) return nullptr;
+    if (ordered.contains("response_format")) return ordered["response_format"];
+    if (ordered.contains("output_format")) return ordered["output_format"];
+    const auto text = ordered.find("text");
+    if (text != ordered.end() && text->is_object() && text->contains("format")) {
+        return (*text)["format"];
+    }
+    return nullptr;
+}
+
+bool output_format_schema(const nlohmann::ordered_json & format,
+                          nlohmann::ordered_json & schema, std::string & error) {
+    schema = nullptr;
+    if (format.is_null()) return true;
+    if (!format.is_object()) {
+        error = "response_format must be an object";
+        return false;
+    }
+    const std::string type = format.value("type", std::string());
+    if (type.empty() || type == "text") return true;
+    if (type == "json_object") {
+        // A schema beside json_object narrows it, as in llama-server.
+        schema = format.contains("schema") ? format["schema"]
+                                           : nlohmann::ordered_json::object();
+    } else if (type == "json_schema") {
+        // Chat completions nest the schema under json_schema; responses and
+        // messages put it on the format itself.
+        const auto & holder = format.contains("json_schema") ? format["json_schema"] : format;
+        schema = holder.is_object() && holder.contains("schema")
+            ? holder["schema"] : nlohmann::ordered_json::object();
+    } else {
+        error = "response_format type must be text, json_object or json_schema, not '" +
+                type + "'";
+        return false;
+    }
+    if (!schema.is_object()) {
+        error = "the response_format schema must be a JSON object";
+        return false;
+    }
+    if (schema.empty()) schema["type"] = "object";  // an empty schema means any object
+    return true;
+}
+
+bool tool_choice_requires_call(const json & tool_choice) {
+    if (tool_choice.is_string()) {
+        return tool_choice == "required" || tool_choice == "any";
+    }
+    if (!tool_choice.is_object()) return false;
+    const std::string type = tool_choice.value("type", std::string());
+    return type == "any" || type == "tool" || type == "function" ||
+           tool_choice.contains("function");
+}
+
+static std::string gbnf_literal(const std::string & text) {
+    std::string out = "\"";
+    for (const char c : text) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:   out += c;
+        }
+    }
+    return out + "\"";
+}
+
+std::string output_constraint_grammar(const nlohmann::ordered_json & schema,
+                                      const std::vector<std::string> & tool_openers) {
+    return build_grammar([&](const GrammarBuilder & builder) {
+        std::string replies;
+        if (!schema.is_null()) {
+            auto resolved = schema;
+            builder.resolve_refs(resolved);
+            replies = builder.add_schema("reply", resolved);
+        }
+        if (!tool_openers.empty()) {
+            std::string openers;
+            for (const auto & opener : tool_openers) {
+                if (!openers.empty()) openers += " | ";
+                openers += gbnf_literal(opener);
+            }
+            // The grammar only admits the opener; the tool parser reads the
+            // call, and the constraint lets go of the output once it starts.
+            if (!replies.empty()) replies += " | ";
+            replies += builder.add_rule("tool-call", "(" + openers + ") .*");
+        }
+        builder.add_rule("root", "[ \\t\\n]{0,4} (" + replies + ")");
+    });
+}
+
+}  // namespace http_detail
+
+std::shared_ptr<const ConstraintVocab> HttpServer::output_constraint_vocab() {
+    std::call_once(constraint_vocab_once_, [this] {
+        std::vector<std::string> pieces((size_t) tokenizer_.vocab_size());
+        for (int32_t id = 0; id < tokenizer_.vocab_size(); ++id) {
+            pieces[(size_t) id] = tokenizer_.token_text(id);
+        }
+        constraint_vocab_ = ConstraintVocab::build(
+            std::move(pieces), {tokenizer_.eos_id(), tokenizer_.eos_chat_id()});
+    });
+    return constraint_vocab_;
+}
+
+bool HttpServer::attach_output_constraint(SocketHandle fd, ParsedRequest & req) {
+    nlohmann::ordered_json schema;
+    std::string error;
+    if (!http_detail::output_format_schema(req.output_format, schema, error)) {
+        send_error(fd, 400, error);
+        return false;
+    }
+    const bool tools_off = req.tool_choice == "none" ||
+        (req.tool_choice.is_object() && req.tool_choice.value("type", "") == "none");
+    const bool has_tools = req.tools.is_array() && !req.tools.empty() && !tools_off;
+    const bool must_call = has_tools && http_detail::tool_choice_requires_call(req.tool_choice);
+    if (schema.is_null() && !must_call) return true;
+
+    // With tools the reply may call one first; a forced call must.
+    std::vector<std::string> openers = has_tools ? tool_call_openers(req.tools)
+                                                 : std::vector<std::string>{};
+    std::string grammar;
+    try {
+        grammar = http_detail::output_constraint_grammar(
+            must_call ? nlohmann::ordered_json() : schema, openers);
+    } catch (const std::exception & e) {
+        send_error(fd, 400, std::string("response_format: ") + e.what());
+        return false;
+    }
+    auto matcher = gbnf::Matcher::compile(grammar, "root", error);
+    if (!matcher) {
+        send_error(fd, 400, "response_format: " + error);
+        return false;
+    }
+    OutputConstraint::Options options;
+    if (req.started_in_thinking) {
+        options.wait_for = config_.think_marker_token_ids.empty()
+            ? std::string("</think>")
+            : tokenizer_.decode(config_.think_marker_token_ids);
+    }
+    options.release_prefixes = std::move(openers);
+    options.calls_only = must_call;
+    req.sampler.constraint = std::make_shared<OutputConstraint>(
+        output_constraint_vocab(), std::move(matcher), std::move(options));
+    return true;
+}
+
 // ─── Request parsing ────────────────────────────────────────────────────
 
 // Fields shared by every endpoint: stream/model/max-tokens, sampler,
@@ -2596,7 +2757,7 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
     std::fprintf(stderr,
         "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
         "max_tokens=%d max_ctx=%d thinking=%s reasoning_effort=%s "
-        "started_in_thinking=%s stops=%zu model=%s\n",
+        "started_in_thinking=%s stops=%zu grammar=%s model=%s\n",
         req.response_id.c_str(), api_format_name(req.format),
         req.stream ? "true" : "false",
         json_array_size(req.messages), json_array_size(req.tools),
@@ -2606,7 +2767,8 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
             (req.reasoning_effort.empty() ? "default" :
                 req.reasoning_effort.c_str()),
         req.started_in_thinking ? "true" : "false",
-        req.stop_sequences.size(), req.model.c_str());
+        req.stop_sequences.size(), req.sampler.constraint ? "on" : "off",
+        req.model.c_str());
 }
 
 RoutingAdmission HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req,
@@ -2654,6 +2816,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
     bool count_tokens_only = false;
     try {
         req.raw_body = json::parse(hr.body);
+        req.output_format = http_detail::request_output_format(hr.body);
         if (!parse_endpoint_request(
                 hr.path, req.raw_body, req, count_tokens_only)) return false;
         return models_.empty()
@@ -2757,6 +2920,7 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
             send_response(fd, 200, "application/json", response.dump() + "\n");
             return true;
         }
+        if (!attach_output_constraint(fd, req)) return true;
     } catch (const json::parse_error & e) {
         send_error(fd, 400, std::string("JSON parse error: ") + e.what());
         return true;
@@ -4593,6 +4757,8 @@ void HttpServer::prepare_generation_inputs(
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
     inputs.request.do_sample = req.sampler.needs_logit_processing();
+    // A grammar masks one position at a time: no speculative blocks.
+    inputs.request.force_ar_decode = req.sampler.constraint != nullptr;
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.
     inputs.request.stream = false;
@@ -4662,6 +4828,9 @@ void HttpServer::configure_generation_io(
 
     io.on_token = [this, job, &req, &emitter, &output](
             int32_t token) -> bool {
+        // The grammar moves with every token the request keeps, before the
+        // backend samples the next one.
+        if (req.sampler.constraint) req.sampler.constraint->accept(token);
         if (output.client_disconnected ||
             job->client_disconnected.load(std::memory_order_acquire)) {
             output.client_disconnected = true;

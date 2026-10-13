@@ -42,6 +42,10 @@ struct ToolParseResult {
 bool find_tool_syntax_start(const std::string & text, const json & tools,
                             size_t & pos);
 
+// The literal openers find_tool_syntax_start recognizes (declared tools'
+// `<NAME>` included): text starting with one of them is a tool call.
+std::vector<std::string> tool_call_openers(const json & tools);
+
 // Number of trailing bytes the streaming emitter must retain to recognize an
 // opener split across token boundaries.
 size_t tool_syntax_holdback(const json & tools);

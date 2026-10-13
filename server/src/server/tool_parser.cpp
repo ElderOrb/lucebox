@@ -104,6 +104,14 @@ static std::string declared_tool_name(const json & tool) {
     return valid_tool_name(name) ? name : std::string();
 }
 
+// Literal openers of the tool-call forms above. ARG_KEY_OPEN is not one: it
+// sits after the tool name it belongs to.
+static const char * const TOOL_OPENERS[] = {
+    TOOL_OPEN, TOOL_CALLS_OPEN, DSML_PREFIX, INVOKE_OPEN, FUNCTION_CALL_OPEN,
+    FUNCTION_CALLS_OPEN, FUNCTION_OPEN, BARE_FUNCTION_OPEN, FUNCTION_SPACE_OPEN,
+    FUNCNAME_OPEN, TOOL_CODE_OPEN, ATTRIBUTE_PARAMETER_OPEN,
+};
+
 static bool declared_tool_open_at(const std::string & text, size_t pos,
                                   const json & tools) {
     if (!tools.is_array()) return false;
@@ -116,25 +124,27 @@ static bool declared_tool_open_at(const std::string & text, size_t pos,
     return false;
 }
 
+std::vector<std::string> tool_call_openers(const json & tools) {
+    std::vector<std::string> openers(std::begin(TOOL_OPENERS), std::end(TOOL_OPENERS));
+    if (tools.is_array()) {
+        for (const auto & tool : tools) {
+            const std::string name = declared_tool_name(tool);
+            if (!name.empty()) openers.push_back("<" + name + ">");
+        }
+    }
+    return openers;
+}
+
 bool find_tool_syntax_start(const std::string & text, const json & tools,
                             size_t & pos) {
     size_t idx = text.find('<');
     while (idx != std::string::npos) {
-        if (text.compare(idx, sizeof(TOOL_OPEN) - 1, TOOL_OPEN) == 0 ||
-            text.compare(idx, sizeof(TOOL_CALLS_OPEN) - 1, TOOL_CALLS_OPEN) == 0 ||
-            text.compare(idx, sizeof(DSML_PREFIX) - 1, DSML_PREFIX) == 0 ||
-            text.compare(idx, sizeof(INVOKE_OPEN) - 1, INVOKE_OPEN) == 0 ||
-            text.compare(idx, sizeof(FUNCTION_CALL_OPEN) - 1, FUNCTION_CALL_OPEN) == 0 ||
-            text.compare(idx, sizeof(FUNCTION_CALLS_OPEN) - 1, FUNCTION_CALLS_OPEN) == 0 ||
-            text.compare(idx, sizeof(FUNCTION_OPEN) - 1, FUNCTION_OPEN) == 0 ||
-            text.compare(idx, sizeof(BARE_FUNCTION_OPEN) - 1, BARE_FUNCTION_OPEN) == 0 ||
-            text.compare(idx, sizeof(FUNCTION_SPACE_OPEN) - 1,
-                         FUNCTION_SPACE_OPEN) == 0 ||
-            text.compare(idx, sizeof(FUNCNAME_OPEN) - 1, FUNCNAME_OPEN) == 0 ||
-            text.compare(idx, sizeof(TOOL_CODE_OPEN) - 1, TOOL_CODE_OPEN) == 0 ||
-            text.compare(idx, sizeof(ATTRIBUTE_PARAMETER_OPEN) - 1,
-                         ATTRIBUTE_PARAMETER_OPEN) == 0 ||
-            declared_tool_open_at(text, idx, tools)) {
+        const bool opener = std::any_of(
+            std::begin(TOOL_OPENERS), std::end(TOOL_OPENERS),
+            [&](const char * open) {
+                return text.compare(idx, std::strlen(open), open) == 0;
+            });
+        if (opener || declared_tool_open_at(text, idx, tools)) {
             pos = idx;
             return true;
         }
