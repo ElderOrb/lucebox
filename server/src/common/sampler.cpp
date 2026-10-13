@@ -271,11 +271,14 @@ int sample_logits(const float * logits_in,
     const int token = sample_logits_chain(logits_in, vocab, cfg, history, rng);
     OutputConstraint * constraint = cfg.constraint.get();
     if (!constraint || !constraint->engaged() || constraint->allows(token)) return token;
-    // The grammar rejects the draw: draw again from the tokens it allows.
-    // Drawing first and masking only on a miss leaves each allowed token
-    // with exactly its masked probability. A rejected draw is the request
-    // writing its reply, so the redraw keeps to the reply and leaves a tool
-    // call out, unless a tool call is all the grammar allows.
+    // The grammar rejects the draw: draw again from the tokens it allows
+    // (llama.cpp's grammar rejection sampling). With temperature and
+    // penalties alone this is exactly the masked distribution; top_k and
+    // top_p rank before the mask, so tokens the unmasked draw could reach
+    // weigh a little more than the masked chain would give them, in exchange
+    // for not masking the whole vocabulary every step. A rejected draw is
+    // the request writing its reply, so the redraw keeps to the reply and
+    // leaves a tool call out, unless a tool call is all the grammar allows.
     thread_local std::vector<float> masked;
     masked.assign(logits_in, logits_in + vocab);
     if (constraint->mask(masked.data(), vocab, /*content_only=*/true) == 0) {

@@ -301,6 +301,11 @@ TEST_CASE(OutputConstraintFixture, output_format_schema_normalizes_formats) {
     CHECK(schema.value("type", "") == "string");
     CHECK(!output_format_schema({{"type", "xml"}}, schema, error));
     CHECK(!error.empty());
+    // A non-string type is the client's mistake: an error, not an exception.
+    error.clear();
+    CHECK(!output_format_schema({{"type", 1}}, schema, error));
+    CHECK(!error.empty());
+    CHECK(!output_format_schema(nlohmann::ordered_json::parse(R"({"type":null})"), schema, error));
 }
 
 TEST_CASE(OutputConstraintFixture, tool_choice_requires_call_covers_each_api) {
@@ -313,6 +318,7 @@ TEST_CASE(OutputConstraintFixture, tool_choice_requires_call_covers_each_api) {
     CHECK(tool_choice_requires_call(json::parse(R"({"type":"any"})")));
     CHECK(tool_choice_requires_call(json::parse(R"({"type":"tool","name":"f"})")));
     CHECK(!tool_choice_requires_call(json::parse(R"({"type":"auto"})")));
+    CHECK(!tool_choice_requires_call(json::parse(R"({"type":1})")));
 }
 
 TEST_CASE(OutputConstraintFixture, forced_tool_call_grammar_admits_only_openers) {

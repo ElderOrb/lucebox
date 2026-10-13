@@ -4,9 +4,10 @@
 // One OutputConstraint per request, shared through SamplerCfg::constraint:
 //   - the sampler (sample_logits) draws the request's token as usual and, if
 //     the grammar rejects it, masks every token the grammar rejects and draws
-//     again from what is left. Drawing first and masking only on a miss gives
-//     exactly the masked distribution, and costs one token check per step
-//     while the model already writes what the grammar wants;
+//     again from what is left (llama.cpp's grammar rejection sampling). It
+//     costs one token check per step while the model already writes what the
+//     grammar wants, and gives the masked distribution exactly for
+//     temperature sampling (see sample_logits for top_k/top_p);
 //   - the commit point advances it with every token the request keeps: the
 //     scheduler (advance_slot) for paged engines, the token callback for the
 //     single-request path.

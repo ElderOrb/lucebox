@@ -2223,6 +2223,16 @@ nlohmann::ordered_json request_output_format(const std::string & body) {
     return nullptr;
 }
 
+// A string member of a client object; "" when it is absent or not a string.
+// (json::value would throw on a client's {"type": 1}.)
+template <typename Json>
+std::string string_member(const Json & object, const char * key) {
+    if (!object.is_object()) return {};
+    const auto it = object.find(key);
+    return it != object.end() && it->is_string() ? it->template get<std::string>()
+                                                 : std::string();
+}
+
 bool output_format_schema(const nlohmann::ordered_json & format,
                           nlohmann::ordered_json & schema, std::string & error) {
     schema = nullptr;
@@ -2231,7 +2241,11 @@ bool output_format_schema(const nlohmann::ordered_json & format,
         error = "response_format must be an object";
         return false;
     }
-    const std::string type = format.value("type", std::string());
+    if (format.contains("type") && !format["type"].is_string()) {
+        error = "response_format type must be a string";
+        return false;
+    }
+    const std::string type = string_member(format, "type");
     if (type.empty() || type == "text") return true;
     if (type == "json_object") {
         // A schema beside json_object narrows it, as in llama-server.
@@ -2261,7 +2275,7 @@ bool tool_choice_requires_call(const json & tool_choice) {
         return tool_choice == "required" || tool_choice == "any";
     }
     if (!tool_choice.is_object()) return false;
-    const std::string type = tool_choice.value("type", std::string());
+    const std::string type = string_member(tool_choice, "type");
     return type == "any" || type == "tool" || type == "function" ||
            tool_choice.contains("function");
 }
@@ -2327,7 +2341,7 @@ bool HttpServer::attach_output_constraint(SocketHandle fd, ParsedRequest & req) 
         return false;
     }
     const bool tools_off = req.tool_choice == "none" ||
-        (req.tool_choice.is_object() && req.tool_choice.value("type", "") == "none");
+        http_detail::string_member(req.tool_choice, "type") == "none";
     const bool has_tools = req.tools.is_array() && !req.tools.empty() && !tools_off;
     const bool must_call = has_tools && http_detail::tool_choice_requires_call(req.tool_choice);
     if (schema.is_null() && !must_call) return true;
