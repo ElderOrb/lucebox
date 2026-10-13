@@ -2,6 +2,17 @@
 // Admission gate: reject oversized requests with HTTP 400.
 // When compression is enabled, lets oversized requests through — post-compress check is the real gate.
 
+#include <algorithm>
+
+// The reply a request can get: what it asked for, trimmed to the context its
+// prompt leaves (0 when the prompt fills it). Clients ask for their usual cap
+// whatever the prompt, Claude Code 32000 tokens, so a long session would
+// otherwise be refused once prompt + cap passed the context.
+inline int fit_reply_to_context(int prompt_tokens, int max_output, int max_ctx)
+{
+    return (std::max)(0, (std::min)(max_output, max_ctx - prompt_tokens));
+}
+
 inline bool should_reject_oversized(int prompt_tokens, int max_output,
                                     int max_ctx, bool compression_enabled)
 {

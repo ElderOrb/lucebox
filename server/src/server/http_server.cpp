@@ -2750,18 +2750,29 @@ bool HttpServer::render_and_tokenize_request(
 // Context-length gate. Oversized prompts pass through when compression
 // (pflash) will run — the post-compress check is the real gate.
 bool HttpServer::validate_request_context(
-        SocketHandle fd, const ParsedRequest & req, bool send_failure) {
+        SocketHandle fd, ParsedRequest & req, bool routed) {
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const bool pflash_will_run =
         !req.images && config_.pflash_mode != ServerConfig::PflashMode::OFF &&
         drafter_tokenizer_ != nullptr &&
         (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
          prompt_tokens >= config_.pflash_threshold);
+    if (!routed && !pflash_will_run) {
+        const int fitted =
+            fit_reply_to_context(prompt_tokens, req.max_output, config_.max_ctx);
+        if (fitted > 0 && fitted < req.max_output) {
+            std::fprintf(stderr,
+                "[server] max_tokens=%d trimmed to %d: the prompt takes %d of "
+                "the %d-token context\n",
+                req.max_output, fitted, prompt_tokens, config_.max_ctx);
+            req.max_output = fitted;
+        }
+    }
     if (!should_reject_oversized(
             prompt_tokens, req.max_output, config_.max_ctx, pflash_will_run)) {
         return true;
     }
-    if (send_failure) send_error(fd, 400,
+    if (!routed) send_error(fd, 400,
                context_overflow_message(
                    config_.max_ctx, prompt_tokens, req.max_output));
     return false;
@@ -2943,7 +2954,7 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         return true;
     }
 
-    if (!validate_request_context(fd, req, admission == nullptr)) {
+    if (!validate_request_context(fd, req, admission != nullptr)) {
         if (admission) *admission = RoutingAdmission::unfit;
         return true;
     }

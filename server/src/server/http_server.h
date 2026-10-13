@@ -667,8 +667,11 @@ private:
         const std::vector<ChatMessage> & chat_messages,
         const ParsedRequest & req, bool add_generation_prompt,
         std::string & rendered, std::string & error);
-    bool validate_request_context(SocketHandle fd, const ParsedRequest & req,
-                                  bool send_failure = true);
+    // A direct request's max_tokens is trimmed to the context its prompt
+    // leaves; a routed one (another model may hold it whole) is refused
+    // without a response, so the router can try the next model.
+    bool validate_request_context(SocketHandle fd, ParsedRequest & req,
+                                  bool routed = false);
     // Constrain the reply to the request's structured output format and
     // tool_choice (common/output_constraint.h). False after sending a 400
     // for a format it cannot serve.

@@ -1,4 +1,4 @@
-// Unit tests for should_reject_oversized — pure, GPU-free.
+// Unit tests for should_reject_oversized and fit_reply_to_context — pure, GPU-free.
 
 #include "CppUnitTestFramework.hpp"
 #include "server/admission.h"
@@ -54,4 +54,18 @@ TEST_CASE(AdmissionFixture, test_effective_overflows_zero_length_hit_is_a_hit) {
 
 TEST_CASE(AdmissionFixture, test_effective_overflows_full_cache_hit_still_too_large) {
     CHECK(effective_prompt_overflows(200000, 60000, 10000, 65536));
+}
+
+TEST_CASE(AdmissionFixture, test_reply_fits_what_the_prompt_leaves) {
+    // Claude Code asks for 32000 whatever the prompt.
+    CHECK(fit_reply_to_context(110000, 32000, 131072) == 21072);
+    CHECK(fit_reply_to_context(1000, 32000, 131072) == 32000);
+    CHECK(fit_reply_to_context(131072, 32000, 131072) == 0);
+    CHECK(fit_reply_to_context(140000, 32000, 131072) == 0);
+    // Trimmed, the request is no longer oversized; a prompt that fills the
+    // context still is.
+    CHECK(!should_reject_oversized(110000, fit_reply_to_context(110000, 32000, 131072),
+                                   131072, false));
+    CHECK(should_reject_oversized(140000, fit_reply_to_context(140000, 32000, 131072),
+                                  131072, false));
 }
