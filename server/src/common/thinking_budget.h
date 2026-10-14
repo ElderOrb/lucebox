@@ -22,6 +22,14 @@ struct BudgetHook {
     int hard_limit_remaining = 0;
 };
 
+// The reply reserve comes out of the request's output cap. When the cap is at
+// most the configured reserve, the reply gets half of it and thinking the
+// other half; the full reserve would leave no room to think at all.
+inline int reply_reserve_within(int reserve, int output_cap) {
+    const int half = output_cap / 2;
+    return reserve < half ? reserve : half;
+}
+
 // One controller per generation, shared by the seed, speculative blocks and
 // every AR tail. The decoder supplies ACCEPTED output candidates exactly once,
 // before committing them to history/KV or emitting them. Rejected drafts and

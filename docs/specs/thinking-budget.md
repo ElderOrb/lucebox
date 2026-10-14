@@ -194,7 +194,7 @@ wants to use that tier's full budget needs to pass an explicit
 `max_tokens` ≥ `tier_value + hard_limit_reply_budget` on the
 request. With smaller `max_tokens`, the request parser narrows the
 effective phase-1 cap to `min(tier_value, request.max_tokens −
-hard_limit_reply_budget)` (see §4.4).
+reply_reserve)` (see §4.4).
 
 A request that asks for an effort tier exceeding the model's
 ceiling (e.g. `effort: "max"` on a model whose card has no
@@ -286,8 +286,11 @@ error response — clamping is silent at the wire to preserve OpenAI/
 Anthropic protocol compatibility.
 
 When `reasoning.effort` is set, the request's effective phase-1
-cap is `min(effort_tier_value, request.max_tokens −
-hard_limit_reply_budget)`. The effort tier value is the server
+cap is `min(effort_tier_value, request.max_tokens − reply_reserve)`,
+where `reply_reserve = min(hard_limit_reply_budget,
+request.max_tokens / 2)`. The reserve comes out of `max_tokens` but
+never takes all of it: with `max_tokens` 4096 and a 4096 reserve, the
+reply gets 2048 and thinking up to 2048, instead of no thinking. The effort tier value is the server
 configuration looked up from the resolved model card (or CLI
 override); the per-request narrowing accommodates clients that
 choose a tier (e.g. `"max"`) without also passing an explicit
@@ -412,7 +415,8 @@ if thinking is still open and remaining ≤ effective_reply_budget: force-close
 ```
 
 Where `effective_reply_budget` is the per-request `thinking.reply_budget`
-clamped to `--hard-limit-reply-budget` (see §4.4). The initial `n_gen` is
+clamped to `--hard-limit-reply-budget` (see §4.4), and at most half of
+the request's `max_tokens`. The initial `n_gen` is
 the combined thinking ceiling and reply reserve, capped by the request's
 maximum output and the backend's available context. Every decode
 strategy receives the same controller by reference; `remaining()` is

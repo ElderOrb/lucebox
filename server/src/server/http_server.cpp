@@ -4010,21 +4010,23 @@ void apply_request_reasoning(
                 request_budget_tokens, config.think_max_tokens);
         }
     } else if (req.thinking_opt_in && effort_set) {
-        // Spec §4.4: effective cap is min(tier value, max_tokens -
-        // hard_limit_reply_budget). Tier values can legitimately exceed
-        // default_max_tokens; clients that want the full tier budget must
-        // pass an explicit max_tokens. Otherwise we narrow silently to fit.
-        const int max_output_phase1_room = (std::max)(
-            0, req.max_output - config.hard_limit_reply_budget);
+        // Spec §4.4: effective cap is min(tier value, max_tokens - reply
+        // reserve). Tier values can legitimately exceed default_max_tokens;
+        // clients that want the full tier budget must pass an explicit
+        // max_tokens. Otherwise we narrow silently to fit.
+        const int reply_reserve = luce::common::reply_reserve_within(
+            config.hard_limit_reply_budget, req.max_output);
+        const int max_output_phase1_room =
+            (std::max)(0, req.max_output - reply_reserve);
         req.per_req_phase1_cap =
             (std::min)(effort_phase1_cap, max_output_phase1_room);
         if (effort_phase1_cap > max_output_phase1_room) {
             std::fprintf(stderr,
                 "[server] reasoning.effort tier=%d narrowed to %d "
-                "(max_tokens=%d - hard_limit_reply_budget=%d); "
+                "(max_tokens=%d - reply reserve=%d); "
                 "pass a larger max_tokens to use the full tier budget\n",
                 effort_phase1_cap, req.per_req_phase1_cap,
-                req.max_output, config.hard_limit_reply_budget);
+                req.max_output, reply_reserve);
         }
     }
     if (req.thinking_opt_in && request_reply_budget >= 0) {
@@ -9693,9 +9695,10 @@ void HttpServer::prepare_generation_inputs(
     const int thinking_ceiling = req.per_req_phase1_cap >= 0
         ? req.per_req_phase1_cap
         : config_.think_max_tokens;
-    const int reply_budget = req.per_req_reply_budget >= 0
-        ? req.per_req_reply_budget
-        : config_.hard_limit_reply_budget;
+    const int reply_budget = luce::common::reply_reserve_within(
+        req.per_req_reply_budget >= 0 ? req.per_req_reply_budget
+                                      : config_.hard_limit_reply_budget,
+        req.max_output);
     inputs.generation_cap = budget_active
         ? (std::min)(thinking_ceiling + reply_budget, req.max_output)
         : req.max_output;

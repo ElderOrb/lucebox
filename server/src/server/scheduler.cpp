@@ -463,9 +463,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         const int effective_think_ceiling = (req.per_req_phase1_cap >= 0)
             ? req.per_req_phase1_cap
             : config_.think_max_tokens;
-        const int eff_reply_for_n_gen = (req.per_req_reply_budget >= 0)
-            ? req.per_req_reply_budget
-            : config_.hard_limit_reply_budget;
+        const int eff_reply_for_n_gen = luce::common::reply_reserve_within(
+            req.per_req_reply_budget >= 0 ? req.per_req_reply_budget
+                                          : config_.hard_limit_reply_budget,
+            req.max_output);
         const int n_gen_cap = budget_active
             ? (std::min)(effective_think_ceiling + eff_reply_for_n_gen,
                          req.max_output)

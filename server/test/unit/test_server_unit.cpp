@@ -6892,6 +6892,35 @@ TEST_CASE(ServerUnitFixture, test_deepseek_reasoning_request_precedence_and_togg
     TEST_ASSERT(no_control.per_req_phase1_cap == -1);
 }
 
+// A max_tokens at or below the reply reserve still leaves room to think: the
+// reply takes half of it. The full reserve used to take all of it, so asking
+// for an effort with max_tokens 4096 (reserve 4096) gave no thinking.
+TEST_CASE(ServerUnitFixture, test_reply_reserve_leaves_room_to_think) {
+    TEST_ASSERT(luce::common::reply_reserve_within(4096, 32768) == 4096);
+    TEST_ASSERT(luce::common::reply_reserve_within(4096, 4096) == 2048);
+    TEST_ASSERT(luce::common::reply_reserve_within(4096, 1000) == 500);
+
+    struct Case {
+        int max_output;
+        int phase1_cap;
+    };
+    // Reserve 100, high tier 300.
+    const Case cases[] = {
+        {1000, 300},
+        {150, 75},
+        {100, 50},
+    };
+    ServerConfig config = deepseek_reasoning_test_config();
+    config.arch = "qwen35";
+    for (const auto & test : cases) {
+        ParsedRequest req;
+        req.max_output = test.max_output;
+        apply_request_reasoning({{"reasoning_effort", "high"}}, config, req);
+        TEST_ASSERT(req.thinking_opt_in);
+        TEST_ASSERT(req.per_req_phase1_cap == test.phase1_cap);
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_qwen_template_toggles_remain_renderer_only) {
     const json renderer_only_controls[] = {
         {{"chat_template_kwargs", {{"thinking", true}}}},
