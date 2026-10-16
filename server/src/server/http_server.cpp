@@ -36,6 +36,7 @@
 #include "pflash/pflash_selection.h"
 #include "pflash/pflash_request_probe.h"
 #include "freeze_history.h"
+#include "tool_checks.h"
 
 #ifdef LUCE_HAS_CURL
 #include <curl/curl.h>
@@ -4222,6 +4223,12 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
                                       bool count_tokens_only,
                                       RoutingAdmission * admission) {
+#if !defined(_WIN32)
+    if (!count_tokens_only && req.format == ApiFormat::OPENAI_CHAT &&
+        tool_checks::requested(req.raw_body, config_.tool_checks)) {
+        return serve_with_tool_checks(fd, req, admission);
+    }
+#endif
     try {
         const json & body = req.raw_body;
         if (!parse_common_request_fields(fd, body, req)) return true;
@@ -4329,6 +4336,186 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
     log_parsed_request(req);
     const auto outcome = enqueue_request_and_wait(fd, std::move(req), admission != nullptr);
     if (admission) *admission = outcome;
+    return true;
+}
+
+namespace {
+
+// Keeps a held SSE response open with comment lines while the checks run.
+class SseKeepAlive {
+public:
+    explicit SseKeepAlive(std::function<bool()> beat)
+        : beat_(std::move(beat)), thread_([this] { run(); }) {}
+    ~SseKeepAlive() { stop(); }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stopped_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mu_);
+        while (!cv_.wait_for(lock, kSseHeartbeatInterval, [this] { return stopped_; })) {
+            if (!beat_()) return;
+        }
+    }
+
+    std::function<bool()> beat_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stopped_ = false;
+    std::thread thread_;
+};
+
+}  // namespace
+
+bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
+                                       int & status, std::string & body) {
+#if defined(_WIN32)
+    (void) request; (void) admission;
+    status = 501;
+    body = json({{"error", {{"message", "tool checks need socketpair"}}}}).dump();
+    return true;
+#else
+    int pair[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        status = 500;
+        body = json({{"error", {{"message", std::string("socketpair: ") + sock_strerror()}}}}).dump();
+        return true;
+    }
+    std::string raw;
+    std::thread reader([&raw, in = pair[1]] {
+        char buf[65536];
+        for (;;) {
+            const ssize_t n = ::recv(in, buf, sizeof(buf), 0);
+            if (n > 0) raw.append(buf, (size_t) n);
+            else if (n == 0 || !sock_is_eintr(sock_errno())) break;
+        }
+    });
+    RoutingAdmission outcome = RoutingAdmission::handled;
+    try {
+        ParsedRequest inner;
+        bool count_only = false;
+        inner.raw_body = request;
+        inner.output_format = http_detail::request_output_format(request.dump());
+        parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
+        handle_model_request(pair[0], inner, false, admission ? &outcome : nullptr);
+    } catch (const std::exception & e) {
+        send_error(pair[0], 500, e.what());
+    }
+    ::shutdown(pair[0], SHUT_WR);
+    reader.join();
+    socket_close(pair[0]);
+    socket_close(pair[1]);
+    if (admission) {
+        *admission = outcome;
+        if (outcome != RoutingAdmission::handled) return false;
+    }
+    const size_t head_end = raw.find("\r\n\r\n");
+    status = raw.size() > 12 && raw.rfind("HTTP/1.1 ", 0) == 0 ? std::atoi(raw.c_str() + 9) : 500;
+    body = head_end == std::string::npos ? raw : raw.substr(head_end + 4);
+    return true;
+#endif
+}
+
+bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
+                                        RoutingAdmission * admission) {
+    namespace tc = tool_checks;
+    const auto started = std::chrono::steady_clock::now();
+    const bool stream = req.raw_body.value("stream", false);
+    const json request = tc::agent_request(req.raw_body, tc::kEffort);
+    const json & messages = request["messages"];
+
+    // A routed request reports admission before any byte goes out, so its
+    // stream opens after the first pass; otherwise it opens now.
+    std::unique_ptr<SseKeepAlive> keepalive;
+    auto open_stream = [&] {
+        if (!stream || keepalive) return;
+        std::string header = "HTTP/1.1 200 OK\r\n";
+        if (config_.enable_cors) header += "Access-Control-Allow-Origin: *\r\n";
+        header += "Content-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+                  "Connection: keep-alive\r\n\r\n";
+        send_all(fd, header.data(), header.size());
+        keepalive = std::make_unique<SseKeepAlive>([this, fd] {
+            return send_all(fd, kSseHeartbeat, sizeof(kSseHeartbeat) - 1);
+        });
+    };
+    if (!admission) open_stream();
+
+    // A pass that fails leaves the reply it would have replaced.
+    auto pass = [&](const json & body, json & response) {
+        if (http_detail::inspect_peer_socket(fd) == http_detail::PeerSocketState::Disconnected) {
+            return false;
+        }
+        int status = 0;
+        std::string raw;
+        if (!inner_chat_completion(body, nullptr, status, raw) || status != 200) return false;
+        response = json::parse(raw, nullptr, false);
+        return !response.is_discarded() && tc::reply_message(response) != nullptr;
+    };
+
+    int status = 0;
+    std::string raw;
+    if (!inner_chat_completion(request, admission, status, raw)) return true;
+    json response = json::parse(raw, nullptr, false);
+    json * reply = status == 200 && !response.is_discarded() ? tc::reply_message(response) : nullptr;
+    if (!reply) {
+        if (keepalive) {
+            keepalive->stop();
+            raw.erase(raw.find_last_not_of(" \r\n") + 1);
+            const std::string error = "data: " + raw + "\n\ndata: [DONE]\n\n";
+            send_all(fd, error.data(), error.size());
+        } else {
+            send_response(fd, status ? status : 500, "application/json", raw);
+        }
+        return true;
+    }
+    open_stream();
+
+    const char * replan = "-";
+    const char * final_check = "-";
+    if (tc::needs_replan(*reply)) {
+        json again;
+        json * again_reply = pass(tc::with_note(request, *reply, tc::kReplanNote), again)
+            ? tc::reply_message(again) : nullptr;
+        replan = "kept";
+        if (again_reply && again_reply->contains("tool_calls") &&
+            !(*again_reply)["tool_calls"].empty()) {
+            response = std::move(again);
+            reply = tc::reply_message(response);
+            replan = "replanned";
+        }
+    }
+    if (tc::needs_final_check(messages, *reply)) {
+        json again;
+        json * again_reply = pass(tc::with_note(request, *reply, tc::kFinalNote), again)
+            ? tc::reply_message(again) : nullptr;
+        json fresh = again_reply ? tc::fresh_calls(messages, *again_reply) : json::array();
+        final_check = "done";
+        if (!fresh.empty()) {
+            tc::mark_checked(fresh);
+            (*again_reply)["tool_calls"] = std::move(fresh);
+            response = std::move(again);
+            final_check = "more_work";
+        }
+    }
+    std::fprintf(stderr, "[tool-checks] %s replan=%s final_check=%s ms=%lld\n",
+                 response.value("id", std::string()).c_str(), replan, final_check,
+                 (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - started).count());
+
+    if (keepalive) {
+        keepalive->stop();
+        const std::string events = tc::as_sse(response);
+        send_all(fd, events.data(), events.size());
+    } else {
+        send_response(fd, 200, "application/json", response.dump() + "\n");
+    }
     return true;
 }
 

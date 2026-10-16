@@ -747,6 +747,7 @@ add_library(luce_common STATIC
     src/server/json_schema_grammar.cpp
     src/server/tool_hint.cpp
     src/server/tool_memory.cpp
+    src/server/tool_checks.cpp
     src/server/pflash_unified.cpp
     src/server/response_error.cpp
     src/server/sse_emitter.cpp
@@ -2237,6 +2238,17 @@ if(LUCE_TESTS)
         target_include_directories(test_seq_batch_plan PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_seq_batch_plan)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_tool_checks.cpp")
+        # Tool-use check decisions on OpenAI chat JSON: no model, no GPU.
+        add_executable(test_tool_checks
+            test/unit/test_tool_checks.cpp
+            src/server/tool_checks.cpp)
+        target_include_directories(test_tool_checks PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        target_link_libraries(test_tool_checks PRIVATE nlohmann_json::nlohmann_json)
+        list(APPEND _raw_unit_test_targets test_tool_checks)
     endif()
     if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_client_send_buffer.cpp")
         # Buffered non-blocking client writer test (socketpair): no GPU.
