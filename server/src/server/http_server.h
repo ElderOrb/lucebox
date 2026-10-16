@@ -21,6 +21,7 @@
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
+#include "tool_checks.h"
 #include "prefix_cache.h"
 #include "disk_prefix_cache.h"
 #include "freeze_history.h"
@@ -1360,6 +1361,8 @@ private:
     // Disk key of each RAM snapshot slot (written on eviction/shutdown).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
     std::unordered_set<int> agent_turn_cache_slots_;
+    // Calls a tool-use final check added (tool_checks.h).
+    tool_checks::CheckedCalls checked_calls_;
     // Replay blob stored with each slot's disk snapshot.
     std::unordered_map<int, std::string> slot_aux_;
     std::vector<int> request_session_slots_;

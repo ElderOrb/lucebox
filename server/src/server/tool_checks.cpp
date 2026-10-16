@@ -34,8 +34,6 @@ const char kFinalNote[] =
     "Otherwise give the same answer again. Do not mention this note or the check "
     "in your reply.";
 
-const char kCheckedCallPrefix[] = "call_check_";
-
 namespace {
 
 // How far from the end of a final answer a question mark counts as asking the
@@ -103,19 +101,34 @@ bool asks_user(const json & reply) {
     return text.find('?', from) != std::string::npos;
 }
 
-bool checked_since_last_user(const json & messages) {
+}  // namespace
+
+void CheckedCalls::add(const json & calls) {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto & call : calls) {
+        const std::string id = string_field(call, "id");
+        if (id.empty() || !ids_.insert(id).second) continue;
+        order_.push_back(id);
+        while (order_.size() > capacity_) {
+            ids_.erase(order_.front());
+            order_.pop_front();
+        }
+    }
+}
+
+bool CheckedCalls::since_last_user(const json & messages) const {
+    if (!messages.is_array()) return false;
+    std::lock_guard<std::mutex> lock(mu_);
     for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
         const std::string role = role_of(*it);
         if (role == "user") return false;
         if (role != "assistant") continue;
         for (const auto & call : calls_of(*it)) {
-            if (string_field(call, "id").rfind(kCheckedCallPrefix, 0) == 0) return true;
+            if (ids_.count(string_field(call, "id"))) return true;
         }
     }
     return false;
 }
-
-}  // namespace
 
 bool requested(const json & body, bool server_default) {
     if (!body.is_object() || !body.contains("tools") || !body["tools"].is_array() ||
@@ -184,11 +197,12 @@ bool needs_replan(const json & reply) {
     return names.size() > 1;
 }
 
-bool needs_final_check(const json & messages, const json & reply) {
+bool needs_final_check(const json & messages, const json & reply,
+                       const CheckedCalls & checked) {
     if (!calls_of(reply).empty() || !messages.is_array()) return false;
     const bool used_tools = std::any_of(messages.begin(), messages.end(),
         [](const json & message) { return role_of(message) == "tool"; });
-    return used_tools && !asks_user(reply) && !checked_since_last_user(messages);
+    return used_tools && !asks_user(reply) && !checked.since_last_user(messages);
 }
 
 json fresh_calls(const json & messages, const json & reply) {
@@ -213,16 +227,6 @@ json fresh_calls(const json & messages, const json & reply) {
         if (!failed.count(call_key(call))) fresh.push_back(call);
     }
     return fresh;
-}
-
-void mark_checked(json & calls) {
-    for (auto & call : calls) {
-        if (!call.is_object()) continue;
-        std::string id = string_field(call, "id");
-        if (id.rfind(kCheckedCallPrefix, 0) == 0) continue;
-        if (id.rfind("call_", 0) == 0) id.erase(0, 5);
-        call["id"] = kCheckedCallPrefix + id;
-    }
 }
 
 std::string as_sse(const json & response) {

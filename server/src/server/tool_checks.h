@@ -18,7 +18,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 
 namespace luce::common::tool_checks {
 
@@ -30,10 +34,23 @@ extern const char kRules[];
 extern const char kReplanNote[];
 extern const char kFinalNote[];
 
-// Tool calls added by a final check carry this id prefix. The ids travel with
-// the conversation, so the next final answer of the same user request is not
-// checked again and the server keeps no state between requests.
-extern const char kCheckedCallPrefix[];
+// Ids of the tool calls a final check added, so the next final answer of the
+// same user request goes out as is. The ids stay as the model made them, so
+// tool memory still replays the turn exactly. Bounded: the oldest ids go first.
+class CheckedCalls {
+public:
+    explicit CheckedCalls(size_t capacity = 4096) : capacity_(capacity) {}
+
+    void add(const json & calls);
+    // An assistant message after the last user message made one of these calls.
+    bool since_last_user(const json & messages) const;
+
+private:
+    mutable std::mutex mu_;
+    size_t capacity_;
+    std::deque<std::string> order_;
+    std::unordered_set<std::string> ids_;
+};
 
 // The request gets checks: it has tools the model may call, the server has
 // checks on, and the client did not set "tool_checks": false (top level or
@@ -56,13 +73,11 @@ bool needs_replan(const json & reply);
 
 // The reply is a final answer after tool results, does not end by asking the
 // user something, and no check has added work since the last user message.
-bool needs_final_check(const json & messages, const json & reply);
+bool needs_final_check(const json & messages, const json & reply,
+                       const CheckedCalls & checked);
 
 // The calls of `reply` that did not already fail earlier in `messages`.
 json fresh_calls(const json & messages, const json & reply);
-
-// Give each call the checked-call id prefix.
-void mark_checked(json & calls);
 
 // A chat.completion response as the SSE events a streaming client expects.
 std::string as_sse(const json & response);

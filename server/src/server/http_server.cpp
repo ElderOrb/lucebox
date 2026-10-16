@@ -36,7 +36,6 @@
 #include "pflash/pflash_selection.h"
 #include "pflash/pflash_request_probe.h"
 #include "freeze_history.h"
-#include "tool_checks.h"
 
 #ifdef LUCE_HAS_CURL
 #include <curl/curl.h>
@@ -4491,14 +4490,14 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
             replan = "replanned";
         }
     }
-    if (tc::needs_final_check(messages, *reply)) {
+    if (tc::needs_final_check(messages, *reply, checked_calls_)) {
         json again;
         json * again_reply = pass(tc::with_note(request, *reply, tc::kFinalNote), again)
             ? tc::reply_message(again) : nullptr;
         json fresh = again_reply ? tc::fresh_calls(messages, *again_reply) : json::array();
         final_check = "done";
         if (!fresh.empty()) {
-            tc::mark_checked(fresh);
+            checked_calls_.add(fresh);
             (*again_reply)["tool_calls"] = std::move(fresh);
             response = std::move(again);
             final_check = "more_work";

@@ -69,7 +69,7 @@ same cached conversation, so it works for any model the server runs.
 3. A final answer after tool results gets one check per user request: the model
    goes through the request part by part against the tool results. The new
    turn replaces the answer only if it makes tool calls that have not already
-   failed. Those calls carry ids starting with `call_check_`, so the next final
+   failed. The server remembers the ids of those calls, so the next final
    answer of the same request goes out as is. An answer that ends by asking the
    user something is not checked.
 

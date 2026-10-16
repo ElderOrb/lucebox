@@ -98,26 +98,35 @@ static void test_replan() {
 }
 
 static void test_final_check() {
+    CheckedCalls checked;
     json messages = json::array({user("Cancel order 1 and email Tom.")});
-    CHECK(!needs_final_check(messages, answer("Done.")));  // no tool results yet
+    CHECK(!needs_final_check(messages, answer("Done."), checked));  // no tool results yet
 
     messages.push_back(assistant_calls(json::array({call("call_1", "get_order", "{\"id\":1}")})));
     messages.push_back(tool_result("call_1", "{\"status\":\"open\"}"));
-    CHECK(needs_final_check(messages, answer("Done.")));
-    CHECK(!needs_final_check(messages, answer("Which email address should I use?")));
-    CHECK(!needs_final_check(messages, assistant_calls(json::array({call("call_2", "send_email", "{}")}))));
+    CHECK(needs_final_check(messages, answer("Done."), checked));
+    CHECK(!needs_final_check(messages, answer("Which email address should I use?"), checked));
+    CHECK(!needs_final_check(messages, assistant_calls(json::array({call("call_2", "send_email", "{}")})), checked));
 
-    // A check already added work for this user request: the next answer goes out.
-    json checked = messages;
-    checked.push_back(assistant_calls(json::array({call("call_check_2", "send_email", "{}")})));
-    checked.push_back(tool_result("call_check_2", "sent"));
-    CHECK(!needs_final_check(checked, answer("Done.")));
+    // A check added work for this user request: the next answer goes out.
+    const json added = json::array({call("call_2", "send_email", "{}")});
+    checked.add(added);
+    json after = messages;
+    after.push_back(assistant_calls(added));
+    after.push_back(tool_result("call_2", "sent"));
+    CHECK(!needs_final_check(after, answer("Done."), checked));
     // A new user request gets a check again.
-    checked.push_back(answer("Done."));
-    checked.push_back(user("Now order 2."));
-    checked.push_back(assistant_calls(json::array({call("call_3", "get_order", "{\"id\":2}")})));
-    checked.push_back(tool_result("call_3", "{\"status\":\"open\"}"));
-    CHECK(needs_final_check(checked, answer("Done.")));
+    after.push_back(answer("Done."));
+    after.push_back(user("Now order 2."));
+    after.push_back(assistant_calls(json::array({call("call_3", "get_order", "{\"id\":2}")})));
+    after.push_back(tool_result("call_3", "{\"status\":\"open\"}"));
+    CHECK(needs_final_check(after, answer("Done."), checked));
+
+    // The set is bounded: the oldest ids leave first.
+    CheckedCalls small(2);
+    small.add(json::array({call("a", "x", "{}"), call("b", "x", "{}"), call("c", "x", "{}")}));
+    CHECK(!small.since_last_user(json::array({assistant_calls(json::array({call("a", "x", "{}")}))})));
+    CHECK(small.since_last_user(json::array({assistant_calls(json::array({call("c", "x", "{}")}))})));
 }
 
 static void test_fresh_calls() {
@@ -136,14 +145,7 @@ static void test_fresh_calls() {
     CHECK(fresh[0]["function"]["name"] == "send_email");
 }
 
-static void test_mark_and_note() {
-    json calls = json::array({call("call_abc", "send_email", "{}"), call("x1", "get_order", "{}")});
-    mark_checked(calls);
-    CHECK(calls[0]["id"] == "call_check_abc");
-    CHECK(calls[1]["id"] == "call_check_x1");
-    mark_checked(calls);
-    CHECK(calls[0]["id"] == "call_check_abc");
-
+static void test_note() {
     const json request = {{"messages", json::array({user("hi")})}};
     const json reply = assistant_calls(json::array({call("call_1", "get_order", "{}")}));
     const json next = with_note(request, reply, kReplanNote);
@@ -196,7 +198,7 @@ int main() {
     test_replan();
     test_final_check();
     test_fresh_calls();
-    test_mark_and_note();
+    test_note();
     test_sse();
     std::printf("test_tool_checks: %d checks passed\n", g_checks);
     return 0;
