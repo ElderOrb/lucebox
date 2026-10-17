@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <initializer_list>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -93,6 +94,55 @@ bool chose_thinking(const json & body) {
         }
     }
     return false;
+}
+
+bool lower_equals(const json & value, std::initializer_list<const char *> words) {
+    if (!value.is_string()) return false;
+    std::string text = value.get<std::string>();
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return (char) std::tolower(c); });
+    return std::any_of(words.begin(), words.end(),
+                       [&](const char * word) { return text == word; });
+}
+
+// A field that carries something: not null, false, 0, or an empty string,
+// array or object.
+bool is_set(const json & object, const char * key) {
+    if (!object.contains(key)) return false;
+    const json & value = object[key];
+    if (value.is_null()) return false;
+    if (value.is_boolean()) return value.get<bool>();
+    if (value.is_number()) return value != 0;
+    if (value.is_string()) return !value.get<std::string>().empty();
+    return !value.empty();
+}
+
+// A tool result reports a failure by its shape: a JSON object with a set
+// "error" or "errors" field, "is_error"/"isError" true, "success"/"ok" false,
+// or a "status" of "error" or "failed"; or plain text that starts with the
+// word "error". A result that only mentions errors is not a failure.
+bool reports_failure(const json & content) {
+    const std::string text = text_of(content);
+    const json parsed = json::parse(text, nullptr, false);
+    if (parsed.is_object()) {
+        auto is_false = [&](const char * key) {
+            return parsed.contains(key) && parsed[key].is_boolean() && !parsed[key].get<bool>();
+        };
+        return is_set(parsed, "error") || is_set(parsed, "errors") ||
+               (parsed.contains("is_error") && parsed["is_error"] == true) ||
+               (parsed.contains("isError") && parsed["isError"] == true) ||
+               is_false("success") || is_false("ok") ||
+               lower_equals(parsed.value("status", json()), {"error", "failed", "failure"});
+    }
+    size_t at = 0;
+    while (at < text.size() && std::isspace((unsigned char) text[at])) ++at;
+    static const std::string kWord = "error";
+    if (text.size() - at < kWord.size()) return false;
+    for (size_t i = 0; i < kWord.size(); ++i) {
+        if (std::tolower((unsigned char) text[at + i]) != kWord[i]) return false;
+    }
+    const size_t next = at + kWord.size();
+    return next == text.size() || !std::isalpha((unsigned char) text[next]);
 }
 
 bool asks_user(const json & reply) {
@@ -213,11 +263,10 @@ json fresh_calls(const json & messages, const json & reply) {
             for (const auto & call : calls_of(message)) by_id[string_field(call, "id")] = call_key(call);
         }
         for (const auto & message : messages) {
-            if (role_of(message) != "tool") continue;
-            std::string text = text_of(message.value("content", json()));
-            std::transform(text.begin(), text.end(), text.begin(),
-                           [](unsigned char c) { return (char) std::tolower(c); });
-            if (text.find("error") == std::string::npos) continue;
+            if (role_of(message) != "tool" ||
+                !reports_failure(message.value("content", json()))) {
+                continue;
+            }
             const auto found = by_id.find(string_field(message, "tool_call_id"));
             if (found != by_id.end()) failed.insert(found->second);
         }

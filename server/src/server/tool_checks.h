@@ -76,7 +76,10 @@ bool needs_replan(const json & reply);
 bool needs_final_check(const json & messages, const json & reply,
                        const CheckedCalls & checked);
 
-// The calls of `reply` that did not already fail earlier in `messages`.
+// The calls of `reply` that did not already fail earlier in `messages`. A call
+// failed when its tool result says so by its shape (an "error" field, a false
+// "success", a failed "status", or text starting with "error"), not when the
+// result merely mentions an error.
 json fresh_calls(const json & messages, const json & reply);
 
 // A chat.completion response as the SSE events a streaming client expects.

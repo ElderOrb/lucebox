@@ -143,6 +143,28 @@ static void test_fresh_calls() {
     const json fresh = fresh_calls(messages, again);
     CHECK(fresh.size() == 1);
     CHECK(fresh[0]["function"]["name"] == "send_email");
+
+    // A result fails by its shape; one that only mentions errors does not.
+    auto failed = [](const char * result) {
+        const json history = json::array({
+            user("Look up order 1."),
+            assistant_calls(json::array({call("call_1", "get_order", "{\"id\":1}")})),
+            tool_result("call_1", result),
+        });
+        const json retry = assistant_calls(json::array({call("call_2", "get_order", "{\"id\":1}")}));
+        return fresh_calls(history, retry).empty();
+    };
+    CHECK(failed("{\"error\": \"not found\"}"));
+    CHECK(failed("{\"errors\": [{\"message\": \"bad id\"}]}"));
+    CHECK(failed("{\"success\": false, \"message\": \"timeout\"}"));
+    CHECK(failed("{\"status\": \"FAILED\"}"));
+    CHECK(failed("{\"isError\": true, \"content\": []}"));
+    CHECK(failed("  error 503"));
+    CHECK(!failed("{\"error\": null, \"value\": 5}"));
+    CHECK(!failed("{\"errors\": 0, \"rows\": 3}"));
+    CHECK(!failed("{\"success\": true, \"note\": \"no error occurred\"}"));
+    CHECK(!failed("Order 1 shipped, no error occurred."));
+    CHECK(!failed("errors: none"));
 }
 
 static void test_note() {
