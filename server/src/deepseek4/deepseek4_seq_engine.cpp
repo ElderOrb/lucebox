@@ -136,13 +136,14 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit_images(
         const SamplerCfg & sampler, const ImagePromptHandle & images) {
     AdmitResult refused;
     refused.status = AdmitResult::Status::failed;
-    // DS4V image blocks need whole-block bidirectional prefill, which the
-    // 16-row gathered graph cannot run. Admission claims a slot, starts the
-    // image encode and seeds the slot with every prompt token but the last;
-    // later steps prefill that prefix into the slot's staging cache one shared
-    // layer-major pass at a time, copy it into the paged slot, and the last
-    // (text) token then prefills in the batch, yielding the first sampled
-    // token as usual.
+    // Image blocks prefill whole (V4's attend bidirectionally; V4.1's carry
+    // the image router bias and Engram mask), which the 16-row gathered graph
+    // cannot run. Admission claims a slot, starts the image encode and seeds
+    // the slot with every prompt token but the last; later steps prefill that
+    // prefix into the slot's staging cache (one shared layer-major pass at a
+    // time, or one chunk at a time on a heterogeneous placement), copy it into
+    // the paged slot, and the last (text) token then prefills in the batch,
+    // yielding the first sampled token as usual.
     const int prefix = int(prompt.size()) - 1;
     if (!supports_images() || prefix < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ||
         prompt.size() > size_t(b_.cache_.max_ctx)) {
@@ -212,36 +213,48 @@ constexpr int kHybridStagedRowsWithoutDecode = 2048;
 }  // namespace
 
 void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
-    if (b_.staged_text_uses_chunks()) {
+    if (b_.staged_text_uses_chunks() || b_.staged_images_use_chunks()) {
         // Heterogeneous placement: stage one bounded chunk of the oldest
-        // pending text prompt per step, so live decoders wait for at most
-        // one chunk rather than the whole prompt.
+        // pending prompt that can run per step, so live decoders wait for at
+        // most one chunk rather than the whole prompt. An image prompt whose
+        // next image is still encoding lets the next pending prompt go first.
+        const int rows = decoding ? kHybridStagedRowsWithDecode : kHybridStagedRowsWithoutDecode;
+        bool ran = false;
+        const DeepSeek4StagedPrefill * waiting_image = nullptr;
         for (auto & pending : pending_images_) {
             DeepSeek4StagedPrefill & staged = pending.staged;
-            if (staged.images || staged.finished() || !staged.staging) continue;
+            if (staged.finished() || !staged.staging) continue;
+            const bool image = bool(staged.images);
+            if (image ? !b_.staged_images_use_chunks() : !b_.staged_text_uses_chunks()) continue;
+            if (!b_.staged_chunk_ready(staged, rows)) {
+                if (!waiting_image) waiting_image = &staged;
+                continue;
+            }
             std::string error;
             const auto t0 = std::chrono::steady_clock::now();
             const int before = staged.done;
             // Each heterogeneous chunk pays a large fixed cost (every cold
             // expert's weights are read once per call), so chunks stay wide:
             // measured 306 rows in 3.2 s against 1842 rows in 7.7 s.
-            if (!b_.run_staged_text_chunk(
-                    staged, decoding ? kHybridStagedRowsWithDecode
-                                     : kHybridStagedRowsWithoutDecode, error)) {
+            if (!b_.run_staged_chunk(staged, rows, error)) {
                 // Intentionally terminal: the slot already holds the prompt
                 // as seeded rows, and a failure of this path (scratch or
                 // expert allocation) would most likely recur in the gathered
                 // prefill of the same rows. The request fails cleanly and its
                 // slot is released.
-                staged.error = error.empty() ? "staged text prefill failed" : error;
+                staged.error = error.empty() ? "staged prefill failed" : error;
             } else if (staged.done >= staged.prefix) {
-                std::fprintf(stderr, "[deepseek4] staged text prefill slot %d: %d rows, last chunk %d rows %.0f ms\n",
-                             pending.slot, staged.prefix, staged.done - before,
+                std::fprintf(stderr, "[deepseek4] staged %s prefill slot %d: %d rows, last chunk %d rows %.0f ms\n",
+                             image ? "image" : "text", pending.slot, staged.prefix, staged.done - before,
                              std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - t0).count());
             }
+            ran = true;
             break;
         }
+        // Nothing else to run: wait briefly for the encoder instead of
+        // spinning the scheduler.
+        if (!ran && idle && waiting_image) b_.wait_staged_ready(*waiting_image, rows, 20);
     }
     if (!staged_pass_ && !pending_images_.empty()) {
         std::vector<DeepSeek4StagedPrefill *> items;
@@ -252,6 +265,7 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
             for (auto & pending : pending_images_) {
                 if (pending.staged.finished() || bool(pending.staged.images) == bool(text)) continue;
                 if (text && b_.staged_text_uses_chunks()) continue;
+                if (!text && b_.staged_images_use_chunks()) continue;
                 items.push_back(&pending.staged);
                 slots.push_back(pending.slot);
             }

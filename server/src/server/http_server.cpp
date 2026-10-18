@@ -4240,7 +4240,8 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
             const ImageRequestPolicy image_policy{
                 req.format == ApiFormat::OPENAI_CHAT,
                 config_.image_input_enabled,
-                backend_.image_placeholder()};
+                backend_.image_placeholder(),
+                backend_.image_part_separator()};
             if (!prepare_request_images(req.messages, image_policy, normalized,
                                         encoded_images, extraction_error)) {
                 send_error(fd, 400, extraction_error);

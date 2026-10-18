@@ -89,6 +89,9 @@ public:
     void print_ready_banner() const override;
     bool supports_images() const override { return image_capable_ && vision_ != nullptr; }
     std::string image_placeholder() const override { return vision::DS4V_IMAGE_PLACEHOLDER; }
+    // DeepSeek V4 and V4.1 encoding.py join a message's text blocks, image
+    // placeholders included, with a blank line.
+    std::string image_part_separator() const override { return "\n\n"; }
     ImagePrepareStatus prepare_images(std::vector<int32_t> & tokens,
                                       std::vector<EncodedImage> images,
                                       uint64_t context_capacity,
@@ -309,6 +312,9 @@ private:
                    int prefix_tokens = 0,
                    const std::vector<int> & restore_points = {});
     bool load_vision();
+    // The loaded projector's image recipe: V4.1's for a V4.1 projector,
+    // V4's otherwise (the preprocessing and the image span both follow it).
+    vision::PreprocessConfig image_recipe() const;
     bool init_single_gpu_vision();
     // Encodes one image with the vision runtime (caller serialises use).
     bool encode_one_image(const vision::PromptImage & image, vision::ImageRaster & raster,
@@ -328,7 +334,7 @@ private:
     // --ds4-prefill sparse with paged serving: text prompts prefill through
     // the staging caches (layer-major sparse) and are copied into their slot.
     // A heterogeneous placement stages text only through the in-process
-    // expert path that run_staged_text_chunk() drives.
+    // expert path that run_staged_chunk() drives.
     bool text_staging_available() const {
         return text_staging_ &&
                (!w_.moe_hybrid ||
@@ -338,7 +344,21 @@ private:
     // heterogeneous experts, a text prompt stages one bounded chunk per call
     // through the regular sparse layer-major prefill instead.
     bool staged_text_uses_chunks() const { return text_staging_available() && w_.moe_hybrid; }
-    bool run_staged_text_chunk(StagedPrefill & item, int max_rows, std::string & error);
+    // Image prompts on a heterogeneous placement stage the same way: whole
+    // image blocks per chunk, each chunk once the encoder has published the
+    // rows of the images it holds.
+    bool staged_images_use_chunks() const {
+        return image_capable_ && vision_ && w_.moe_hybrid && moe_hybrid_ &&
+               (expert_runtime_.compute || expert_backend_);
+    }
+    // Rows the next chunk of `item` takes (whole image blocks for an image
+    // prompt), 0 when the remaining prefix cannot be chunked.
+    int staged_chunk_rows(const StagedPrefill & item, int max_rows) const;
+    // The next chunk can run now: a text prompt always, an image prompt once
+    // the images in that chunk are encoded.
+    bool staged_chunk_ready(const StagedPrefill & item, int max_rows) const;
+    // Prefills the next chunk of a text or image prompt into its staging cache.
+    bool run_staged_chunk(StagedPrefill & item, int max_rows, std::string & error);
     // Starts encoding an admitted image request: queued on the encoder
     // worker with --mmproj-device, otherwise encoded here.
     bool encode_image_request(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,

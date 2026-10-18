@@ -24,6 +24,7 @@
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/model_capabilities.h"
+#include "common/paged_attention_config.h"
 #include "common/spark_corpus.h"
 #include "common/moe_routing_collector.h"
 #include "common/moe_hybrid_routing_stats.h"
@@ -52,6 +53,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1331,12 +1333,18 @@ static std::set<std::string> & installed_env_defaults() {
 
 // Install a set of environment defaults. Variables that are already set keep
 // their value, and the log names the ones the operator set.
+// `leave_out` (optional) names defaults this launch must not install.
 static void apply_env_defaults(const std::string & owner,
-                               const std::vector<luce::server::LaunchProfileEnv> & defaults) {
+                               const std::vector<luce::server::LaunchProfileEnv> & defaults,
+                               bool (*leave_out)(std::string_view) = nullptr) {
     if (defaults.empty()) return;
     int applied = 0;
-    std::string kept_env;
+    std::string kept_env, left_out;
     for (const luce::server::LaunchProfileEnv & env : defaults) {
+        if (leave_out && leave_out(env.name)) {
+            left_out += std::string(left_out.empty() ? "" : ", ") + env.name;
+            continue;
+        }
         if (std::getenv(env.name)) {
             if (!installed_env_defaults().count(env.name)) {
                 kept_env += std::string(kept_env.empty() ? "" : ", ") + env.name;
@@ -1347,14 +1355,20 @@ static void apply_env_defaults(const std::string & owner,
         installed_env_defaults().insert(env.name);
         ++applied;
     }
-    std::fprintf(stderr, "[server] %s: %d environment defaults applied%s%s\n",
+    std::fprintf(stderr, "[server] %s: %d environment defaults applied%s%s%s%s\n",
                  owner.c_str(), applied,
                  kept_env.empty() ? "" : "; kept explicit ",
-                 kept_env.c_str());
+                 kept_env.c_str(),
+                 left_out.empty() ? "" : "; left out (not qualified with this launch) ",
+                 left_out.c_str());
 }
 
-static void apply_launch_profile_env(const luce::server::LaunchProfile & profile) {
-    apply_env_defaults(std::string("profile ") + profile.name, profile.env);
+// Paged DeepSeek V4.1 serving is qualified with the default expert-owner
+// kernels only: the profile's TP switches stay out under --paged-attention.
+static void apply_launch_profile_env(const luce::server::LaunchProfile & profile,
+                                     bool paged_deepseek41) {
+    apply_env_defaults(std::string("profile ") + profile.name, profile.env,
+                       paged_deepseek41 ? &luce::common::deepseek41_paged_unqualified_env : nullptr);
 }
 
 static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_model) {
@@ -1362,7 +1376,11 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     if (model.bargs.cluster.enabled()) {
         apply_env_defaults("cluster mode", luce::server::cluster_launch_env());
     }
-    if (model.profile) apply_launch_profile_env(*model.profile);
+    if (model.profile) {
+        const bool paged_deepseek41 = model.bargs.paged_attention &&
+            inspect_gguf_model_info(model.bargs.model_path.c_str()).arch == "deepseek41";
+        apply_launch_profile_env(*model.profile, paged_deepseek41);
+    }
     if (!model.adaptive_experts_tau.empty())
         set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
     if (!model.kvflash_pool.empty())
