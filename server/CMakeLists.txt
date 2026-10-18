@@ -1746,6 +1746,17 @@ if(LUCE_TESTS)
             target_link_libraries(test_ds41v_vision PRIVATE hip::host)
         endif()
         list(APPEND _raw_unit_test_targets test_ds41v_vision)
+        # The same image path on a real projector, dumped for the reference
+        # comparison (scripts/ds41v_reference_check.py); skips without one.
+        add_executable(test_ds41v_encoder_dump test/unit/test_ds41v_encoder_dump.cpp)
+        target_include_directories(test_ds41v_encoder_dump PRIVATE ${LUCE_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_link_libraries(test_ds41v_encoder_dump PRIVATE luce_common ggml ggml-cpu ${LUCE_GGML_BACKEND_TARGET} ggml-base)
+        if(LUCE_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(test_ds41v_encoder_dump PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_ds41v_encoder_dump PRIVATE hip::host)
+        endif()
+        list(APPEND _raw_unit_test_targets test_ds41v_encoder_dump)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_deepseek4_roctx.cpp")
         add_executable(test_deepseek4_roctx
@@ -2371,6 +2382,16 @@ if(LUCE_TESTS)
         src/deepseek4/deepseek4_image_prompt.cpp
         src/deepseek4/deepseek4_vision_preprocess.cpp
         src/common/vision/image_resize.cpp)
+    # DeepSeek V4.1 image input (plans checked against image_processor.py).
+    add_executable(test_ds41v_image test/unit/test_ds41v_image.cpp
+        src/deepseek4/deepseek4_image_prompt.cpp
+        src/deepseek4/deepseek4_vision_preprocess.cpp
+        src/deepseek4/deepseek4_image_assembly.cpp
+        src/deepseek4/deepseek4_image_policy.cpp
+        src/common/vision/image_resize.cpp)
+    target_include_directories(test_ds41v_image PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4)
+    list(APPEND _raw_unit_test_targets test_ds41v_image)
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_moe_source_page_range.cpp")
         add_executable(test_moe_source_page_range test/unit/test_moe_source_page_range.cpp)
