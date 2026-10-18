@@ -1675,6 +1675,79 @@ static void test_engram_apply_synthetic(ggml_backend_t backend, const char * nam
     std::fprintf(stderr, " out %.2e gate %.2e %s\n", e.out_rel, e.gate_abs, g_failures ? "done" : "ok");
 }
 
+// Image positions (V4.1 image input): the runner's dead mask shuts their gate,
+// so their copies come back bit for bit, while every text position gets exactly
+// the update it gets without a mask. Runs on 300 tokens (two runner parts, a
+// dead run across the boundary).
+static void test_engram_apply_image_rows_untouched(ggml_backend_t backend, const char * name) {
+    std::fprintf(stderr, "  test_engram_apply_image_rows_untouched (%s) ...", name);
+    constexpr int n_embd = 128, n_hc = 4, key_width = 6 * 32, n_tokens = 300;
+    TestLcg rng(20261018u);
+    const bool f32_weights = ggml_backend_is_cpu(backend);
+    const int n_out = n_embd * (n_hc + 1);
+    std::vector<float> wkv((size_t) key_width * n_out), q((size_t) n_embd * n_hc), k(q.size()),
+                       keys((size_t) key_width * n_tokens), h((size_t) n_embd * n_hc * n_tokens);
+    for (auto & v : wkv) v = ggml_fp16_to_fp32(ggml_fp32_to_fp16(0.08f * rng.next()));
+    for (auto & v : q) v = 1.0f + 0.5f * rng.next();
+    for (auto & v : k) v = 1.0f + 0.5f * rng.next();
+    for (auto & v : keys) v = ggml_fp16_to_fp32(ggml_fp32_to_fp16(2.0f * rng.next()));
+    for (auto & v : h) v = 3.0f * rng.next();
+    std::vector<uint8_t> dead((size_t) n_tokens, 0);
+    for (int t = 10; t < 41; ++t) dead[(size_t) t] = 1;
+    for (int t = 250; t < 262; ++t) dead[(size_t) t] = 1;   // across the 256-token part boundary
+    dead[(size_t) n_tokens - 1] = 1;
+
+    ggml_init_params params{};
+    params.mem_size = 16 * ggml_tensor_overhead();
+    params.no_alloc = true;
+    ggml_context * wctx = ggml_init(params);
+    ggml_tensor * wkv_t = ggml_new_tensor_2d(wctx, f32_weights ? GGML_TYPE_F32 : GGML_TYPE_F16, key_width, n_out);
+    ggml_tensor * q_t = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, n_hc);
+    ggml_tensor * k_t = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, n_embd, n_hc);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    TEST_ASSERT_MSG(wbuf != nullptr, "engram weight buffer");
+    if (!wbuf) { ggml_free(wctx); return; }
+    if (f32_weights) {
+        ggml_backend_tensor_set(wkv_t, wkv.data(), 0, wkv.size() * sizeof(float));
+    } else {
+        std::vector<ggml_fp16_t> wkv16(wkv.size());
+        ggml_fp32_to_fp16_row(wkv.data(), wkv16.data(), (int64_t) wkv.size());
+        ggml_backend_tensor_set(wkv_t, wkv16.data(), 0, wkv16.size() * sizeof(ggml_fp16_t));
+    }
+    ggml_backend_tensor_set(q_t, q.data(), 0, q.size() * sizeof(float));
+    ggml_backend_tensor_set(k_t, k.data(), 0, k.size() * sizeof(float));
+    DeepSeek4Layer L{};
+    L.engram_wkv = wkv_t;
+    L.engram_q = q_t;
+    L.engram_k = k_t;
+
+    std::vector<float> plain = h, masked = h;
+    DeepSeek4EngramApplyRunner runner;
+    TEST_ASSERT_MSG(runner.run(backend, L, n_embd, n_hc, 1e-20f, plain.data(), keys.data(), n_tokens),
+                    "engram apply without a mask");
+    TEST_ASSERT_MSG(runner.run(backend, L, n_embd, n_hc, 1e-20f, masked.data(), keys.data(), n_tokens,
+                               dead.data()), "engram apply with image rows");
+    const size_t row = (size_t) n_embd * n_hc;
+    size_t image_changed = 0, text_differs = 0, text_updated = 0;
+    for (int t = 0; t < n_tokens; ++t) {
+        const size_t at = (size_t) t * row;
+        const bool same_as_input = std::memcmp(masked.data() + at, h.data() + at, row * sizeof(float)) == 0;
+        if (dead[(size_t) t]) {
+            image_changed += !same_as_input;
+        } else {
+            text_differs += std::memcmp(masked.data() + at, plain.data() + at, row * sizeof(float)) != 0;
+            text_updated += !same_as_input;
+        }
+    }
+    TEST_ASSERT_MSG(image_changed == 0, "an image position was updated");
+    TEST_ASSERT_MSG(text_differs == 0, "a text position differs from the unmasked apply");
+    TEST_ASSERT_MSG(text_updated > 0, "the text positions were not updated at all");
+    runner.release();
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(wctx);
+    std::fprintf(stderr, " %s\n", image_changed == 0 && text_differs == 0 ? "ok" : "FAILED");
+}
+
 // The released tables and weights (LUCE_DS4_ENGRAM_GGUF=<V4.1 GGUF>): hash a
 // token run, read its rows through the runtime (in two chunks, carrying the
 // n-gram context), and apply each Engram layer on `backend` against the
@@ -9334,6 +9407,7 @@ int main(int argc, char ** argv) {
     test_indexer_score_cpu(backend);
     test_indexer_mask_cpu(backend);
     test_engram_apply_synthetic(backend, "cpu");
+    test_engram_apply_image_rows_untouched(backend, "cpu");
     test_engram_apply_released_weights(backend, "cpu");
     test_v41_indexer_topk(backend, "cpu");
     test_v41_candidate_blocks(backend, "cpu");
@@ -9402,6 +9476,7 @@ int main(int argc, char ** argv) {
         if (gpu) {
             for (int mode = 0; mode < 3; ++mode) test_dspark_compressor_rollback(gpu, mode);
             test_engram_apply_synthetic(gpu, "gpu");
+            test_engram_apply_image_rows_untouched(gpu, "gpu");
             test_engram_apply_released_weights(gpu, "gpu");
             test_v41_indexer_topk(gpu, "gpu");
             test_v41_candidate_blocks(gpu, "gpu");
