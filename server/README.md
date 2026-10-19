@@ -403,6 +403,7 @@ lists both, the validated overrides and the active experiments.
 | `--prefill-curve T:R [T:R ...]` | none (the release curve with a head) | Piecewise keep-ratio curve; overrides the flat ratio. |
 | `--prefill-drafter <path>` | none | PFlash drafter GGUF (Qwen3.5-0.8B). |
 | `--prefill-skip-park` | off | Keep target and decode draft resident while PFlash runs. |
+| `--prefill-drafter-device <backend:gpu>` | the `--draft-device` | Device the PFlash drafter scores on, in process: a GPU on the target's backend, with one explicit `--target-device` (not `auto` or `--target-devices`). On another GPU than the target, concurrent serving reserves nothing for it in the paged pool and a single request is not parked, so the target's GPU keeps its memory for context. |
 | `--prefill-upstream-base <URL>` | none | Enable compression-proxy mode. |
 | `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
 | `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |

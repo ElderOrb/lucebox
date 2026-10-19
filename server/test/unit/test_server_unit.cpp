@@ -7023,6 +7023,67 @@ TEST_CASE(ServerUnitFixture, test_pflash_placement_disabled_never_remote) {
     TEST_ASSERT(!placement.remote.enabled());
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_drafter_device_overrides_the_decode_drafters) {
+    DevicePlacement draft;
+    draft.backend = PlacementBackend::Hip;
+    draft.gpu = 0;
+    DevicePlacement own;
+    own.backend = PlacementBackend::Hip;
+    own.gpu = 1;
+    TEST_ASSERT(pflash_drafter_device(draft, std::nullopt).gpu == 0);
+    TEST_ASSERT(pflash_drafter_device(draft, own).gpu == 1);
+
+    RemoteDraftConfig remote;
+    remote.ipc_bin = "/tmp/backend_ipc_daemon";
+    auto placement = resolve_pflash_drafter_placement(
+        draft, pflash_drafter_device(draft, own), remote, /*pflash_enabled=*/true);
+    TEST_ASSERT(placement.drafter_gpu == 1);
+    // Same backend on another GPU: scored in process, not through IPC.
+    TEST_ASSERT(!placement.remote_drafter);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_drafter_beside_target) {
+    DevicePlacement target;
+    target.backend = PlacementBackend::Hip;
+    target.gpu = 0;
+    DevicePlacement same = target;
+    DevicePlacement other = target;
+    other.gpu = 1;
+    DevicePlacement unset;
+    unset.backend = PlacementBackend::Auto;
+    unset.gpu = 0;
+    // No device of its own: it follows the decode drafter, on the target's GPU.
+    TEST_ASSERT(pflash_drafter_beside_target(target, std::nullopt));
+    TEST_ASSERT(pflash_drafter_beside_target(target, same));
+    TEST_ASSERT(!pflash_drafter_beside_target(target, other));
+    // An unset backend is the compiled one, so hip:0 and auto:0 are one GPU here.
+    if (compiled_placement_backend() == PlacementBackend::Hip) {
+        TEST_ASSERT(pflash_drafter_beside_target(target, unset));
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_drafter_device_refusal) {
+    DevicePlacement target;
+    target.backend = PlacementBackend::Hip;
+    target.gpu = 0;
+    DevicePlacement other = target;
+    other.gpu = 1;
+    // Without its own device nothing is refused, whatever the target.
+    TEST_ASSERT(pflash_drafter_device_refusal(target, true, std::nullopt) == nullptr);
+    // Another GPU on the target's backend scores in process.
+    TEST_ASSERT(pflash_drafter_device_refusal(target, false, other) == nullptr);
+    // auto picks the target's GPU after the pool and parking are sized.
+    TEST_ASSERT(pflash_drafter_device_refusal(target, true, other) != nullptr);
+    // A layer-split target loads its drafter on its first GPU.
+    DevicePlacement split;
+    TEST_ASSERT(parse_placement_device_list("hip:0,hip:1", split));
+    TEST_ASSERT(pflash_drafter_device_refusal(split, false, other) != nullptr);
+    // Another backend would need the IPC drafter.
+    DevicePlacement cuda = other;
+    cuda.backend = target.backend == PlacementBackend::Cuda ? PlacementBackend::Hip : PlacementBackend::Cuda;
+    TEST_ASSERT(pflash_drafter_device_refusal(target, false, cuda) != nullptr);
+}
+
 TEST_CASE(ServerUnitFixture, test_draft_residency_parse) {
     DraftResidencyPolicy policy = DraftResidencyPolicy::Auto;
     TEST_ASSERT(parse_draft_residency_policy("auto", policy));
