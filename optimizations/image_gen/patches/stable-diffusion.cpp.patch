@@ -1,0 +1,265 @@
+diff --git a/examples/common/media_io.cpp b/examples/common/media_io.cpp
+index baac6d2..04fe6bd 100644
+--- a/examples/common/media_io.cpp
++++ b/examples/common/media_io.cpp
+@@ -18,6 +18,19 @@
+ #define STBI_WINDOWS_UTF8
+ #include "stb_image.h"
+ 
++// PNG deflate through miniz (built in for zip support) at level 1: ~4x faster than stb's own compressor on a
++// 1024x1024 image and the file is smaller; PNG stays lossless at any level.
++extern "C" void* tdefl_compress_mem_to_heap(const void* src, size_t src_len, size_t* out_len, int flags);
++extern "C" unsigned int tdefl_create_comp_flags_from_zip_params(int level, int window_bits, int strategy);
++
++static unsigned char* png_zlib_compress(unsigned char* data, int data_len, int* out_len, int /*quality*/) {
++    size_t len = 0;
++    void* out  = tdefl_compress_mem_to_heap(data, (size_t)data_len, &len, (int)tdefl_create_comp_flags_from_zip_params(1, 15, 0));
++    *out_len   = (int)len;
++    return (unsigned char*)out;
++}
++
++#define STBIW_ZLIB_COMPRESS png_zlib_compress
+ #define STB_IMAGE_WRITE_IMPLEMENTATION
+ #define STB_IMAGE_WRITE_STATIC
+ #define STBIW_WINDOWS_UTF8
+diff --git a/src/core/ggml_extend.cpp b/src/core/ggml_extend.cpp
+index 64c1533..0ebd542 100644
+--- a/src/core/ggml_extend.cpp
++++ b/src/core/ggml_extend.cpp
+@@ -684,15 +684,20 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
+         }
+         k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+ 
+-        v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
+-        v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
+-        if (pad_head) {
+-            v_in = ggml_pad(ctx, v_in, static_cast<int>(64 - d_head), 0, 0, 0);
+-        }
+-        if (kv_scale != 1.0f) {
+-            v_in = ggml_ext_scale(ctx, v_in, kv_scale);
++        v_in = ggml_permute(ctx, v_in, 0, 2, 1, 3);
++        if (pad_head || kv_scale != 1.0f) {
++            v_in = ggml_reshape_3d(ctx, ggml_ext_cont(ctx, v_in), d_head, L_k, n_kv_head * N);
++            if (pad_head) {
++                v_in = ggml_pad(ctx, v_in, static_cast<int>(64 - d_head), 0, 0, 0);
++            }
++            if (kv_scale != 1.0f) {
++                v_in = ggml_ext_scale(ctx, v_in, kv_scale);
++            }
++            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
++        } else {
++            // One strided copy does the permute and the f16 cast.
++            v_in = ggml_reshape_3d(ctx, ggml_cast(ctx, v_in, GGML_TYPE_F16), d_head, L_k, n_kv_head * N);
+         }
+-        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+ 
+         if (mask_in != nullptr) {
+             // ggml_flash_attn_ext expects the mask as a contiguous F16 tensor shaped
+@@ -786,18 +791,36 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
+         // if (flash_attn) {
+         //     LOG_VERBOSE("fallback to default attention, L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
+         // }
+-        v = ggml_ext_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [N, n_kv_head, d_head, L_k]
+-        v = ggml_reshape_3d(ctx, v, L_k, d_head, n_kv_head * N);   // [N * n_kv_head, d_head, L_k]
++        // Flash attention asked for but unsupported for this shape (one 512-wide head in the image VAEs): run its
++        // math, f16 inputs with f32 accumulation, as two f16 GEMMs instead of two f32 GEMMs.
++        const bool f16_inputs = flash_attn;
++        auto to_f16           = [&](ggml_tensor* t) {
++            return t->type == GGML_TYPE_F16 ? t : ggml_cast(ctx, t, GGML_TYPE_F16);
++        };
++        if (f16_inputs) {
++            q = to_f16(q);
++            k = to_f16(k);
++            v = to_f16(ggml_permute(ctx, v, 1, 2, 0, 3));  // [N, n_kv_head, d_head, L_k]
++        } else {
++            v = ggml_ext_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [N, n_kv_head, d_head, L_k]
++        }
++        v = ggml_reshape_3d(ctx, v, L_k, d_head, n_kv_head * N);  // [N * n_kv_head, d_head, L_k]
+ 
+         auto kq = ggml_mul_mat(ctx, k, q);  // [N * n_head, L_q, L_k]
+         ggml_prec_set_acc(kq, GGML_PREC_F32);
+-        kq = ggml_scale_inplace(ctx, kq, scale);
+         if (mask) {
++            kq = ggml_scale_inplace(ctx, kq, scale);
+             kq = ggml_add_inplace(ctx, kq, mask);
++            kq = ggml_soft_max_inplace(ctx, kq);
++        } else {
++            kq = ggml_soft_max_ext_inplace(ctx, kq, nullptr, scale, 0.0f);
++        }
++        if (f16_inputs) {
++            kq = to_f16(kq);
+         }
+-        kq = ggml_soft_max_inplace(ctx, kq);
+ 
+         kqv = ggml_mul_mat(ctx, v, kq);  // [N * n_head, L_q, d_head]
++        ggml_prec_set_acc(kqv, GGML_PREC_F32);
+ 
+         kqv = ggml_reshape_4d(ctx, kqv, d_head, L_q, n_head, N);  // [N, n_head, L_q, d_head]
+         kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);                 // [N, L_q, n_head, d_head]
+diff --git a/src/model/common/ggml_block.hpp b/src/model/common/ggml_block.hpp
+index 7529848..874d27b 100644
+--- a/src/model/common/ggml_block.hpp
++++ b/src/model/common/ggml_block.hpp
+@@ -934,16 +934,22 @@ public:
+           eps(eps),
+           elementwise_affine(elementwise_affine) {}
+ 
+-    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+-        if (!elementwise_affine) {
+-            return ggml_rms_norm(ctx->ggml_ctx, x, eps);
+-        }
++    // The affine weight, adapter-patched, for callers that fold a per-channel scale into it.
++    ggml_tensor* get_weight(GGMLRunnerContext* ctx) {
+         ggml_tensor* w = params["weight"];
+         if (ctx->weight_adapter) {
+             w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
+         }
+-        x = ggml_rms_norm(ctx->ggml_ctx, x, eps);
+-        x = ggml_mul_inplace(ctx->ggml_ctx, x, w);
++        return w;
++    }
++
++    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
++        if (!elementwise_affine) {
++            return ggml_rms_norm(ctx->ggml_ctx, x, eps);
++        }
++        ggml_tensor* w = get_weight(ctx);
++        x              = ggml_rms_norm(ctx->ggml_ctx, x, eps);
++        x              = ggml_mul_inplace(ctx->ggml_ctx, x, w);
+         return x;
+     }
+ };
+diff --git a/src/model/diffusion/moss_image.hpp b/src/model/diffusion/moss_image.hpp
+index f1cbbc7..6d32b51 100644
+--- a/src/model/diffusion/moss_image.hpp
++++ b/src/model/diffusion/moss_image.hpp
+@@ -53,13 +53,21 @@ namespace MOSSImage {
+         }
+     };
+ 
++    // 4*tanh(gate/4)*sigmoid(gate) * 25*tanh(hidden/25), one GLU kernel.
+     inline ggml_tensor* situ(ggml_context* c, ggml_tensor* hidden, ggml_tensor* gate) {
+-        auto a = ggml_scale(c, ggml_tanh(c, ggml_scale(c, gate, 0.25f)), 4.f);
+-        a      = ggml_mul(c, a, ggml_sigmoid(c, gate));
+-        auto b = ggml_scale(c, ggml_tanh(c, ggml_scale(c, hidden, 1.f / 25.f)), 25.f);
+-        return ggml_mul(c, a, b);
++        return ggml_situ(c, gate, hidden, 4.f, 25.f);
+     }
+ 
++    // The block modulation, shared by every block of one forward: shift, 1 + scale and gate, for attention and FFN.
++    struct Modulation {
++        ggml_tensor* shift1;
++        ggml_tensor* scale1;
++        ggml_tensor* gate1;
++        ggml_tensor* shift2;
++        ggml_tensor* scale2;
++        ggml_tensor* gate2;
++    };
++
+     struct TextBlock : public GGMLBlock {
+         MOSSImageConfig config;
+ 
+@@ -113,31 +121,38 @@ namespace MOSSImage {
+             blocks["proj.ffn_down"]    = std::make_shared<Linear>(config.ffn_dim, config.dim, false);
+         }
+ 
+-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, ggml_tensor* mod) {
++        // norm1 and norm2 weights times (1 + scale), so rms_norm * weight + shift is one fused norm kernel. They must be in
++        // the graph before the block, or they land between the norm and its multiply and the backend cannot fuse.
++        std::pair<ggml_tensor*, ggml_tensor*> modulated_norm_weights(GGMLRunnerContext* ctx, const Modulation& mod) {
++            auto weight = [&](const char* name) { return std::dynamic_pointer_cast<RMSNorm>(blocks[name])->get_weight(ctx); };
++            return {ggml_mul(ctx->ggml_ctx, weight("norm1"), mod.scale1), ggml_mul(ctx->ggml_ctx, weight("norm2"), mod.scale2)};
++        }
++
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, const Modulation& mod, std::pair<ggml_tensor*, ggml_tensor*> norm_weights) {
+             auto c      = ctx->ggml_ctx;
+             auto linear = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, h); };
+             auto norm   = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<RMSNorm>(blocks[name])->forward(ctx, h); };
+-            auto part   = [&](int i) { return ggml_ext_slice(c, mod, 0, i * config.dim, (i + 1) * config.dim); };
+-            auto y      = norm("norm1", x);
+-            y           = ggml_add(c, ggml_add(c, y, ggml_mul(c, y, part(1))), part(0));
++            auto y      = ggml_add(c, ggml_mul(c, ggml_rms_norm(c, x, 1e-6f), norm_weights.first), mod.shift1);
+             auto qkv    = linear("proj.qkv", y);
+-            auto split  = [&](int i) {
+-                return ggml_reshape_4d(c, ggml_ext_slice(c, qkv, 0, i * config.dim, (i + 1) * config.dim), config.head_dim, config.dim / config.head_dim, x->ne[1], x->ne[2]);
++            // q, k and v as [head_dim, heads, tokens] views of qkv: the norms and the attention read them in place.
++            auto split = [&](int i) {
++                return ggml_view_4d(c, qkv, config.head_dim, config.dim / config.head_dim, qkv->ne[1], qkv->ne[2], config.head_dim * ggml_element_size(qkv),
++                                    qkv->nb[1], qkv->nb[2], i * config.dim * ggml_element_size(qkv));
+             };
+-            auto q       = norm("q_norm", split(0));
+-            auto k       = norm("k_norm", split(1));
+-            auto v       = split(2);
+-            y            = Rope::attention(ctx, q, k, v, pe, nullptr, 1.f, false);
+-            y            = linear("proj.o", y);
+-            y            = ggml_mul(c, y, part(2));
+-            x            = ggml_add(c, x, y);
+-            y            = norm("norm2", x);
+-            y            = ggml_add(c, ggml_add(c, y, ggml_mul(c, y, part(4))), part(3));
+-            auto up_gate = linear("proj.ffn_up_gate", y);
+-            y            = situ(c, ggml_ext_slice(c, up_gate, 0, 0, config.ffn_dim), ggml_ext_slice(c, up_gate, 0, config.ffn_dim, 2 * config.ffn_dim));
+-            y            = linear("proj.ffn_down", y);
+-            y            = ggml_mul(c, y, part(5));
+-            return ggml_add(c, x, y);
++            // Out-of-place multiply: the backend fuses rms_norm, the weight, rope and K's f16 cast into one kernel.
++            auto head_norm = [&](const char* name, ggml_tensor* h) {
++                return ggml_mul(c, ggml_rms_norm(c, h, 1e-6f), std::dynamic_pointer_cast<RMSNorm>(blocks[name])->get_weight(ctx));
++            };
++            auto q = head_norm("q_norm", split(0));
++            auto k = head_norm("k_norm", split(1));
++            auto v = split(2);
++            y      = Rope::attention(ctx, q, k, v, pe, nullptr, 1.f, false);
++            y      = linear("proj.o", y);
++            x      = ggml_add(c, x, ggml_mul(c, y, mod.gate1));
++            y      = ggml_add(c, ggml_mul(c, ggml_rms_norm(c, x, 1e-6f), norm_weights.second), mod.shift2);
++            y      = ggml_situ_swapped(c, linear("proj.ffn_up_gate", y), 4.f, 25.f);
++            y      = linear("proj.ffn_down", y);
++            return ggml_add(c, x, ggml_mul(c, y, mod.gate2));
+         }
+     };
+ 
+@@ -162,7 +177,7 @@ namespace MOSSImage {
+             blocks["final_linear_video"] = std::make_shared<Linear>(config.dim, config.channels, false);
+         }
+ 
+-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* image, ggml_tensor* time, ggml_tensor* text, ggml_tensor* pe, const std::vector<int>& skip) {
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_cgraph* gf, ggml_tensor* image, ggml_tensor* time, ggml_tensor* text, ggml_tensor* pe, const std::vector<int>& skip) {
+             auto c            = ctx->ggml_ctx;
+             auto linear       = [&](const char* name, ggml_tensor* h) { return std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx, h); };
+             int64_t image_len = image->ne[0] * image->ne[1];
+@@ -175,10 +190,24 @@ namespace MOSSImage {
+             time      = linear("time_embedding.2", ggml_silu(c, linear("time_embedding.0", time)));
+             auto mod  = linear("shared_block_modulation", time);
+             auto head = linear("video_head_modulation", time);
+-            x         = ggml_concat(c, x, text, 1);
++            auto part = [&](int i) { return ggml_ext_slice(c, mod, 0, i * config.dim, (i + 1) * config.dim); };
++            Modulation m{part(0), ggml_scale_bias(c, part(1), 1.f, 1.f), part(2), part(3), ggml_scale_bias(c, part(4), 1.f, 1.f), part(5)};
++            auto block = [&](int64_t i) { return std::dynamic_pointer_cast<Block>(blocks["layers." + std::to_string(i)]); };
++            std::vector<std::pair<ggml_tensor*, ggml_tensor*>> norm_weights(config.depth);
++            for (int64_t i = 0; i < config.depth; ++i) {
++                if (std::find(skip.begin(), skip.end(), i) == skip.end()) {
++                    norm_weights[i] = block(i)->modulated_norm_weights(ctx, m);
++                    ggml_build_forward_expand(gf, norm_weights[i].first);
++                    ggml_build_forward_expand(gf, norm_weights[i].second);
++                }
++            }
++            for (auto t : {m.shift1, m.gate1, m.shift2, m.gate2}) {
++                ggml_build_forward_expand(gf, t);
++            }
++            x = ggml_concat(c, x, text, 1);
+             for (int64_t i = 0; i < config.depth; ++i) {
+                 if (std::find(skip.begin(), skip.end(), i) == skip.end()) {
+-                    x = std::dynamic_pointer_cast<Block>(blocks["layers." + std::to_string(i)])->forward(ctx, x, pe, mod);
++                    x = block(i)->forward(ctx, x, pe, m, norm_weights[i]);
+                     sd::ggml_graph_cut::mark_graph_cut(x, "moss_image.layers." + std::to_string(i), "x");
+                 }
+             }
+@@ -251,7 +280,7 @@ namespace MOSSImage {
+                 set_backend_tensor_data(pe, pe_data.data());
+                 set_backend_tensor_data(time, time_data.data());
+                 auto ctx = get_context();
+-                ggml_build_forward_expand(gf, model.forward(&ctx, x, time, text, pe, skip));
++                ggml_build_forward_expand(gf, model.forward(&ctx, gf, x, time, text, pe, skip));
+                 return gf;
+             };
+             return restore_trailing_singleton_dims(GGMLRunner::compute(graph, n_threads, false), inputs.x->dim());
