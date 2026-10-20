@@ -3376,6 +3376,21 @@ int DeepSeek4Backend::restore_safe_prefill_tokens(int pos, int requested_tokens,
         ? *next - pos : requested_tokens;
 }
 
+// The first chunk after a restored prefix. A restore point fewer than
+// DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS rows past the restore would leave a chunk
+// for the decode-shaped path, which at a long context runs out of memory beside
+// the model. PFlash re-renders the end of the last turn, so its snapshot can land
+// a few tokens before the next turn's boundary. That chunk runs on to the next
+// restore point instead, and the chunks after it still match a cold prefill.
+int DeepSeek4Backend::restored_prefill_first_tokens(int pos, int requested_tokens,
+                                                    const std::vector<int> & restore_points) {
+    int n_tok = restore_safe_prefill_tokens(pos, requested_tokens, restore_points);
+    while (n_tok < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS && n_tok < requested_tokens) {
+        n_tok += restore_safe_prefill_tokens(pos + n_tok, requested_tokens - n_tok, restore_points);
+    }
+    return n_tok;
+}
+
 bool DeepSeek4Backend::init_moe_tensor_parallel() {
     if (!moe_hybrid_) {
         std::fprintf(stderr,
@@ -4518,7 +4533,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // A batched chunk's numerics depend on where it starts. Start one at
         // every position a later request may restore from, so the chunks after
         // a restore are exactly the ones a cold prefill of the prompt runs.
-        n_tok = restore_safe_prefill_tokens(pos, n_tok, restore_points);
+        n_tok = kv_offset > 0 && i == 0
+            ? restored_prefill_first_tokens(pos, n_tok, restore_points)
+            : restore_safe_prefill_tokens(pos, n_tok, restore_points);
         // The replay rows start a chunk of their own.
         if (replay && i < replay_from && i + n_tok > replay_from) {
             n_tok = replay_from - i;
