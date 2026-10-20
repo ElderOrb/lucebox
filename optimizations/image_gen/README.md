@@ -3,31 +3,32 @@
 </p>
 
 <p align="center">
-  <img src="hero.png" width="760" alt="Two 1024x1024 MOSS-Image outputs from this build at 8 steps: a vintage travel poster with the word LUCEBOX over a mountain lake, and a red bicycle against a stone wall in a narrow street" />
+  <img src="hero.png" width="760" alt="Two 1024x1024 MOSS-Image outputs from this build at 8 steps of er_sde and CFG 2.5: a vintage travel poster with the word LUCEBOX over a mountain lake, and a red bicycle against a stone wall in a narrow street" />
 </p>
 
 <h1 align="center">MOSS-Image on one R9700</h1>
 
 <p align="center">
-  <strong>A 1024×1024 image in 3.0 s on one Radeon AI PRO R9700, from the full 5B model.</strong><br/>
-  MOSS-Image SFT, 8 steps, int8 convrot weights, no distillation and no step caching.<br/>
+  <strong>A 1024×1024 image in 3.2 s on one Radeon AI PRO R9700, from the full 5B model.</strong><br/>
+  MOSS-Image SFT, 8 steps of er_sde, int8 convrot weights, no distillation and no step caching; 5.9 s at CFG 2.5, as in the pictures above.<br/>
   Our own int8 GEMMs, attention and VAE kernels for RDNA4, closer to the bf16 model than stock stable-diffusion.cpp.<br/>
-  <strong>1.5×</strong> a DGX Spark running ComfyUI on the same diffusion weights, <strong>1.9×</strong> on a new prompt.
+  <strong>1.4×</strong> a DGX Spark running ComfyUI on the same diffusion weights and sampler, <strong>1.8×</strong> on a new prompt.
 </p>
 
 ---
 
 ```
-MOSS-Image SFT · 1024×1024 · 8 steps · CFG 1 · warm server · median per image
+MOSS-Image SFT · 1024×1024 · 8 steps of er_sde · CFG 1 · warm server · median per image
 
-  R9700, this build                       ██████                            3.00 s
+  R9700, this build                       ██████                            3.16 s
   DGX Spark, ComfyUI, same prompt again   █████████                         4.54 s
   DGX Spark, ComfyUI, new prompt          ███████████                       5.60 s
-  R9700, stable-diffusion.cpp             ████████████████████████         11.83 s
-  DGX Spark, stable-diffusion.cpp         ████████████████████████████████  16.1 s
+  R9700, stable-diffusion.cpp             ████████████████████████         12.19 s
+  DGX Spark, stable-diffusion.cpp, Euler  ████████████████████████████████  16.1 s
 
-  Same int8 convrot format, steps, CFG, size and seed in every row. The stable-diffusion.cpp
-  rows run the upstream commit this build patches. Method in RESULTS.md.
+  Same int8 convrot format, steps, CFG, size and seed in every row, and the same sampler
+  except in the last row. The stable-diffusion.cpp rows run the upstream commit this build
+  patches. Method in RESULTS.md.
 ```
 
 MOSS-Image is a 5B single-stream diffusion transformer (42 layers, 24 heads of 128) with a Qwen3.5 9B text encoder and the FLUX.2 VAE. This folder builds [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) at a pinned commit with our ggml kernels and serves it over HTTP. The model is untouched: same weights, steps, sampler and seed as stock, with nothing distilled, cached or skipped. The speed comes from the kernels.
@@ -39,7 +40,7 @@ Needs ROCm 7.2 with the hipBLAS, hipBLASLt and rocBLAS development packages, cma
 ```bash
 ./fetch_models.sh   # pinned Hugging Face revisions into ./models (26 GB), then writes the int8 model
 ./build.sh          # stable-diffusion.cpp + these kernels, HIP for gfx1201, binaries in build/bin
-./serve.sh          # 1024x1024, 8 steps, CFG 1 on http://127.0.0.1:7860
+./serve.sh          # 1024x1024, 8 steps of er_sde, CFG 1, on http://127.0.0.1:7860
 ```
 
 ```bash
@@ -49,6 +50,8 @@ curl -s http://127.0.0.1:7860/v1/images/generations -H 'Content-Type: applicatio
 ```
 
 The server also answers the AUTOMATIC1111 API (`POST /sdapi/v1/txt2img`). Fields sent with a request override the defaults of `serve.sh`.
+
+CFG 1 is the fast setting, and at 8 steps some pictures come out misshapen: by eye, 4 of 8 in a check of two prompts with four seeds each. At CFG 2.5 (`./serve.sh --cfg-scale 2.5`) 1 of 8 did, and an image takes 5.9 s, as each step runs the model twice. Euler, stable-diffusion.cpp's default sampler, leaves 8-step pictures hazy, so `serve.sh` and `bench.sh` sample with er_sde on the simple schedule, as ComfyUI does for this model.
 
 `./bench.sh` times builds against each other on the same card, for example `./bench.sh ours=build/bin/sd-server stock=stock/bin/sd-server` after `./build.sh --stock stock`.
 
@@ -78,26 +81,16 @@ Each of the 42 transformer layers does its work in 9 kernels, plus two tiny mult
 ## Correctness
 
 - **The own GEMMs are exact.** int8 sums are exact integers, and the fused epilogues repeat the dequantize, gate and residual arithmetic of the separate kernels in the same order: with `GGML_CUDA_I8_GEMM=0` the three test prompts give byte-identical PNGs.
-- **Closer to the bf16 model than stock.** Against the bf16 release weights run with f32 attention, this build's images score a PSNR of 47.3 dB after one step and 35.2 dB after eight; stock's int8 path scores 39.8 and 27.6 dB (mean of the three test prompts). Stock's error comes mostly from its attention path: its own bf16 run scores 26.8 dB after eight steps.
+- **Closer to the bf16 model than stock.** Against the bf16 release weights run with f32 attention, this build's images score a PSNR of 47.3 dB after one step and 35.2 dB after eight; stock's int8 path scores 39.8 and 27.6 dB (mean of the three test prompts, sampled with Euler). Stock's error comes mostly from its attention path: its own bf16 run scores 26.8 dB after eight steps.
 - The weights are the int8 convrot format ComfyUI ships for this model: per-row int8 weights rotated in 256-wide Hadamard groups, activations quantized per token at run time. `convert_int8_convrot.py` writes them from the bf16 release with numpy only, and the result does not depend on the machine.
 
 ## Switches
 
 | Variable | Effect |
 |---|---|
-| `GGML_CUDA_I8_GEMM=0` | int8 linears on hipBLASLt with separate epilogue kernels: same pixels, 3.2 s per image |
-| `GGML_CUDA_DISABLE_FUSION=1` | ggml's own switch, every fusion off, ours and ggml's: 4.9 s per image, same accuracy, not byte-identical |
+| `GGML_CUDA_I8_GEMM=0` | int8 linears on hipBLASLt with separate epilogue kernels: same pixels, 3.3 s per image |
+| `GGML_CUDA_DISABLE_FUSION=1` | ggml's own switch, every fusion off, ours and ggml's: 5.1 s per image, same accuracy, not byte-identical |
 | `LUCE_HIP_ARCH` | build target for `build.sh`, default `gfx1201` |
-
-## Seven calls instead of eight
-
-stable-diffusion.cpp spreads this model's 8 steps over noise levels from 1.0 down to 0.005, so the eighth call only removes the last half percent of noise. The same schedule without that point skips the call:
-
-```bash
-./serve.sh --sigmas 1,0.967778325,0.926021934,0.869763613,0.789861202,0.667443454,0.456277341,0
-```
-
-On 20 new prompts with 2 seeds each, a request took 2.67 s against 3.02 s with all 8 calls. The images matched the 8-call ones at a PSNR of 59.3 dB (54.0 at worst, 92% of pixel values identical) and were just as close to the bf16 model, 36.66 dB for both. The comparisons above keep all 8 calls. Details in [RESULTS.md](RESULTS.md#seven-calls).
 
 ## Limits
 
