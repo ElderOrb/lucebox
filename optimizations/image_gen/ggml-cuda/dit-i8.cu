@@ -511,6 +511,13 @@ int ggml_cuda_try_fuse_dit_i8(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     const auto f32_vector = [](const ggml_tensor * t, int64_t n) {
         return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == n;
     };
+    // A fused kernel reads its input while it writes its outputs, row by row in parallel blocks, so an output the
+    // allocator placed over that input (or over another output) would be overwritten while still in use.
+    const auto apart = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * pa = (const char *) a->data;
+        const char * pb = (const char *) b->data;
+        return pa >= pb + ggml_nbytes(b) || pb >= pa + ggml_nbytes(a);
+    };
 
     // RMS_NORM -> MUL(w) -> ADD(b) -> QUANTIZE_I8_CONVROT: a modulated norm feeding an int8 linear.
     if (node->op == GGML_OP_RMS_NORM &&
@@ -522,7 +529,8 @@ int ggml_cuda_try_fuse_dit_i8(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
         const int64_t k    = x->ne[0];
         const int64_t rows = ggml_nrows(x);
         if (x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && mul->src[0] == node && add->src[0] == mul &&
-                f32_vector(mul->src[1], k) && f32_vector(add->src[1], k) && ggml_cuda_i8_convrot_output_ok(q, k, rows, smpbo)) {
+                f32_vector(mul->src[1], k) && f32_vector(add->src[1], k) && ggml_cuda_i8_convrot_output_ok(q, k, rows, smpbo) &&
+                apart(q, x)) {
             float eps;
             memcpy(&eps, node->op_params, sizeof(float));
             const auto [q_data, q_scales] = ggml_cuda_i8_convrot_output(q, k, rows, stream);
@@ -662,11 +670,6 @@ int ggml_cuda_try_fuse_dit_i8(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
             if (quantize) {
                 memcpy(&eps, norm->op_params, sizeof(float));
             }
-            const auto apart = [](const ggml_tensor * a, const ggml_tensor * b) {
-                const char * pa = (const char *) a->data;
-                const char * pb = (const char *) b->data;
-                return pa >= pb + ggml_nbytes(b) || pb >= pa + ggml_nbytes(a);
-            };
             const auto aligned = [](const ggml_tensor * t) { return (uintptr_t) t->data % 16 == 0; };
             const int64_t k = node->src[1]->ne[0];
 
@@ -691,8 +694,9 @@ int ggml_cuda_try_fuse_dit_i8(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
 
             ggml_cuda_i8_sums sums(ctx.pool());
             ggml_cuda_mul_mat_i8_sums(ctx, node->src[0], node->src[1], node, sums);
-            // The residual and the quantization in one kernel, unless the int8 output reuses the memory of x, still being read.
-            if (quantize && apart(q, x)) {
+            // The residual and the quantization in one kernel, unless the int8 output reuses the memory of x or of the
+            // new residual.
+            if (quantize && apart(q, x) && apart(q, add)) {
                 const auto [q_data, q_scales] = ggml_cuda_i8_convrot_output(q, n, rows, stream);
                 if (ggml_cuda_mul_add_i32_rms_norm_quantize_i8_convrot(
                         sums.sums.get(), sums.act_scales, weight_scales, bias, (const float *) mul->src[1]->data,

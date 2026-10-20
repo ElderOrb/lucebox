@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Warm per-image time of one or more sd-server builds at 1024x1024 and seed 42, 8 steps and CFG 1 unless set. Each
+# Warm per-image time of one or more sd-server builds at 1024x1024 and seed 42, 8 steps of er_sde on the simple
+# schedule (the sampler ComfyUI runs for MOSS-Image) and CFG 1 unless set. Each
 # round starts the builds' servers in turn, so clocks and temperature hit them alike, and sends one warm-up request
 # (weights to the GPU, GEMM kernel tuning) and then the three test prompts, each new to the server (it reuses the text
 # encoding of a repeated prompt). Prints the median times (the whole request, prompt in and PNG out; the server's
@@ -11,7 +12,8 @@
 #   ./bench.sh ours=build/bin/sd-server "no-own-gemm=env GGML_CUDA_I8_GEMM=0 build/bin/sd-server"
 #
 # Environment: MODELS (default ./models), DIFFUSION_MODEL (default the int8 file in MODELS), STEPS (default 8), CFG
-# (default 1), ROUNDS (default 3), PORT (default 7861), OUT (default ./bench-out).
+# (default 1), SAMPLER (default er_sde), SCHEDULER (default simple), ROUNDS (default 3), PORT (default 7861), OUT
+# (default ./bench-out).
 set -euo pipefail
 ulimit -c 0
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -19,6 +21,8 @@ models=${MODELS:-$here/models}
 diffusion_model=${DIFFUSION_MODEL:-$models/moss_image_sft_int8_convrot.safetensors}
 steps=${STEPS:-8}
 cfg=${CFG:-1.0}
+sampler=${SAMPLER:-er_sde}
+scheduler=${SCHEDULER:-simple}
 rounds=${ROUNDS:-3}
 port=${PORT:-7861}
 out=${OUT:-$here/bench-out}
@@ -55,8 +59,10 @@ for round in $(seq "$rounds"); do
         $command --diffusion-model "$diffusion_model" \
             --llm "$models/Qwen3.5-9B-Q8_0.gguf" --vae "$models/flux2-vae.safetensors" \
             --tokenizer "$models/tokenizer.json" --listen-port "$port" \
-            -H 1024 -W 1024 --steps "$steps" --cfg-scale "$cfg" > "$log" 2>&1 &
+            -H 1024 -W 1024 --steps "$steps" --cfg-scale "$cfg" --sampling-method "$sampler" --scheduler "$scheduler" \
+            > "$log" 2>&1 &
         pid=$!
+        trap 'kill "$pid" 2>/dev/null || true' EXIT  # a failed request must not leave the server on the GPU
         for _ in $(seq 600); do
             curl -s -o /dev/null "http://127.0.0.1:$port/" && break
             kill -0 "$pid" 2>/dev/null || { echo "$label: server exited, see $log" >&2; exit 1; }
@@ -68,6 +74,7 @@ for round in $(seq "$rounds"); do
         done > "$out/$label-$round.wall"
         kill "$pid"
         wait "$pid" 2>/dev/null || true
+        trap - EXIT
         echo "$label round $round: $(grep -oE 'generate_image completed in [0-9.]+' "$log" | tail -n 3 | grep -oE '[0-9.]+$' | tr '\n' ' ')s"
     done
 done

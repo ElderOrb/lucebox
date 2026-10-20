@@ -173,7 +173,7 @@ index f7c3a732..a096491d 100644
 +        return false;
 +    }
 +    return ggml_is_contiguous(x) && ggml_is_contiguous(y) && ggml_is_contiguous(g) && ggml_is_contiguous(add) &&
-+           ggml_are_same_shape(x, y) && ggml_are_same_shape(add, y) && ggml_nelements(g) == y->ne[0];
++           ggml_are_same_shape(x, y) && ggml_are_same_shape(add, y) && g->ne[0] == y->ne[0] && ggml_nelements(g) == y->ne[0];
 +}
 +
 +void ggml_cuda_op_mul_add_fused(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add) {
@@ -753,7 +753,7 @@ index 33cee75a..b6b70cb5 100644
 +            w->type != GGML_TYPE_F32 || rope->src[1]->type != GGML_TYPE_F32) {
 +        return false;
 +    }
-+    if (x->nb[0] != sizeof(float) || x->ne[0] % 2 != 0 || !ggml_is_contiguous(w) || ggml_nelements(w) != x->ne[0] ||
++    if (x->nb[0] != sizeof(float) || x->ne[0] % 2 != 0 || !ggml_is_contiguous(w) || w->ne[0] != x->ne[0] || ggml_nelements(w) != x->ne[0] ||
 +            !ggml_are_same_shape(mul, rms_norm) || rope->src[0] != mul || !ggml_is_contiguous(rope)) {
 +        return false;
 +    }
