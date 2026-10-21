@@ -300,6 +300,8 @@ private:
                                          size_t per_token_bytes);
     static int restore_safe_prefill_tokens(int pos, int requested_tokens,
                                            const std::vector<int> & restore_points);
+    static int restored_prefill_first_tokens(int pos, int requested_tokens,
+                                             const std::vector<int> & restore_points);
 
     // Prefill prompt tokens in chunks, return absolute committed position.
     // prefix_tokens > 0 prefills only that many leading tokens (the batched

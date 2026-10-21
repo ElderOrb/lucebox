@@ -5143,6 +5143,18 @@ static void test_prefill_restore_points() {
     TEST_ASSERT(Backend::restore_safe_prefill_tokens(36, 64, points) == 64);
     TEST_ASSERT(Backend::restore_safe_prefill_tokens(0, 1024, {}) == 1024);
 
+    // After a restore, a restore point only rows ahead does not leave a chunk
+    // for the decode-shaped path: the chunk runs on to the next one.
+    const std::vector<int> view = {33000, 33007, 47758};
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(32998, 2048, view) == 9);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(32998, 3, view) == 3);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(16762, 2048, {16764, 16770}) == 8);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(32998, 6, {33000}) == 6);
+    // A restore on a boundary, as without PFlash, keeps its chunks.
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(46915, 2048, {46915, 58553}) == 2048);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(100, 1024, points) == 200);
+    TEST_ASSERT(Backend::restored_prefill_first_tokens(0, 1024, {}) == 1024);
+
     // The chunks after any restore point are the ones a cold prefill runs.
     const auto chunk_starts = [&](int from, int end, int chunk) {
         std::vector<int> starts;

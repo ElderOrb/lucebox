@@ -302,12 +302,17 @@ static void print_usage(const char * prog) {
         "  --prefill-curve T:R [T:R ...]  Piecewise keep-ratio curve over\n"
         "                              (token,ratio) breakpoints; linear interp.\n"
         "                              Overrides --prefill-keep-ratio. Example:\n"
-        "                              10000:0.5 40000:0.2 100000:0.1\n"
+        "                              10000:0.5 40000:0.2 100000:0.1 (quoted\n"
+        "                              as one argument works the same)\n"
         "                              With PFLASH_SCORING_HEAD_GGUF and neither\n"
         "                              flag: 16384:0.315 32768:0.270 65536:0.270\n"
         "                              120000:0.225\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3.5-0.8B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
+        "  --prefill-drafter-device <backend:gpu>\n"
+        "                              Score on this device (default: the\n"
+        "                              --draft-device). On another GPU than the\n"
+        "                              target, nothing is reserved or parked on it\n"
         "  --draft-residency auto|persistent|request-scoped\n"
         "                         Drafter lifetime policy (default: auto)\n"
         "  --lazy-draft                Legacy alias for --draft-residency=request-scoped\n"
@@ -403,6 +408,7 @@ struct ModelOptions {
     bool target_device_auto = false;   // --target-device auto
     bool target_device_from_env = false;  // the device came from LUCE_TARGET_DEVICE
     bool draft_device_set = false;     // --draft-device given explicitly
+    std::optional<DevicePlacement> pflash_drafter_device;  // --prefill-drafter-device
     bool pflash_threshold_set = false; // --prefill-threshold given explicitly
     bool pflash_ratio_set = false;     // --prefill-keep-ratio or --prefill-curve given explicitly
     std::optional<DevicePlacement> expert_device;  // --expert-device
@@ -956,6 +962,13 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.pflash_drafter_path = argv[++i];
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
+        } else if (std::strcmp(argv[i], "--prefill-drafter-device") == 0 && i + 1 < argc) {
+            DevicePlacement drafter;
+            if (!parse_placement_device(argv[++i], drafter)) {
+                std::fprintf(stderr, "[server] bad --prefill-drafter-device value (expected backend:gpu)\n");
+                return 2;
+            }
+            model.pflash_drafter_device = drafter;
         } else if (std::strcmp(argv[i], "--prefill-upstream-base") == 0 && i + 1 < argc) {
             sconfig.pflash_upstream_base = argv[++i];
             // Strip trailing slash
@@ -968,17 +981,15 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(argv[i], "--prefill-curve") == 0 && i + 1 < argc) {
             sconfig.pflash_curve.clear();
             model.pflash_ratio_set = true;
+            std::string curve_error;
             while (i + 1 < argc && argv[i + 1][0] != '-') {
-                const char * arg = argv[++i];
-                const char * colon = std::strchr(arg, ':');
-                if (!colon) {
-                    std::fprintf(stderr, "[server] --prefill-curve: bad format '%s' (expected TOKENS:RATIO)\n", arg);
-                    print_usage(argv[0]);
-                    return 1;
-                }
-                int tok = std::atoi(arg);
-                float ratio = (float)std::atof(colon + 1);
-                sconfig.pflash_curve.push_back({tok, ratio});
+                if (!luce::server::parse_pflash_curve_arg(argv[++i], sconfig.pflash_curve, curve_error)) break;
+            }
+            if (curve_error.empty() && sconfig.pflash_curve.empty()) curve_error = "no TOKENS:RATIO points";
+            if (!curve_error.empty()) {
+                std::fprintf(stderr, "[server] --prefill-curve: %s\n", curve_error.c_str());
+                print_usage(argv[0]);
+                return 1;
             }
             std::sort(sconfig.pflash_curve.begin(), sconfig.pflash_curve.end());
         } else if (std::strcmp(argv[i], "--draft-residency") == 0 && i + 1 < argc) {
@@ -1394,7 +1405,14 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         set_environment_variable("LUCE_KVFLASH_DRAFTER", model.sconfig.pflash_drafter_path.c_str(), true);
     auto & bargs = model.bargs;
     auto & sconfig = model.sconfig;
+    if (const char * refusal = pflash_drafter_device_refusal(
+            bargs.device, model.target_device_auto, model.pflash_drafter_device)) {
+        std::fprintf(stderr, "[server] --prefill-drafter-device %s\n", refusal);
+        return 2;
+    }
     if (sconfig.pflash_mode != ServerConfig::PflashMode::OFF) {
+        const bool drafter_beside_target = pflash_drafter_beside_target(
+            bargs.device, model.pflash_drafter_device);
         // A trained scoring head serves the measured release profile for
         // every setting the operator left unset.
         const auto release_env = luce::server::pflash_release_env();
@@ -1447,16 +1465,26 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
                     "[server] PFlash with --max-concurrency %d: the drafter scores beside the "
                     "resident target (--prefill-skip-park)\n", bargs.max_concurrency);
             }
-            std::error_code size_error;
-            const auto drafter_bytes =
-                std::filesystem::file_size(sconfig.pflash_drafter_path, size_error);
-            bargs.kv_pool_reserve_bytes = pflash_concurrent_reserve_bytes(
-                size_error ? 0 : (long long)drafter_bytes, bargs.device.max_ctx);
+            if (drafter_beside_target) {
+                std::error_code size_error;
+                const auto drafter_bytes =
+                    std::filesystem::file_size(sconfig.pflash_drafter_path, size_error);
+                bargs.kv_pool_reserve_bytes = pflash_concurrent_reserve_bytes(
+                    size_error ? 0 : (long long)drafter_bytes, bargs.device.max_ctx);
+                std::fprintf(stderr,
+                    "[server] PFlash with --max-concurrency %d: %.2f GiB of device memory "
+                    "reserved for the drafter, for prompts up to %d tokens\n",
+                    bargs.max_concurrency, bargs.kv_pool_reserve_bytes / 1073741824.0,
+                    bargs.device.max_ctx);
+            }
+        }
+        // On a GPU of its own the drafter needs no room on the target's: the
+        // paged pool keeps all of it, and a single request is not parked.
+        if (!drafter_beside_target) {
+            sconfig.pflash_skip_park = true;
             std::fprintf(stderr,
-                "[server] PFlash with --max-concurrency %d: %.2f GiB of device memory "
-                "reserved for the drafter, for prompts up to %d tokens\n",
-                bargs.max_concurrency, bargs.kv_pool_reserve_bytes / 1073741824.0,
-                bargs.device.max_ctx);
+                "[server] PFlash drafter on gpu %d, apart from the target: nothing reserved "
+                "or parked on the target's GPU\n", model.pflash_drafter_device->gpu);
         }
     }
     auto & spark_autotune = model.spark_autotune;
@@ -1674,7 +1702,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     const PFlashDrafterPlacement pflash_placement =
         resolve_pflash_drafter_placement(
             backend_placement.target,
-            backend_placement.draft,
+            pflash_drafter_device(backend_placement.draft, model.pflash_drafter_device),
             backend_placement.remote_draft,
             sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
     sconfig.pflash_drafter_gpu = pflash_placement.drafter_gpu;
@@ -1728,12 +1756,12 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // KV types now come from each family's default (q8_0 for laguna, q4_0
     // base) unless the user passes --cache-type-k/v explicitly.
 
-    // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
+    // The PFlash scorer (Qwen3.5 drafter) runs ggml attention and reads none of
+    // the FlashPrefill kernel switches. LUCE_FP_USE_BSA stays on with PFlash so
+    // Gemma 4's sliding-window prefill keeps the BSA launcher it had before.
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
     if (pflash_enabled) {
         set_environment_variable("LUCE_FP_USE_BSA", "1", false);
-        set_environment_variable("LUCE_FP_ALPHA", "0.85", false);
-        set_environment_variable("LUCE_FA_WINDOW", "0", false);
     }
 
     if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
@@ -2207,14 +2235,18 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         sconfig.pflash_mode == ServerConfig::PflashMode::ALWAYS ? "always" : "off");
     if (pflash_enabled) {
         std::fprintf(stderr, "[server] │  pflash_threshold= %d\n", sconfig.pflash_threshold);
-        std::fprintf(stderr, "[server] │  pflash_keep     = %.3f\n", sconfig.pflash_keep_ratio);
+        if (sconfig.pflash_curve.empty()) {
+            std::fprintf(stderr, "[server] │  pflash_keep     = %.3f\n", sconfig.pflash_keep_ratio);
+        } else {
+            std::fprintf(stderr, "[server] │  pflash_keep     = curve");
+            for (const auto & p : sconfig.pflash_curve) std::fprintf(stderr, " %d:%.3f", p.first, p.second);
+            std::fprintf(stderr, "\n");
+        }
         std::fprintf(stderr, "[server] │  pflash_drafter  = %s\n", sconfig.pflash_drafter_path.c_str());
         std::fprintf(stderr, "[server] │  pflash_drafter_gpu= %d\n", sconfig.pflash_drafter_gpu);
         std::fprintf(stderr, "[server] │  pflash_drafter_exec= %s\n",
                      sconfig.pflash_remote_drafter ? "remote-ipc" : "local");
         std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
-        std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("LUCE_FP_USE_BSA") ? "ON" : "off");
-        std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("LUCE_FP_ALPHA") ? getenv("LUCE_FP_ALPHA") : "0.12 (default)");
     }
     std::fprintf(stderr, "[server] │  draft_residency = %s\n",
                  draft_residency_policy_name(sconfig.draft_residency));
