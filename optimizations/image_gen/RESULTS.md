@@ -2,7 +2,7 @@
 
 **Setup.** AMD Radeon AI PRO R9700 (RDNA4 `gfx1201`, 32 GB) at its 330 W power limit, ROCm 7.2.4. luce_server built for `gfx1201`. MOSS-Image SFT as int8 convrot with the FLUX.2 VAE in one GGUF (`server/scripts/convert_moss_image.py` from the bf16 release), Qwen3.5 9B Q8_0 text encoder. 1024×1024, 8 steps of er_sde on the simple schedule (the sampler ComfyUI runs for this model), CFG 1, seed 42, unless a table says otherwise.
 
-**Method.** `bench.sh`: three rounds; in each, the server starts, makes its warm-up images while it loads, then takes the three test prompts, each new to it. Medians of 9 images. *Request* is timed by the client, prompt in and PNG out over HTTP; *generate_image* is the server's text encoding, sampling and VAE decode.
+**Method.** `bench.sh`: three rounds; in each, the server starts (the first start tunes hipBLASLt with two warm-up images, later starts read the tuned kernels back), then takes the three test prompts, each new to it. Medians of 9 images. *Request* is timed by the client, prompt in and PNG out over HTTP; *generate_image* is the server's text encoding, sampling and VAE decode.
 
 ## Per image on the R9700
 
@@ -27,7 +27,7 @@ This engine replaces a build of stable-diffusion.cpp `b13a482` with the same ker
 - The model costs about the same in both: sampling took 2.79 s there and 2.84 s here with Euler, 2.86 and 2.87 s with er_sde, and 5.58 and 5.57 s at CFG 2.5. The decode takes 0.20 s there and 0.18 s here.
 - Euler at 8 steps is the one setting where the old build was faster, by 12 ms: its Euler sampling was 0.05 s shorter, while its er_sde sampling took 0.07 s longer than its Euler. Here the two samplers differ by 0.03 s.
 - With `bench.sh`'s method (new prompts, a fresh server each round), the old build took 3.16 s per request at CFG 1 (generate_image 3.11 s, sampling 2.87 s) and 5.92 s at CFG 2.5; stock stable-diffusion.cpp `b13a482` took 12.19 s at CFG 1.
-- luce_server is ready 7.2-7.4 s after it starts, from the page cache: the model (2.9 s) and the text encoder (4.3 s) load at once, then two warm-up images tune hipBLASLt (3.0 s), so the first request runs at full speed. `sd-server` was ready after 6.0 s and took 8.5 s on its first request.
+- luce_server is ready 4.4-4.5 s after it starts, from the page cache: the model (2.9 s) and the text encoder (4.3 s) load at once while hipBLASLt loads the kernels tuned on the first start, so the first request runs at full speed. The first start tunes them with two warm-up images (3.0 s) and is ready after 7.2-7.5 s; the starts after it pick the same kernels, and their images match its bit for bit. `sd-server` was ready after 6.0 s and took 8.5 s on its first request.
 
 ## Accuracy
 

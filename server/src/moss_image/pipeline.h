@@ -18,6 +18,7 @@ namespace luce::moss_image {
 struct PipelineOptions {
     std::string model_path;         // the moss-image GGUF: DiT and VAE (scripts/convert_moss_image.py)
     std::string text_encoder_path;  // the Qwen3.5-9B GGUF
+    std::string tuning_path;        // the GEMM kernels tuned by an earlier run (Blas::save_tuning); empty: none
     int         warmup_width  = 1024;
     int         warmup_height = 1024;
 };
@@ -29,8 +30,9 @@ public:
     Pipeline(const Pipeline &) = delete;
     Pipeline & operator=(const Pipeline &) = delete;
 
-    // Weights on the GPU, then one warm-up image at the warm-up size so the first request pays no GEMM tuning;
-    // false with `error` set.
+    // Weights on the GPU, so that the first request pays no GEMM tuning: the GEMM kernels from the tuning file, loaded
+    // beside the uploads, or when it has none, a warm-up image at the warm-up size that tunes them and writes the file.
+    // False with `error` set.
     bool load(const PipelineOptions & options, std::string & error);
 
     bool generate(const ImageRequest & request, RgbImage & image, std::string & error) override;

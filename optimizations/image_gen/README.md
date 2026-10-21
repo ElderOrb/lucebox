@@ -45,7 +45,7 @@ cmake --build ../../server/build --target luce_server -j
 ../../server/build/luce_server models/moss-image.gguf --text-encoder models/Qwen3.5-9B-Q8_0.gguf --port 7860
 ```
 
-The server is ready once it has loaded both files and made a warm-up image (about 7 s from the page cache), so the first request runs at full speed.
+The server is ready once both files are on the GPU, about 4.5 s from the page cache, and the first request runs at full speed. The first start takes 3 s more: two warm-up images tune hipBLASLt's kernels, which it keeps in `~/.cache/lucebox/moss-image-gemm.txt` (under `$XDG_CACHE_HOME` when set) for the starts after it.
 
 ```bash
 curl -s http://127.0.0.1:7860/v1/images/generations -H 'Content-Type: application/json' \
@@ -88,7 +88,7 @@ Each transformer layer is 9 kernel launches, 10 with CFG, where the two passes' 
 | int8 down GEMM + gated residual | GEMM, dequantize, gate multiply, residual add |
 
 - **Own int8 GEMMs** (`dit_kernels.cu`). 256×128×64 tiles on RDNA4 WMMA with the epilogue in registers, so the int32 sums never go to memory. The card runs at its power limit, so the SiTU gate stays a separate memory-bound pass, where it costs less than inside the GEMM.
-- **hipBLASLt** (`blas.cpp`) runs the up/gate GEMM and the bf16 and f16 products. The first product of a shape times hipBLASLt's 16 best candidates and keeps the fastest, once per 256 tokens, so a new prompt length does not tune again. Two warm-up images, with and without CFG, tune the shapes of a 1024×1024 request before the server answers.
+- **hipBLASLt** (`blas.cpp`) runs the up/gate GEMM and the bf16 and f16 products. The first product of a shape times hipBLASLt's 16 best candidates and keeps the fastest, once per 256 tokens, so a new prompt length does not tune again. On the first start, two warm-up images, with and without CFG, tune the shapes of a 1024×1024 request before the server answers, and the tuning file keeps the winners. A later start finds each among hipBLASLt's candidates again and runs it once while the weights upload, so it times nothing, needs no warm-up image, and makes the same images bit for bit.
 - **No graph runtime.** A step is a fixed sequence of kernel launches on one stream, with no allocations, copies or host waits in between.
 
 ## Correctness

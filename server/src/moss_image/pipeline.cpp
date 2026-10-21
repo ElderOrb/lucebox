@@ -122,6 +122,7 @@ struct Pipeline::Impl {
     PinnedBuffer host_pe, host_time;
     hipEvent_t   events[4] = {};
     bool         warming_up = false;  // the warm-up images log nothing
+    std::string  tuning_path;         // where the tuned GEMM kernels are kept; empty: nowhere
 
     ~Impl() {
         for (hipEvent_t e : events) {
@@ -142,6 +143,7 @@ struct Pipeline::Impl {
                 float * out);
     bool attention(const VaeAttention & block, const float * in, int w, int h, float * out);
     bool decode(int lh, int lw, std::string & error);
+    void save_tuning();
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -470,6 +472,14 @@ bool Pipeline::Impl::decode(const int lh, const int lw, std::string & error) {
     return ok;
 }
 
+// Kernels tuned since the tuning file was read or written go into it. A file that cannot be written is said once.
+void Pipeline::Impl::save_tuning() {
+    if (!tuning_path.empty() && blas.tuning_changed() && !blas.save_tuning(tuning_path)) {
+        std::fprintf(stderr, "[moss-image] cannot write the GEMM tuning file %s\n", tuning_path.c_str());
+        tuning_path.clear();
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 
 Pipeline::Pipeline() : impl_(std::make_unique<Impl>()) {}
@@ -497,6 +507,10 @@ bool Pipeline::load(const PipelineOptions & options, std::string & error) {
     const auto seconds = [](clock::time_point a, clock::time_point b) {
         return std::chrono::duration<double>(b - a).count();
     };
+    // GEMM kernels tuned by an earlier run need no warm-up image: they are found again, and their first products run,
+    // beside the uploads on a thread and stream of their own.
+    m.tuning_path      = options.tuning_path;
+    const size_t tuned = m.tuning_path.empty() ? 0 : m.blas.load_tuning(m.tuning_path);
     // The two files load at once: the text encoder through ggml on its own thread, the model through our uploads.
     const auto  t0 = clock::now();
     std::string encoder_error;
@@ -506,9 +520,19 @@ bool Pipeline::load(const PipelineOptions & options, std::string & error) {
         encoder_seconds = seconds(t0, clock::now());
         return ok;
     });
+    auto        kernels         = std::async(std::launch::async, [&] {
+        hipStream_t stream = nullptr;
+        if (tuned == 0 || hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
+            return size_t(0);
+        }
+        const size_t ran = m.blas.preload(stream);
+        (void) hipStreamDestroy(stream);
+        return ran;
+    });
     const bool   model_ok      = m.weights.load(options.model_path, m.stream, error);
     const double model_seconds = seconds(t0, clock::now());
     const bool   encoder_ok    = encoder.get();
+    const size_t preloaded     = kernels.get();
     if (!model_ok) {
         return false;
     }
@@ -517,7 +541,21 @@ bool Pipeline::load(const PipelineOptions & options, std::string & error) {
         return false;
     }
     const auto t1 = clock::now();
-    // One image with and one without CFG at the warm-up size: every GEMM shape of a request is tuned before the first.
+    if (tuned > 0 && preloaded == tuned) {
+        // The encoder's first prompt loads its kernels, which the first request then finds loaded.
+        TextHidden hidden;
+        if (!m.encoder.encode(m.encoder.tokenize("a photo of a lighthouse"), hidden, error)) {
+            return false;
+        }
+        std::fprintf(stderr,
+                     "[moss-image] loaded in %.1f s: model %.1f s and text encoder %.1f s at once, with the %zu GEMM "
+                     "kernels tuned in %s, first prompt %.2f s\n",
+                     seconds(t0, clock::now()), model_seconds, encoder_seconds, preloaded, m.tuning_path.c_str(),
+                     seconds(t1, clock::now()));
+        return true;
+    }
+    // One image with and one without CFG at the warm-up size: every GEMM shape of a request is tuned before the first
+    // (only those not found again, after a partial preload), and the tuning file keeps the kernels for the next run.
     ImageRequest warmup;
     warmup.prompt = "a photo of a lighthouse";
     warmup.width  = options.warmup_width;
@@ -537,6 +575,7 @@ bool Pipeline::load(const PipelineOptions & options, std::string & error) {
     std::fprintf(stderr,
                  "[moss-image] loaded in %.1f s: model %.1f s and text encoder %.1f s at once, warm-up %.1f s\n",
                  seconds(t0, clock::now()), model_seconds, encoder_seconds, seconds(t1, clock::now()));
+    m.save_tuning();
     return true;
 }
 
@@ -603,6 +642,7 @@ bool Pipeline::generate(const ImageRequest & request, RgbImage & image, std::str
     (void) hipEventElapsedTime(&decode_ms, m.events[2], m.events[3]);
     std::fprintf(stderr, "[moss-image] %dx%d, %d steps, cfg %.2f: text %.0f ms, sampling %.0f ms, decode %.0f ms\n",
                  request.width, request.height, request.steps, request.cfg_scale, text_ms, sample_ms, decode_ms);
+    m.save_tuning();
     return true;
 }
 

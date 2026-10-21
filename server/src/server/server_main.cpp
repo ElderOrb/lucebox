@@ -452,20 +452,25 @@ struct ModelOptions {
 };
 
 // Native cache directory, or empty when no usable home/cache path is set.
-static std::string default_kv_cache_dir() {
+static std::string default_cache_dir() {
 #if defined(_WIN32)
     for (const char * variable : {"LOCALAPPDATA", "USERPROFILE"}) {
         const char * value = std::getenv(variable);
         if (value && *value && std::filesystem::path(value).is_absolute()) {
-            return (std::filesystem::path(value) / "lucebox" / "kv-cache").string();
+            return (std::filesystem::path(value) / "lucebox").string();
         }
     }
 #endif
     const char * xdg = std::getenv("XDG_CACHE_HOME");
-    if (xdg && xdg[0] == '/') return std::string(xdg) + "/lucebox/kv-cache";
+    if (xdg && xdg[0] == '/') return std::string(xdg) + "/lucebox";
     const char * home = std::getenv("HOME");
-    if (home && home[0] == '/') return std::string(home) + "/.cache/lucebox/kv-cache";
+    if (home && home[0] == '/') return std::string(home) + "/.cache/lucebox";
     return std::string();
+}
+
+static std::string default_kv_cache_dir() {
+    const std::string dir = default_cache_dir();
+    return dir.empty() ? dir : (std::filesystem::path(dir) / "kv-cache").string();
 }
 
 static int parse_model_options(int argc, char ** argv, ModelOptions & model,
@@ -2531,7 +2536,11 @@ static int run_moss_image(int argc, char ** argv) {
         std::fprintf(stderr, "[server] a moss-image model needs --text-encoder <Qwen3.5-9B.gguf>\n");
         return 2;
     }
-    // load() ends with a warm-up image, so the port opens once the server is ready.
+    const std::string cache_dir = default_cache_dir();
+    if (!cache_dir.empty()) {
+        pipeline_options.tuning_path = (std::filesystem::path(cache_dir) / "moss-image-gemm.txt").string();
+    }
+    // load() returns once a request runs at full speed, so the port opens when the server is ready.
     luce::moss_image::Pipeline pipeline;
     std::string error;
     if (!pipeline.load(pipeline_options, error)) {

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Warm per-image time of one or more luce_server builds at 1024x1024 and seed 42, 8 steps of er_sde on the simple
 # schedule (the sampler ComfyUI runs for MOSS-Image) and CFG 1 unless set. Each round starts the builds' servers in
-# turn, so clocks and temperature hit them alike; a server makes one warm-up image while it loads (GEMM tuning), and
-# the three test prompts are each new to it (it reuses the text encoding of a repeated prompt). Prints the median
-# times (the whole request, prompt in and PNG out; the server's own time per image, then its text, sampling and
-# decode phases) and each image's md5: the same hashes from two builds mean the same pixels.
+# turn, so clocks and temperature hit them alike. A server's first start tunes its GEMMs with two warm-up images and
+# later starts read them back from its tuning file (see the README); the three test prompts are each new to it (it
+# reuses the text encoding of a repeated prompt). Prints the median times (from the server's launch until it answers;
+# the whole request, prompt in and PNG out; the server's own time per image, then its text, sampling and decode
+# phases) and each image's md5: the same hashes from two builds mean the same pixels.
 #
 #   ./bench.sh LABEL=COMMAND ...
 #   ./bench.sh ours=../../server/build/luce_server
@@ -51,16 +52,18 @@ for round in $(seq "$rounds"); do
         label=${spec%%=*}
         command=${spec#*=}
         log=$out/$label-$round.log
+        launched=$(date +%s.%N)
         # shellcheck disable=SC2086  # COMMAND may carry an env prefix
         $command "$models/moss-image.gguf" --text-encoder "$models/Qwen3.5-9B-Q8_0.gguf" \
             --host 127.0.0.1 --port "$port" > "$log" 2>&1 &
         pid=$!
         trap 'kill "$pid" 2>/dev/null || true' EXIT  # a failed request must not leave the server on the GPU
-        for _ in $(seq 600); do
+        for _ in $(seq 12000); do
             curl -s -o /dev/null "http://127.0.0.1:$port/v1/models" && break
             kill -0 "$pid" 2>/dev/null || { echo "$label: server exited, see $log" >&2; exit 1; }
-            sleep 1
+            sleep 0.05
         done
+        awk -v a="$launched" -v b="$(date +%s.%N)" 'BEGIN { printf "%.2f\n", b - a }' > "$out/$label-$round.ready"
         for i in "${!names[@]}"; do
             request "${prompts[$i]}" "$out/$label-${names[$i]}.png"
         done > "$out/$label-$round.wall"
@@ -82,7 +85,7 @@ echo
 for spec in "$@"; do
     label=${spec%%=*}
     per_image=$(for f in "$out/$label"-[0-9]*.log; do grep -oE 'generate_image completed in [0-9.]+' "$f" | grep -oE '[0-9.]+$'; done | median)
-    echo "$label: request $(cat "$out/$label"-[0-9]*.wall | median) s"
+    echo "$label: ready $(cat "$out/$label"-[0-9]*.ready | median) s, request $(cat "$out/$label"-[0-9]*.wall | median) s"
     echo "  generate_image $per_image s; text $(phase "$label" text) ms, sampling $(phase "$label" sampling) ms, decode $(phase "$label" decode) ms"
     for name in "${names[@]}"; do
         printf '  %-7s %s\n' "$name" "$(md5sum < "$out/$label-$name.png" | cut -c1-32)"
