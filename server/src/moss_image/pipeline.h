@@ -1,5 +1,5 @@
 // MOSS-Image text to image on one RDNA4 GPU: the Qwen3.5-9B text encoder, the int8 DiT sampling loop and the FLUX.2
-// VAE decoder, all on one stream.
+// VAE decoder, all on one stream; the text encoder can run on a second GPU instead (text_encoder_gpu).
 //
 // A request with CFG runs the conditional and the unconditional sequence as one batch of rows through every GEMM;
 // only attention and the rotary tables stay per sequence. The text side of a prompt (encoder, projection and the two
@@ -19,6 +19,7 @@ struct PipelineOptions {
     std::string model_path;         // the moss-image GGUF: DiT and VAE (scripts/convert_moss_image.py)
     std::string text_encoder_path;  // the Qwen3.5-9B GGUF
     std::string tuning_path;        // the GEMM kernels tuned by an earlier run (Blas::save_tuning); empty: none
+    int         text_encoder_gpu = -1;  // the GPU the text encoder runs on; -1: the model's
     int         warmup_width  = 1024;
     int         warmup_height = 1024;
 };

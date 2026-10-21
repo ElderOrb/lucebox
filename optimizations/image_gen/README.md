@@ -47,6 +47,8 @@ cmake --build ../../server/build --target luce_server -j
 
 The server is ready once both files are on the GPU, about 4.5 s from the page cache, and the first request runs at full speed. The first start takes 3 s more: two warm-up images tune hipBLASLt's kernels, which it keeps in `~/.cache/lucebox/moss-image-gemm.txt` (under `$XDG_CACHE_HOME` when set) for the starts after it.
 
+On a machine with a second GPU, `--text-encoder-device hip:N` runs the text encoder there and hands its output over through host memory, so the two GPUs need no peer access. Build for both (`-DLUCE_HIP_ARCHITECTURES="gfx1201;gfx1151"` for the R9700 beside a Ryzen AI Max+ 395): the encoder then runs on the APU's Radeon 8060S and the R9700 loads only the 5.5 GB model. With the R9700 behind a PCIe Gen3 x4 link, the server is ready in 2.0-2.1 s instead of about 4.5 s, and a new prompt's encoding takes 78-98 ms instead of 25-28 ms. The two GPUs round the encoder differently, so the images are close to the R9700-encoded ones, not byte-identical (see [RESULTS.md](RESULTS.md)).
+
 ```bash
 curl -s http://127.0.0.1:7860/v1/images/generations -H 'Content-Type: application/json' \
   -d '{"prompt": "a lovely cat holding a sign that says \"hello\"", "size": "1024x1024"}' |
@@ -98,7 +100,7 @@ Each transformer layer is 9 kernel launches, 10 with CFG, where the two passes' 
 
 ## Limits
 
-- Measured on the Radeon AI PRO R9700 (RDNA4, gfx1201) only. The kernels are RDNA4's: on another GPU the engine refuses to load. Builds without hipBLASLt or zlib leave the engine out, and luce_server then says so for a MOSS-Image file.
+- Measured on the Radeon AI PRO R9700 (RDNA4, gfx1201) only. The kernels are RDNA4's: on another GPU the engine refuses to load. The text encoder runs through ggml, on any GPU the build includes. Builds without hipBLASLt or zlib leave the engine out, and luce_server then says so for a MOSS-Image file.
 - One request at a time; others wait their turn.
 - The card ran at its 330 W power limit, the driver's maximum. At the 300 W default an image takes about 1% longer.
 

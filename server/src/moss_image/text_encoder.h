@@ -13,8 +13,10 @@
 namespace luce::moss_image {
 
 struct TextHidden {
-    const float * data     = nullptr;  // device memory, [n_tokens][4096] f32; valid until the next encode
+    const float * data     = nullptr;  // [n_tokens][4096] f32 on the model's GPU, or in host memory when the encoder
+                                       // runs on another GPU (`host`); valid until the next encode
     int           n_tokens = 0;
+    bool          host     = false;
 };
 
 class TextEncoder {
@@ -26,14 +28,15 @@ public:
     TextEncoder(const TextEncoder &) = delete;
     TextEncoder & operator=(const TextEncoder &) = delete;
 
-    // Weights on the GPU and the tokenizer from the same GGUF; false with `error` set.
-    bool load(const std::string & gguf_path, std::string & error);
+    // Weights on GPU `gpu` and the tokenizer from the same GGUF; false with `error` set. On a GPU other than the
+    // model's (`model_gpu`), encode() hands its rows over in host memory.
+    bool load(const std::string & gguf_path, int gpu, int model_gpu, std::string & error);
 
     // The template around `prompt`, tokenized and cut to kMaxTokens.
     std::vector<int32_t> tokenize(const std::string & prompt) const;
 
-    // Runs the encoder over `tokens` (1 .. kMaxTokens of them) and returns once the hidden states are in device
-    // memory (the encoder's own stream is synchronized); false with `error` set.
+    // Runs the encoder over `tokens` (1 .. kMaxTokens of them) and returns once the hidden states are in `out` (the
+    // encoder's own stream is synchronized), with the calling thread's GPU as it found it; false with `error` set.
     bool encode(const std::vector<int32_t> & tokens, TextHidden & out, std::string & error);
 
 private:

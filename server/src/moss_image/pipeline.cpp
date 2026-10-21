@@ -112,7 +112,7 @@ struct Pipeline::Impl {
     const TextRows *    uncond = nullptr;  // and its negative prompt's, with CFG
 
     // Text embedder work buffers.
-    DeviceBuffer t_bf16, t_mm, t_q, t_k, t_v, t_att, t_pe;
+    DeviceBuffer t_states, t_bf16, t_mm, t_q, t_k, t_v, t_att, t_pe;
     // Timestep path, every step of a request at once.
     DeviceBuffer time_in, time_hidden, time_emb, block_mod, head_mod;
     // DiT.
@@ -173,9 +173,17 @@ bool Pipeline::Impl::text(const std::string & prompt, const TextRows *& found, s
     if (!t_bf16.reserve(n * kFfn * sizeof(uint16_t)) || !t_mm.reserve(n * 2 * kFfn * sizeof(float)) ||
         !t_q.reserve(n * kHidden * sizeof(float)) || !t_k.reserve(n * kHidden * sizeof(uint16_t)) ||
         !t_v.reserve(n * kHidden * sizeof(uint16_t)) || !t_att.reserve(n * kHidden * sizeof(float)) ||
-        !t_pe.reserve(n * kRopePairs * 2 * sizeof(float)) || !out.rows.reserve(n * kHidden * sizeof(float))) {
+        !t_pe.reserve(n * kRopePairs * 2 * sizeof(float)) || !out.rows.reserve(n * kHidden * sizeof(float)) ||
+        (hidden.host && !t_states.reserve(n * kTextHidden * sizeof(float)))) {
         error = "out of GPU memory for the text embedder";
         return false;
+    }
+    const float * states = hidden.data;
+    if (hidden.host) {
+        // An encoder on another GPU hands its rows over in host memory.
+        (void) hipMemcpyAsync(t_states.as<float>(), hidden.data, n * kTextHidden * sizeof(float),
+                              hipMemcpyHostToDevice, stream);
+        states = t_states.as<float>();
     }
     float * pe = host_pe.reserve(size_t(n) * kRopePairs * 2);
     if (pe == nullptr) {
@@ -190,7 +198,7 @@ bool Pipeline::Impl::text(const std::string & prompt, const TextRows *& found, s
     float *            mm = t_mm.as<float>();
     float *            tx = out.rows.as<float>();
     bool               ok = true;
-    f32_to_bf16(hidden.data, n * kTextHidden, b, stream);
+    f32_to_bf16(states, n * kTextHidden, b, stream);
     ok = ok && blas.gemm(GemmType::bf16_f32, w.text_proj.w, kTextHidden, b, kTextHidden, tx, kHidden, kHidden, n,
                          kTextHidden);
     add_bias(tx, w.text_proj.b, n, kHidden, tx, stream);
@@ -512,11 +520,19 @@ bool Pipeline::load(const PipelineOptions & options, std::string & error) {
     m.tuning_path      = options.tuning_path;
     const size_t tuned = m.tuning_path.empty() ? 0 : m.blas.load_tuning(m.tuning_path);
     // The two files load at once: the text encoder through ggml on its own thread, the model through our uploads.
-    const auto  t0 = clock::now();
+    // The encoder can run on another GPU (an APU's, beside the R9700), which leaves the model's GPU only the model
+    // to load.
+    int model_gpu = 0;
+    if (hipGetDevice(&model_gpu) != hipSuccess) {
+        error = "no GPU";
+        return false;
+    }
+    const int   encoder_gpu = options.text_encoder_gpu < 0 ? model_gpu : options.text_encoder_gpu;
+    const auto  t0          = clock::now();
     std::string encoder_error;
     double      encoder_seconds = 0.0;
     auto        encoder         = std::async(std::launch::async, [&] {
-        const bool ok   = m.encoder.load(options.text_encoder_path, encoder_error);
+        const bool ok   = m.encoder.load(options.text_encoder_path, encoder_gpu, model_gpu, encoder_error);
         encoder_seconds = seconds(t0, clock::now());
         return ok;
     });
@@ -540,7 +556,8 @@ bool Pipeline::load(const PipelineOptions & options, std::string & error) {
         error = encoder_error;
         return false;
     }
-    const auto t1 = clock::now();
+    const auto        t1    = clock::now();
+    const std::string where = encoder_gpu == model_gpu ? "" : " on GPU " + std::to_string(encoder_gpu);
     if (tuned > 0 && preloaded == tuned) {
         // The encoder's first prompt loads its kernels, which the first request then finds loaded.
         TextHidden hidden;
@@ -548,10 +565,10 @@ bool Pipeline::load(const PipelineOptions & options, std::string & error) {
             return false;
         }
         std::fprintf(stderr,
-                     "[moss-image] loaded in %.1f s: model %.1f s and text encoder %.1f s at once, with the %zu GEMM "
-                     "kernels tuned in %s, first prompt %.2f s\n",
-                     seconds(t0, clock::now()), model_seconds, encoder_seconds, preloaded, m.tuning_path.c_str(),
-                     seconds(t1, clock::now()));
+                     "[moss-image] loaded in %.1f s: model %.1f s and text encoder%s %.1f s at once, with the %zu "
+                     "GEMM kernels tuned in %s, first prompt %.2f s\n",
+                     seconds(t0, clock::now()), model_seconds, where.c_str(), encoder_seconds, preloaded,
+                     m.tuning_path.c_str(), seconds(t1, clock::now()));
         return true;
     }
     // One image with and one without CFG at the warm-up size: every GEMM shape of a request is tuned before the first
@@ -573,8 +590,8 @@ bool Pipeline::load(const PipelineOptions & options, std::string & error) {
     }
     m.warming_up = false;
     std::fprintf(stderr,
-                 "[moss-image] loaded in %.1f s: model %.1f s and text encoder %.1f s at once, warm-up %.1f s\n",
-                 seconds(t0, clock::now()), model_seconds, encoder_seconds, seconds(t1, clock::now()));
+                 "[moss-image] loaded in %.1f s: model %.1f s and text encoder%s %.1f s at once, warm-up %.1f s\n",
+                 seconds(t0, clock::now()), model_seconds, where.c_str(), encoder_seconds, seconds(t1, clock::now()));
     m.save_tuning();
     return true;
 }

@@ -10,7 +10,7 @@
 //   luce_server <model.gguf> [--draft <draft.gguf>] [--port 8080]
 //                              [--host 0.0.0.0] [--max-ctx 131072]
 //                              [--max-tokens 4096] [--target-device auto:0]
-//   luce_server <moss-image.gguf> --text-encoder <Qwen3.5-9B.gguf> [--port 8080]
+//   luce_server <moss-image.gguf> --text-encoder <Qwen3.5-9B.gguf> [--text-encoder-device hip:N] [--port 8080]
 
 #include "http_server.h"
 #include "admission.h"
@@ -138,6 +138,7 @@ static void print_usage(const char * prog) {
         "  --text-encoder <path> Qwen3.5-9B GGUF for a moss-image (text-to-image) model,\n"
         "                       served with the images API; --host, --port and\n"
         "                       --model-name apply to it\n"
+        "  --text-encoder-device hip:N  Run the moss-image text encoder on another GPU\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N|auto>   Max context length (default: 8192). auto: the model's\n"
@@ -2521,6 +2522,13 @@ static int run_moss_image(int argc, char ** argv) {
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--text-encoder") == 0 && i + 1 < argc) {
             pipeline_options.text_encoder_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--text-encoder-device") == 0 && i + 1 < argc) {
+            DevicePlacement device;
+            if (!parse_placement_device(argv[++i], device) || device.backend == PlacementBackend::Cuda) {
+                std::fprintf(stderr, "[server] bad --text-encoder-device value (expected hip:gpu)\n");
+                return 2;
+            }
+            pipeline_options.text_encoder_gpu = device.gpu;
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             config.host = argv[++i];
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {

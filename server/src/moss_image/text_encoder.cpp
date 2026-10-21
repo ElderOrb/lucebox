@@ -11,6 +11,8 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
+#include <hip/hip_runtime_api.h>
+
 namespace luce::moss_image {
 
 namespace common = luce::common;
@@ -21,6 +23,19 @@ const char *  kTemplateHead = "<|im_start|>user\n";
 const char *  kTemplateTail = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
 constexpr int kTextLayers   = 32;
 constexpr int kGraphNodes   = 32768;  // a 512-token chunk's graph has about 17k nodes
+
+// The encoder's work runs on its GPU whatever the calling thread had selected, and the thread gets its GPU back: the
+// pipeline's work that follows runs on the model's.
+struct OnDevice {
+    int previous = 0;
+
+    explicit OnDevice(const int gpu) {
+        (void) hipGetDevice(&previous);
+        (void) hipSetDevice(gpu);
+    }
+
+    ~OnDevice() { (void) hipSetDevice(previous); }
+};
 
 } // namespace
 
@@ -37,6 +52,9 @@ struct TextEncoder::Impl {
     std::unique_ptr<uint8_t[]> arena;
     std::vector<float>         embeddings;
     std::vector<int32_t>       positions;
+    int                        gpu    = 0;
+    bool                       remote = false;  // on another GPU than the model: rows go out through host_rows
+    std::vector<float>         host_rows;
 
     ~Impl() {
         if (galloc != nullptr) {
@@ -103,11 +121,14 @@ TextEncoder::TextEncoder() : impl_(std::make_unique<Impl>()) {}
 
 TextEncoder::~TextEncoder() = default;
 
-bool TextEncoder::load(const std::string & gguf_path, std::string & error) {
-    Impl & m  = *impl_;
-    m.backend = ggml_backend_cuda_init(0);
+bool TextEncoder::load(const std::string & gguf_path, const int gpu, const int model_gpu, std::string & error) {
+    OnDevice on(gpu);
+    Impl &   m = *impl_;
+    m.gpu      = gpu;
+    m.remote   = gpu != model_gpu;
+    m.backend  = ggml_backend_cuda_init(gpu);
     if (m.backend == nullptr) {
-        error = "the text encoder cannot open GPU 0";
+        error = "the text encoder cannot open GPU " + std::to_string(gpu);
         return false;
     }
     common::TargetLoadPlan plan;
@@ -157,6 +178,7 @@ std::vector<int32_t> TextEncoder::tokenize(const std::string & prompt) const {
 
 bool TextEncoder::encode(const std::vector<int32_t> & tokens, TextHidden & out, std::string & error) {
     Impl &    m = *impl_;
+    OnDevice  on(m.gpu);
     const int n = int(tokens.size());
     if (n < 1 || n > kMaxTokens) {
         error = "a prompt takes 1 to " + std::to_string(kMaxTokens) + " tokens";
@@ -172,8 +194,16 @@ bool TextEncoder::encode(const std::vector<int32_t> & tokens, TextHidden & out, 
         }
         start += len;
     }
-    out.data     = static_cast<const float *>(m.hidden->data);
     out.n_tokens = n;
+    out.host     = m.remote;
+    if (m.remote) {
+        // Through host memory, not GPU to GPU: the two GPUs have no peer access to each other's memory.
+        m.host_rows.resize(size_t(n) * kTextHidden);
+        ggml_backend_tensor_get(m.hidden, m.host_rows.data(), 0, m.host_rows.size() * sizeof(float));
+        out.data = m.host_rows.data();
+    } else {
+        out.data = static_cast<const float *>(m.hidden->data);
+    }
     return true;
 }
 
