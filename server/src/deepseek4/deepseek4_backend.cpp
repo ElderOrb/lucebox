@@ -3172,10 +3172,13 @@ bool DeepSeek4Backend::init_streamed_expert_tier() {
     MoeHybridStorage * hybrid = moe_hybrid_.get();
     if (!hybrid || !hybrid->stream_engine || stream_cache_device_ < 0) return true;
     std::string err;
-    // The cache takes what the device has left beyond its headroom.
+    // The cache takes what the device has left beyond its headroom, less room
+    // for what it allocates after sizing its slots (its backend, the pinned
+    // loader staging and the mapped mailbox, which an APU takes from the same
+    // memory); without it the load check finds the device a few MiB short.
     MoeExpertCacheOptions cache_opts;
     cache_opts.device = stream_cache_device_;
-    cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device);
+    cache_opts.reserve_bytes = ds4_device_headroom_bytes(cache_opts.device) + ((size_t) 128 << 20);
     cache_opts.direct_path = cfg_.model_path;
     // Once experts are locked in host memory the page cache is too small to
     // hold the streamed tier, so every load reads the drive directly.
