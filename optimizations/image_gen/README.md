@@ -61,9 +61,9 @@ curl -s http://127.0.0.1:7860/v1/images/generations -H 'Content-Type: applicatio
 | `POST /sdapi/v1/txt2img` | AUTOMATIC1111's `prompt`, `negative_prompt`, `width`, `height`, `steps`, `cfg_scale`, `seed`, `batch_size`, `sampler_name`, `scheduler` |
 | `GET /v1/models` | the model, under `--model-name` (default `moss-image`) |
 
-A request without settings gets 1024×1024, 8 steps of er_sde on the simple schedule (the sampler ComfyUI runs for this model), CFG 2.5 and a new seed. stable-diffusion.cpp's `<sd_cpp_extra_args>{...}</sd_cpp_extra_args>` in an OpenAI prompt sets the seed, negative prompt, size, image count and `sample_params` (`sample_steps`, `sample_method` `euler` or `er_sde`, `scheduler` `discrete` or `simple`, `guidance.txt_cfg`, `eta`, `flow_shift`), so clients written for `sd-server` work unchanged. Sides are multiples of 16 from 256, up to 1024×1024 pixels in all; up to 100 steps and 8 images a request, and prompts of up to 16 KiB.
+A request without settings gets 1024×1024, 8 steps of er_sde on the simple schedule (the sampler ComfyUI runs for this model), CFG 1 and a new seed. stable-diffusion.cpp's `<sd_cpp_extra_args>{...}</sd_cpp_extra_args>` in an OpenAI prompt sets the seed, negative prompt, size, image count and `sample_params` (`sample_steps`, `sample_method` `euler` or `er_sde`, `scheduler` `discrete` or `simple`, `guidance.txt_cfg`, `eta`, `flow_shift`), so clients written for `sd-server` work unchanged. Sides are multiples of 16 from 256, up to 1024×1024 pixels in all; up to 100 steps and 8 images a request, and prompts of up to 16 KiB.
 
-CFG 1 is the fast setting, and at 8 steps some images come out misshapen: by eye, 4 of 8 in a check of two prompts with four seeds each, against 1 of 8 at CFG 2.5, where each step runs the model twice. Euler leaves 8-step images hazy on either schedule; er_sde does not.
+CFG 1 runs the model once a step (3.06 s an image), and at 8 steps some of its images come out misshapen: by eye, 4 of 8 in a check of two prompts with four seeds each, against 1 of 8 at CFG 2.5, where each step runs the model twice (5.78 s). Euler leaves 8-step images hazy on either schedule; er_sde does not.
 
 ## How it works
 

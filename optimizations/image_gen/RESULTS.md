@@ -51,7 +51,7 @@ The reference is the bf16 release weights on stock stable-diffusion.cpp with f32
 ## Sampler and CFG
 
 - At 8 steps, Euler leaves images hazy on its discrete schedule as on the simple one; er_sde does not, on either. Both make one model call a step.
-- At CFG 1, some images come out misshapen. In a check by eye of two prompts (a fox in fresh snow, a fisherman mending a net) with seeds 1 to 4, 4 of the 8 images were misshapen at CFG 1 and 1 of 8 at CFG 2.5. The server defaults to CFG 2.5 for that reason.
+- At CFG 1, some images come out misshapen. In a check by eye of two prompts (a fox in fresh snow, a fisherman mending a net) with seeds 1 to 4, 4 of the 8 images were misshapen at CFG 1 and 1 of 8 at CFG 2.5. The server defaults to CFG 1, which runs the model once a step; a request sets CFG 2.5 with `cfg_scale` or `guidance.txt_cfg`.
 
 ## Against a DGX Spark
 

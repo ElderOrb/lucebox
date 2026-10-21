@@ -34,7 +34,7 @@ struct ImageRequest {
     int          width         = 1024;
     int          height        = 1024;
     int          steps         = 8;
-    float        cfg_scale     = 2.5f;  // 1: no unconditional pass
+    float        cfg_scale     = 1.0f;  // 1: no unconditional pass
     SampleMethod sample_method = SampleMethod::er_sde;
     Scheduler    scheduler     = Scheduler::simple;
     float        eta           = 1.0f;  // er_sde noise
