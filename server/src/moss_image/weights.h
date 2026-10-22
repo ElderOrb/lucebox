@@ -11,7 +11,6 @@
 
 #include <hip/hip_runtime.h>
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -140,10 +139,10 @@ public:
 
     // Queues the copy read() made onto the current device on `stream`: ready[0] is recorded once everything before the
     // first DiT layer is there, ready[1 + l] once layer l is, ready[kLayers + 1] once the VAE decoder is, so that work
-    // on another stream can wait for each part alone. With `cancel`, it returns once the copies are done, and stops
-    // early when `cancel` is set: the device copy is then freed and the result is false with no error. A failed copy
-    // frees it too, with `error` set.
-    bool upload(hipStream_t stream, hipEvent_t * ready, const std::atomic<bool> * cancel, std::string & error);
+    // on another stream can wait for each part alone. With `stopped`, it returns once the copies are done, and stops
+    // early once (*stopped)() is true: the device copy is then freed and the result is false with no error. A failed
+    // copy frees it too, with `error` set.
+    bool upload(hipStream_t stream, hipEvent_t * ready, const std::function<bool()> * stopped, std::string & error);
 
     // Frees the device copy; the work using it must be done.
     void release();

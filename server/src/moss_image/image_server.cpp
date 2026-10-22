@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -413,9 +414,9 @@ private:
                 keep_weights = body["keep_weights"].get<bool>();
             }
         }
-        if (release) {
-            generator_.cancel_load();  // a load in progress lets go of the GPU soon
-        }
+        // A release stops the loads asked for before it, the one copying and any still waiting for the GPU.
+        const uint64_t releases = release ? ++releases_ : releases_.load();
+
         std::string error;
         bool        ok = true;
         MemoryState state;
@@ -424,7 +425,7 @@ private:
             if (release) {
                 ok = generator_.release_memory(keep_weights, error);
             } else if (load) {
-                ok = generator_.load_weights(error);
+                ok = generator_.load_weights([this, releases] { return releases_.load() != releases; }, error);
             }
             state = generator_.memory();
         }
@@ -549,6 +550,7 @@ private:
     const ImageServerConfig & config_;
     Generator &               generator_;
     std::mutex                gpu_;
+    std::atomic<uint64_t>     releases_{ 0 };  // POST /memory/release requests so far
 };
 
 int listen_on(const std::string & host, const int port) {

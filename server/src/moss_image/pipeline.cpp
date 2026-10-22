@@ -8,7 +8,6 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -36,10 +35,6 @@ constexpr size_t kLoadHeadroom = size_t(1) << 30;
 constexpr size_t kFreeSlack    = size_t(64) << 20;
 constexpr auto   kFreeWait     = std::chrono::seconds(10);
 constexpr auto   kClearWait    = std::chrono::seconds(2);
-
-int64_t round_up(const int64_t v, const int64_t m) {
-    return (v + m - 1) / m * m;
-}
 
 // A device buffer that only grows: work buffers are sized for the largest request so far. Grown only while the
 // stream is idle.
@@ -135,6 +130,7 @@ struct Pipeline::Impl {
     DeviceBuffer time_in, time_hidden, time_emb, block_mod, head_mod;
     // DiT.
     DeviceBuffer x, xq, xs, q, k, v, att, sums, hq, hs, pe, state_bf16, img, head_in, pred, state, old_den, old_dd;
+    DeviceBuffer split;  // the int8 GEMMs' split-K workspace (gemm_i8_split_bytes): this stream's own
     // VAE.
     DeviceBuffer maps[4], nhwc[2], gn_scratch, scores, probs, rgb;
     PinnedBuffer host_pe, host_time;
@@ -144,12 +140,11 @@ struct Pipeline::Impl {
     int          warmup_width = 1024, warmup_height = 1024;
 
     // Standby: the weights' copies onto the GPU run on copy_stream, and ready[] marks each part's arrival.
-    bool              standby      = false;
-    bool              needs_warmup = false;  // no tuning file yet: the first request tunes the GEMM kernels first
-    bool              streaming    = false;  // this request's weights are still arriving
-    hipStream_t       copy_stream  = nullptr;
-    hipEvent_t        ready[Weights::kParts] = {};
-    std::atomic<bool> cancel{ false };  // stops load_weights()
+    bool        standby      = false;
+    bool        needs_warmup = false;  // no tuning file yet: the first request tunes the GEMM kernels first
+    bool        streaming    = false;  // this request's weights are still arriving
+    hipStream_t copy_stream  = nullptr;
+    hipEvent_t  ready[Weights::kParts] = {};
 
     ~Impl() {
         for (hipEvent_t e : events) {
@@ -174,8 +169,8 @@ struct Pipeline::Impl {
     std::vector<DeviceBuffer *> work_buffers() {
         std::vector<DeviceBuffer *> all = { &t_states, &t_bf16, &t_mm, &t_q, &t_k, &t_v, &t_att, &t_pe, &time_in,
                                             &time_hidden, &time_emb, &block_mod, &head_mod, &x, &xq, &xs, &q, &k, &v,
-                                            &att, &sums, &hq, &hs, &pe, &state_bf16, &img, &head_in, &pred, &state,
-                                            &old_den, &old_dd, &gn_scratch, &scores, &probs, &rgb };
+                                            &att, &sums, &hq, &hs, &pe, &split, &state_bf16, &img, &head_in, &pred,
+                                            &state, &old_den, &old_dd, &gn_scratch, &scores, &probs, &rgb };
         for (DeviceBuffer & map : maps) {
             all.push_back(&map);
         }
@@ -309,17 +304,16 @@ bool Pipeline::Impl::reserve(const int64_t n_img, const int64_t rows, const int 
         *shortfall += bytes > buffer.bytes() ? bytes - buffer.bytes() : 0;
         return true;
     };
-    const int64_t rows_pad = round_up(rows, 4);  // the hipBLASLt int8 operand's rows
     bool ok = grow(time_in, size_t(steps) * kTimeFreqs * sizeof(float)) &&
               grow(time_hidden, size_t(steps) * kHidden * sizeof(float)) &&
               grow(time_emb, size_t(steps) * kHidden * sizeof(float)) &&
               grow(block_mod, size_t(steps) * 6 * kHidden * sizeof(float)) &&
               grow(head_mod, size_t(steps) * 2 * kHidden * sizeof(float));
-    ok = ok && grow(x, rows * kHidden * sizeof(float)) && grow(xq, rows_pad * kHidden) &&
-         grow(xs, rows_pad * sizeof(float)) && grow(q, rows * kHidden * sizeof(float)) &&
+    ok = ok && grow(x, rows * kHidden * sizeof(float)) && grow(xq, rows * kHidden) &&
+         grow(xs, rows * sizeof(float)) && grow(q, rows * kHidden * sizeof(float)) &&
          grow(k, rows * kHidden * sizeof(uint16_t)) && grow(v, rows * kHidden * sizeof(uint16_t)) &&
-         grow(att, rows * kHidden * sizeof(float)) && grow(sums, rows_pad * 2 * kFfn * sizeof(int32_t)) &&
-         grow(hq, rows_pad * kFfn) && grow(hs, rows_pad * sizeof(float)) &&
+         grow(att, rows * kHidden * sizeof(float)) && grow(sums, rows * 2 * kFfn * sizeof(int32_t)) &&
+         grow(hq, rows * kFfn) && grow(hs, rows * sizeof(float)) &&
          grow(pe, rows * kRopePairs * 2 * sizeof(float)) &&
          grow(state_bf16, n_img * kLatentChannels * sizeof(uint16_t)) &&
          grow(img, n_img * kHidden * sizeof(float)) && grow(head_in, n_seq * n_img * kHidden * sizeof(uint16_t)) &&
@@ -327,6 +321,9 @@ bool Pipeline::Impl::reserve(const int64_t n_img, const int64_t rows, const int 
          grow(state, n_img * kLatentChannels * sizeof(float)) &&
          grow(old_den, n_img * kLatentChannels * sizeof(float)) &&
          grow(old_dd, n_img * kLatentChannels * sizeof(float));
+    const bool new_split = shortfall == nullptr && split.bytes() == 0;  // a new split-K workspace starts zeroed
+    ok = ok && grow(split, gemm_i8_split_bytes()) &&
+         (!new_split || hipMemsetAsync(split.as<void>(), 0, split.bytes(), stream) == hipSuccess);
     // VAE decoder: the largest map is 512 channels at 4x4 or 256 channels at 8x8 the latent's pixels, so 16384
     // values per latent pixel; the mid-block attention scores are latent_hw^2.
     size_t gn = 0;
@@ -366,7 +363,7 @@ bool Pipeline::Impl::dit_layer(const DitLayer & layer, const float * mod, const 
     norm_quantize_i8(xf, active, kHidden, layer.norm1, scale1, shift1, kEps, xq.as<int8_t>(), xs.as<float>(), stream);
     gemm_i8_qkv_attention(layer.qkv.w, layer.qkv.scale, xq.as<int8_t>(), xs.as<float>(), active, kHidden, kHeads,
                           layer.q_norm, layer.k_norm, kEps, pe.as<float>(), q.as<float>(), k.as<uint16_t>(),
-                          v.as<uint16_t>(), stream);
+                          v.as<uint16_t>(), split.as<int32_t>(), stream);
     const float attn_scale = 1.0f / std::sqrt(float(kHeadDim));
     attention_d128(q.as<float>(), k.as<uint16_t>(), v.as<uint16_t>(), active, 0, rows_c, kHeads, attn_scale,
                    att.as<float>(), stream);
@@ -376,13 +373,13 @@ bool Pipeline::Impl::dit_layer(const DitLayer & layer, const float * mod, const 
     }
     quantize_i8(att.as<float>(), active, kHidden, xq.as<int8_t>(), xs.as<float>(), stream);
     gemm_i8_gated_residual(layer.o.w, layer.o.scale, xq.as<int8_t>(), xs.as<float>(), active, kHidden, kHidden, gate1,
-                           xf, stream);
+                           xf, split.as<int32_t>(), stream);
     norm_quantize_i8(xf, active, kHidden, layer.norm2, scale2, shift2, kEps, xq.as<int8_t>(), xs.as<float>(), stream);
     gemm_i8_i32(layer.up_gate.w, xq.as<int8_t>(), active, kHidden, 2 * kFfn, sums.as<int32_t>(), stream);
     situ_quantize_i8(sums.as<int32_t>(), xs.as<float>(), layer.up_gate.scale, active, kFfn, hq.as<int8_t>(),
                      hs.as<float>(), stream);
     gemm_i8_gated_residual(layer.down.w, layer.down.scale, hq.as<int8_t>(), hs.as<float>(), active, kFfn, kHidden,
-                           gate2, xf, stream);
+                           gate2, xf, split.as<int32_t>(), stream);
     return true;
 }
 
@@ -555,7 +552,7 @@ bool Pipeline::Impl::decode(const int lh, const int lw, std::string & error) {
     return ok;
 }
 
-// Kernels tuned since the tuning file was read or written go into it. A file that cannot be written is said once.
+// Kernels the warm-up tuned go into the tuning file. A file that cannot be written is said once.
 void Pipeline::Impl::save_tuning() {
     if (!tuning_path.empty() && blas.tuning_changed() && !blas.save_tuning(tuning_path)) {
         std::fprintf(stderr, "[moss-image] cannot write the GEMM tuning file %s\n", tuning_path.c_str());
@@ -714,8 +711,8 @@ bool Pipeline::load(const PipelineOptions & options, std::string & error) {
     return true;
 }
 
-// Every GEMM shape of a request is tuned before the first (only those not found again, after a partial preload), and
-// the tuning file keeps the kernels for the next run.
+// The only GEMM tuning: every shape of a request at the warm-up size, before the first request (only those not found
+// again, after a partial preload), kept in the tuning file for the next run.
 bool Pipeline::warm_up(std::string & error) {
     Impl &       m = *impl_;
     ImageRequest warmup;
@@ -726,15 +723,18 @@ bool Pipeline::warm_up(std::string & error) {
     warmup.seed   = 0;
     RgbImage image;
     m.warming_up = true;
+    m.blas.set_tuning(true);
+    bool ok = true;
     for (const float cfg : { 2.5f, 1.0f }) {
         warmup.cfg_scale = cfg;
-        if (!generate(warmup, image, error)) {
-            m.warming_up = false;
-            error        = "warm-up: " + error;
-            return false;
-        }
+        ok               = ok && generate(warmup, image, error);
     }
+    m.blas.set_tuning(false);
     m.warming_up = false;
+    if (!ok) {
+        error = "warm-up: " + error;
+        return false;
+    }
     m.save_tuning();
     return true;
 }
@@ -839,7 +839,6 @@ bool Pipeline::generate(const ImageRequest & request, RgbImage & image, std::str
     std::fprintf(stderr, "[moss-image] %dx%d, %d steps, cfg %.2f: text %.0f ms, sampling %.0f ms, decode %.0f ms%s\n",
                  request.width, request.height, request.steps, request.cfg_scale, text_ms, sample_ms, decode_ms,
                  streamed ? ", weights copied in meanwhile" : "");
-    m.save_tuning();
     return true;
 }
 
@@ -890,14 +889,16 @@ bool Pipeline::release_memory(const bool keep_weights, std::string & error) {
     return true;
 }
 
-bool Pipeline::load_weights(std::string & error) {
+bool Pipeline::load_weights(const std::function<bool()> & stopped, std::string & error) {
     Impl & m = *impl_;
     if (!m.standby) {
-        return Generator::load_weights(error);
+        return Generator::load_weights(stopped, error);
     }
-    m.cancel = false;
     if (m.weights.on_device()) {
         return true;
+    }
+    if (stopped()) {
+        return false;
     }
     const size_t bytes = m.weights.host_bytes();
     const size_t free  = m.free_bytes();
@@ -907,17 +908,13 @@ bool Pipeline::load_weights(std::string & error) {
         return false;
     }
     const auto t0 = std::chrono::steady_clock::now();
-    if (!m.weights.upload(m.copy_stream, m.ready, &m.cancel, error)) {
+    if (!m.weights.upload(m.copy_stream, m.ready, &stopped, error)) {
         m.wait_cleared(free);  // stopped: the copy started is given back
         return false;
     }
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "[moss-image] weights on the GPU in %.2f s (%.1f GB/s)\n", seconds, bytes / seconds / 1e9);
     return true;
-}
-
-void Pipeline::cancel_load() {
-    impl_->cancel = true;
 }
 
 } // namespace luce::moss_image

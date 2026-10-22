@@ -512,7 +512,8 @@ bool Weights::read(const std::string & path, std::string & error) {
     return true;
 }
 
-bool Weights::upload(hipStream_t stream, hipEvent_t * ready, const std::atomic<bool> * cancel, std::string & error) {
+bool Weights::upload(hipStream_t stream, hipEvent_t * ready, const std::function<bool()> * stopped,
+                     std::string & error) {
     if (host_ == nullptr) {
         error = "the weights are not in host memory";
         return false;
@@ -527,7 +528,7 @@ bool Weights::upload(hipStream_t stream, hipEvent_t * ready, const std::atomic<b
             bind(static_cast<uint8_t *>(device_));
         }
     }
-    // Pieces of at most 128 MiB: with `cancel`, each one is waited for, so that a cancel stops the copies soon.
+    // Pieces of at most 128 MiB: with `stopped`, each one is waited for, so that the copies stop soon.
     constexpr size_t kPiece = size_t(128) << 20;
     const uint8_t *  host   = static_cast<const uint8_t *>(host_);
     uint8_t *        device = static_cast<uint8_t *>(device_);
@@ -535,13 +536,13 @@ bool Weights::upload(hipStream_t stream, hipEvent_t * ready, const std::atomic<b
     bool             ok     = true;
     for (int part = 0; ok && part < kParts; ++part) {
         while (ok && begin < part_end_[part]) {
-            if (cancel != nullptr && cancel->load()) {
+            if (stopped != nullptr && (*stopped)()) {
                 release();
                 return false;
             }
             const size_t bytes = std::min(kPiece, part_end_[part] - begin);
             ok = hipMemcpyAsync(device + begin, host + begin, bytes, hipMemcpyHostToDevice, stream) == hipSuccess &&
-                 (cancel == nullptr || hipStreamSynchronize(stream) == hipSuccess);
+                 (stopped == nullptr || hipStreamSynchronize(stream) == hipSuccess);
             begin += bytes;
         }
         ok = ok && hipEventRecord(ready[part], stream) == hipSuccess;

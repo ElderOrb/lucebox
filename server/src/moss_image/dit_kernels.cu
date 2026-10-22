@@ -325,11 +325,9 @@ namespace gemm_i8 {
 
 constexpr int WM = 4, WN = 2, BM = 64 * WM, BN = 64 * WN, NT = 32 * WM * WN;
 
-// A split tile's k ranges (block_tile) meet in this workspace: the int32 sums of up to SPLIT_TILES tiles (N = 9216,
-// the qkv linear) in the accumulators' layout, and how many ranges of each have arrived.
-constexpr int SPLIT = 4, SPLIT_TILES = 36;
-__device__ int32_t  split_sums[SPLIT_TILES * NT * 128];
-__device__ unsigned split_arrivals[SPLIT_TILES];
+// A split tile's k ranges (block_tile) meet in the caller's workspace (gemm_i8_split_bytes): the int32 sums of up to
+// SPLIT_TILES tiles (N = 9216, the qkv linear) in the accumulators' layout, then how many ranges of each have arrived.
+constexpr int SPLIT = 4, SPLIT_TILES = 36, SPLIT_SUMS = SPLIT_TILES * NT * 128;
 
 #if defined(MOSS_GFX12)
 constexpr int BK = 64, WS = BK + 16, CPR = BK / 16, CA = BM * CPR / NT, CB = BN * CPR / NT, RPS = NT / CPR;
@@ -500,15 +498,18 @@ __device__ __forceinline__ int block_tile(const int N, const int T, const int K,
     return i / SPLIT;
 }
 
-// The end of a split tile's k range: the ranges add their sums into the tile's workspace (int32 sums are exact in any
-// order) in the accumulators' own layout, so a wave's atomics are whole cache lines, for the 16-token columns with a
-// token below T (the rest is dropped anyway). The range that arrives last takes the totals into acc, leaving the
-// workspace and the count zero for the next launch, and returns true to run the epilogue; the others return false.
+// The end of a split tile's k range: the ranges add their sums into the tile's part of the workspace `split` (int32
+// sums are exact in any order) in the accumulators' own layout, so a wave's atomics are whole cache lines, for the
+// 16-token columns with a token below T (the rest is dropped anyway). The range that arrives last takes the totals
+// into acc, leaving the sums and the count zero for the next launch, and returns true to run the epilogue; the others
+// return false.
 template <int TI, int TJ>
-__device__ __forceinline__ bool split_reduce(v8i_t (&acc)[TI][TJ], const int tile, const int t0, const int T) {
+__device__ __forceinline__ bool split_reduce(v8i_t (&acc)[TI][TJ], int32_t * split, const int tile, const int t0,
+                                             const int T) {
     __shared__ int last;
-    const int lane = threadIdx.x % 32, wave = threadIdx.x / 32, wn = wave / (BM / (16 * TI));
-    int32_t * ws = split_sums + (size_t) tile * NT * 128 + wave * 32 * 128 + lane;  // + 32 ((i TJ + j) 8 + e)
+    const int  lane = threadIdx.x % 32, wave = threadIdx.x / 32, wn = wave / (BM / (16 * TI));
+    int32_t *  ws       = split + (size_t) tile * NT * 128 + wave * 32 * 128 + lane;  // + 32 ((i TJ + j) 8 + e)
+    unsigned * arrivals = (unsigned *) (split + SPLIT_SUMS) + tile;
 #pragma unroll
     for (int j = 0; j < TJ; ++j) {
         if (t0 + 16 * TJ * wn + 16 * j < T) {
@@ -524,7 +525,7 @@ __device__ __forceinline__ bool split_reduce(v8i_t (&acc)[TI][TJ], const int til
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
-        last = atomicAdd(&split_arrivals[tile], 1u) == SPLIT - 1;
+        last = atomicAdd(arrivals, 1u) == SPLIT - 1;
     }
     __syncthreads();
     if (!last) {
@@ -544,7 +545,7 @@ __device__ __forceinline__ bool split_reduce(v8i_t (&acc)[TI][TJ], const int til
         }
     }
     if (threadIdx.x == 0) {
-        split_arrivals[tile] = 0;
+        *arrivals = 0;
     }
     return true;
 }
@@ -594,7 +595,7 @@ int64_t blocks(const int64_t n, const int64_t rows, const bool split = false) {
 // i0 + 6, so its wave sum (lanes ^ 16, 8, 4, 2, 1) adds over i0 in the lane, then with lane ^ 16, then over e in the
 // lane; a RoPE pair (p, p + 64) is tiles i and i + 4 of one lane.
 __global__ void __launch_bounds__(gemm_i8::NT) gemm_i8_qkv_attention_kernel(
-        const int8_t * __restrict__ W, const int8_t * __restrict__ X, const int T, const int K, const bool split,
+        const int8_t * __restrict__ W, const int8_t * __restrict__ X, const int T, const int K, int32_t * split,
         const float * __restrict__ act_scales, const float * __restrict__ weight_scales,
         const float * __restrict__ q_w, const float * __restrict__ k_w, const float eps, const float * __restrict__ pe,
         const int heads, float * __restrict__ q, _Float16 * __restrict__ k, _Float16 * __restrict__ v) {
@@ -604,10 +605,10 @@ __global__ void __launch_bounds__(gemm_i8::NT) gemm_i8_qkv_attention_kernel(
     __shared__ __attribute__((aligned(16))) int8_t smem[LDS];
     const int dim = heads * head_dim, N = 3 * dim;
     int f0, t0, k0, nkb;
-    const int tile = block_tile(N, T, K, 0, split, f0, t0, k0, nkb);
+    const int tile = block_tile(N, T, K, 0, split != nullptr, f0, t0, k0, nkb);
     v8i_t acc[TI][TJ];
     mainloop_wave(weight_rows(W, K, f0), (size_t) RPS * K, X, T, K, t0, k0, nkb, smem, acc);
-    if (tile >= 0 && !split_reduce(acc, tile, t0, T)) {
+    if (tile >= 0 && !split_reduce(acc, split, tile, t0, T)) {
         return;
     }
 
@@ -741,16 +742,16 @@ __global__ void __launch_bounds__(gemm_i8::NT) gemm_i8_qkv_attention_kernel(
 // writes, all four of a token's before any store.
 __global__ void __launch_bounds__(gemm_i8::NT) gemm_i8_gated_residual_kernel(
         const int8_t * __restrict__ W, const int8_t * __restrict__ X, const int N, const int T, const int K, const int S,
-        const bool split, const float * __restrict__ act_scales, const float * __restrict__ weight_scales,
+        int32_t * split, const float * __restrict__ act_scales, const float * __restrict__ weight_scales,
         const float * __restrict__ gate, float * x) {
 #if defined(MOSS_GFX12)
     using namespace gemm_i8;
     __shared__ __attribute__((aligned(16))) int8_t smem[LDS];
     int f0, t0, k0, nkb;
-    const int tile = block_tile(N, T, K, S, split, f0, t0, k0, nkb);
+    const int tile = block_tile(N, T, K, S, split != nullptr, f0, t0, k0, nkb);
     v8i_t acc[4][4];
     mainloop_wave(weight_rows(W, K, f0), (size_t) RPS * K, X, T, K, t0, k0, nkb, smem, acc);
-    if (tile >= 0 && !split_reduce(acc, tile, t0, T)) {
+    if (tile >= 0 && !split_reduce(acc, split, tile, t0, T)) {
         return;
     }
 
@@ -1550,14 +1551,18 @@ void quantize_i8(const float * x, const int64_t rows, const int64_t k, int8_t * 
     launch_convrot<false>(x, rows, k, nullptr, nullptr, nullptr, 0.0f, xq, xs, stream);
 }
 
+size_t gemm_i8_split_bytes() {
+    return size_t(gemm_i8::SPLIT_SUMS) * sizeof(int32_t) + gemm_i8::SPLIT_TILES * sizeof(unsigned);
+}
+
 void gemm_i8_qkv_attention(const int8_t * w, const float * w_scales, const int8_t * xq, const float * xs,
                            const int64_t rows, const int64_t k, const int heads, const float * q_w, const float * k_w,
                            const float eps, const float * pe, float * q, uint16_t * k_out, uint16_t * v,
-                           hipStream_t stream) {
-    const int64_t n     = 3 * heads * 128;
-    const bool    split = gemm_i8::split_tail(n, rows, k);
-    gemm_i8_qkv_attention_kernel<<<(unsigned) gemm_i8::blocks(n, rows, split), gemm_i8::NT, 0, stream>>>(
-        w, xq, (int) rows, (int) k, split, xs, w_scales, q_w, k_w, eps, pe, heads, q, (_Float16 *) k_out, (_Float16 *) v);
+                           int32_t * split, hipStream_t stream) {
+    const int64_t n  = 3 * heads * 128;
+    int32_t *     ws = split != nullptr && gemm_i8::split_tail(n, rows, k) ? split : nullptr;
+    gemm_i8_qkv_attention_kernel<<<(unsigned) gemm_i8::blocks(n, rows, ws != nullptr), gemm_i8::NT, 0, stream>>>(
+        w, xq, (int) rows, (int) k, ws, xs, w_scales, q_w, k_w, eps, pe, heads, q, (_Float16 *) k_out, (_Float16 *) v);
 }
 
 void attention_d128(const float * q, const uint16_t * k, const uint16_t * v, const int64_t rows, const int64_t first,
@@ -1581,11 +1586,11 @@ void attention_d128(const float * q, const uint16_t * k, const uint16_t * v, con
 
 void gemm_i8_gated_residual(const int8_t * w, const float * w_scales, const int8_t * xq, const float * xs,
                             const int64_t rows, const int64_t k, const int64_t n, const float * gate, float * x,
-                            hipStream_t stream) {
-    const int  stagger = k >= 8192 ? 5 : 0;  // k blocks staggered by 5 per block: only the long k loop gains
-    const bool split   = gemm_i8::split_tail(n, rows, k);
-    gemm_i8_gated_residual_kernel<<<(unsigned) gemm_i8::blocks(n, rows, split), gemm_i8::NT, 0, stream>>>(
-        w, xq, (int) n, (int) rows, (int) k, stagger, split, xs, w_scales, gate, x);
+                            int32_t * split, hipStream_t stream) {
+    const int stagger = k >= 8192 ? 5 : 0;  // k blocks staggered by 5 per block: only the long k loop gains
+    int32_t * ws      = split != nullptr && gemm_i8::split_tail(n, rows, k) ? split : nullptr;
+    gemm_i8_gated_residual_kernel<<<(unsigned) gemm_i8::blocks(n, rows, ws != nullptr), gemm_i8::NT, 0, stream>>>(
+        w, xq, (int) n, (int) rows, (int) k, stagger, ws, xs, w_scales, gate, x);
 }
 
 void gemm_i8_i32(const int8_t * w, const int8_t * xq, const int64_t rows, const int64_t k, const int64_t n,

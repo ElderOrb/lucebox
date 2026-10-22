@@ -46,8 +46,7 @@ public:
 
     MemoryState memory() override;
     bool        release_memory(bool keep_weights, std::string & error) override;
-    bool        load_weights(std::string & error) override;
-    void        cancel_load() override;
+    bool        load_weights(const std::function<bool()> & stopped, std::string & error) override;
 
 private:
     // One image with and one without CFG at the warm-up size, which tune every GEMM a request runs.

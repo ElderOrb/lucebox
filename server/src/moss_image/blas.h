@@ -1,13 +1,17 @@
-// hipBLASLt GEMMs of MOSS-Image: every linear and the VAE attention products.
+// hipBLASLt GEMMs of MOSS-Image: the bf16 linears (the text embedder, the DiT's first and last) and the VAE's attention
+// products.
 //
 // All products are D[rows][n] = B[rows][k] * A[n][k]^T in row-major terms: A holds the weights (or the keys),
 // one row per output column, B the activations, one row per token. hipBLASLt sees column-major D (n x rows) =
 // A^T (n x k) * B (k x rows) with TRANSA = T.
 //
-// hipBLASLt's implicit heuristic is not its fastest kernel for every shape: the first product of a shape times the
-// heuristic's top 16 candidates and keeps the fastest. The token count moves with every prompt while the best kernel
-// does not, so one tuning serves a 256-row bucket and each new exact problem only checks the bucket's kernel. A file
-// keeps the tuned kernels for the next run on the same GPU and hipBLASLt, which then finds them again without timing.
+// hipBLASLt's implicit heuristic is not its fastest kernel for every shape: while tuning is on (the warm-up), the
+// first product of a shape times the heuristic's top 16 candidates and keeps the fastest. The token count moves with
+// every prompt while the best kernel does not, so one tuning serves a 256-row bucket and each new exact problem only
+// checks the bucket's kernel. A file keeps the tuned kernels for the next run on the same GPU and hipBLASLt, which then
+// finds them again without timing. With tuning off, a problem its bucket's kernel cannot run takes the implicit
+// heuristic's, and nothing is timed or kept: a product depends on its problem, the tuning file, the GPU and hipBLASLt,
+// never on timing or on the products before it.
 
 #pragma once
 
@@ -22,10 +26,10 @@
 
 namespace luce::moss_image {
 
+// The values are the tuning file's: 0 was an int8 type that nothing runs any more, and its lines are skipped.
 enum class GemmType {
-    i8_i32,    // int8 A and B, int32 D
-    bf16_f32,  // bf16 A and B, f32 accumulation and D
-    f16_f32,   // f16 A and B, f32 accumulation and D
+    bf16_f32 = 1,  // bf16 A and B, f32 accumulation and D
+    f16_f32  = 2,  // f16 A and B, f32 accumulation and D
 };
 
 class Blas {
@@ -53,6 +57,9 @@ public:
 
     // True when the file save_tuning() writes would differ from the one load_tuning() read.
     bool tuning_changed() const { return changed_; }
+
+    // Tuning on or off (off at first): see above.
+    void set_tuning(bool on) { tuning_ = on; }
 
     // D = B * A^T with leading dimensions (row strides, in elements) lda >= k, ldb >= k, ldd >= n.
     bool gemm(GemmType type, const void * a, int64_t lda, const void * b, int64_t ldb, void * d, int64_t ldd,
@@ -97,6 +104,7 @@ private:
     std::map<Problem, Tuned> bucket_algos_;  // the tuned kernel of each 256-row bucket
     std::map<Problem, int>   stored_;        // from the tuning file: each timed problem's kernel index
     bool                     changed_ = false;
+    bool                     tuning_  = false;
 };
 
 } // namespace luce::moss_image

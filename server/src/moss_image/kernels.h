@@ -5,8 +5,7 @@
 // were measured in (same order, same rounding), so the port's images match it.
 //
 // Int8 linears use the convrot format: an activation row of k values is quantized to int8 after a 256-wide Hadamard
-// rotation, with one scale per row (xq [rows][k] int8, xs [rows] f32). The hipBLASLt int8 GEMM reads xq with its rows
-// padded to a multiple of 4; the padding rows may hold anything.
+// rotation, with one scale per row (xq [rows][k] int8, xs [rows] f32).
 //
 // Batched CFG: the conditional and the unconditional sequence are stacked in one activation, conditional rows first
 // (rows 0 .. n_cond - 1, then n_cond .. n_cond + n_uncond - 1). Each sequence is its n_img image tokens followed by
@@ -134,12 +133,17 @@ void norm_quantize_i8(const float * x, int64_t rows, int64_t k, const float * no
 // Convrot quantization without a norm: x [rows][k] f32 -> xq [rows][k], xs [rows]. k is 2048, 3072 or 4096.
 void quantize_i8(const float * x, int64_t rows, int64_t k, int8_t * xq, float * xs, hipStream_t stream);
 
+// The workspace `split` of the two int8 GEMMs below, which split the k loop of a partial last token block across
+// blocks: zeroed before its first use, and left zero by every launch. Launches that can run at once (on two streams)
+// need one each; nullptr runs them without.
+size_t gemm_i8_split_bytes();
+
 // The int8 qkv linear fused with the attention prologue: w [3 * heads * 128][k] int8 with w_scales [3 * heads * 128]
 // times xq [rows][k] (xs [rows]), then q and k through rms_norm * q_w / k_w (eps) and RoPE (pe [rows][64][2]), v cast.
 // q f32, k and v f16, each [heads][rows][128]. heads * 128 % 256 == 0, k % 64 == 0.
 void gemm_i8_qkv_attention(const int8_t * w, const float * w_scales, const int8_t * xq, const float * xs, int64_t rows,
                            int64_t k, int heads, const float * q_w, const float * k_w, float eps, const float * pe,
-                           float * q, uint16_t * k_out, uint16_t * v, hipStream_t stream);
+                           float * q, uint16_t * k_out, uint16_t * v, int32_t * split, hipStream_t stream);
 
 // Self-attention with head size 128, no mask, of the sequence in rows first .. first + n - 1 of q, k and v
 // ([heads][rows][128] as written by the prologues). dst [rows][heads * 128] f32, written at rows first .. first + n - 1.
@@ -150,7 +154,7 @@ void attention_d128(const float * q, const uint16_t * k, const uint16_t * v, int
 // An int8 linear with a gated residual: x [rows][n] += (w [n][k] (w_scales [n]) times xq [rows][k] (xs [rows])) * gate
 // [n]. n % 256 == 0, k % 64 == 0.
 void gemm_i8_gated_residual(const int8_t * w, const float * w_scales, const int8_t * xq, const float * xs, int64_t rows,
-                            int64_t k, int64_t n, const float * gate, float * x, hipStream_t stream);
+                            int64_t k, int64_t n, const float * gate, float * x, int32_t * split, hipStream_t stream);
 
 // The int32 sums of an int8 linear: w [n][k] int8 times xq [rows][k], sums [rows][n] (rows past rows not written).
 // n % 256 == 0, k % 64 == 0.

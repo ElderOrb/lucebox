@@ -27,18 +27,16 @@ struct TypeInfo {
 
 TypeInfo type_info(const GemmType type) {
     switch (type) {
-        case GemmType::i8_i32:   return { HIP_R_8I, HIP_R_32I, HIPBLAS_COMPUTE_32I, HIP_R_32I };
         case GemmType::bf16_f32: return { HIP_R_16BF, HIP_R_32F, HIPBLAS_COMPUTE_32F, HIP_R_32F };
         case GemmType::f16_f32:  return { HIP_R_16F, HIP_R_32F, HIPBLAS_COMPUTE_32F, HIP_R_32F };
     }
     return {};
 }
 
-// alpha 1 and beta 0 in the problem's scale type.
-const void * scalar(const GemmType type, const bool one) {
-    static const int32_t i32[2] = { 0, 1 };
-    static const float   f32[2] = { 0.0f, 1.0f };
-    return type == GemmType::i8_i32 ? static_cast<const void *>(&i32[one]) : static_cast<const void *>(&f32[one]);
+// alpha 1 and beta 0 (every type scales in f32).
+const void * scalar(const bool one) {
+    static const float f32[2] = { 0.0f, 1.0f };
+    return &f32[one];
 }
 
 int64_t bucket_rows(const int64_t rows) {
@@ -108,11 +106,12 @@ int Blas::heuristic(const Plan & plan, hipblasLtMatmulHeuristicResult_t * candid
     return status == HIPBLAS_STATUS_SUCCESS ? n_found : 0;
 }
 
-// The bucket's kernel when it runs this exact problem, else the fastest of the heuristic's candidates, timed on the
-// call's own operands (each candidate writes the same product to d). False inside stream capture, which cannot time.
+// The bucket's kernel when it runs this exact problem; else, while tuning, the fastest of the heuristic's candidates,
+// timed on the call's own operands (each candidate writes the same product to d); else the implicit heuristic's. False
+// inside stream capture, which cannot time.
 bool Blas::choose_algo(const Problem & p, Plan & plan, const void * a, const void * b, void * d) {
-    const void * alpha = scalar(p.type, true);
-    const void * beta  = scalar(p.type, false);
+    const void * alpha = scalar(true);
+    const void * beta  = scalar(false);
     Problem bucket = p;
     bucket.rows    = bucket_rows(p.rows);
     const auto known = bucket_algos_.find(bucket);
@@ -127,6 +126,9 @@ bool Blas::choose_algo(const Problem & p, Plan & plan, const void * a, const voi
             plan.tuned = true;
             return true;
         }
+    }
+    if (!tuning_) {
+        return true;
     }
     hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
     if (hipStreamIsCapturing(stream_, &capture) != hipSuccess || capture != hipStreamCaptureStatusNone) {
@@ -206,8 +208,8 @@ size_t Blas::load_tuning(const std::string & path) {
             int                type  = -1;
             int                index = -1;
             Problem            p{};
-            if (fields >> type >> p.n >> p.rows >> p.k >> p.lda >> p.ldb >> p.ldd >> index && type >= 0 &&
-                type <= int(GemmType::f16_f32)) {
+            if (fields >> type >> p.n >> p.rows >> p.k >> p.lda >> p.ldb >> p.ldd >> index &&
+                type >= int(GemmType::bf16_f32) && type <= int(GemmType::f16_f32)) {
                 p.type     = GemmType(type);
                 stored_[p] = index;
             }
@@ -243,10 +245,9 @@ size_t Blas::preload(hipStream_t stream) {
     size_t b_bytes = 0;
     size_t d_bytes = 0;
     for (const auto & [p, algo] : found) {
-        const size_t ab = p.type == GemmType::i8_i32 ? 1 : 2;
-        a_bytes         = std::max(a_bytes, size_t(p.n * p.lda) * ab);
-        b_bytes         = std::max(b_bytes, size_t(p.rows * p.ldb) * ab);
-        d_bytes         = std::max(d_bytes, size_t(p.rows * p.ldd) * 4);
+        a_bytes = std::max(a_bytes, size_t(p.n * p.lda) * 2);  // bf16 or f16
+        b_bytes = std::max(b_bytes, size_t(p.rows * p.ldb) * 2);
+        d_bytes = std::max(d_bytes, size_t(p.rows * p.ldd) * 4);
     }
     a_bytes          = (a_bytes + 255) / 256 * 256;
     b_bytes          = (b_bytes + 255) / 256 * 256;
@@ -260,8 +261,8 @@ size_t Blas::preload(hipStream_t stream) {
     for (auto & [p, algo] : found) {
         Plan plan;
         if (make_plan(p, plan)) {
-            (void) hipblasLtMatmul(handle_, plan.desc, scalar(p.type, true), a, plan.a_layout, b, plan.b_layout,
-                                   scalar(p.type, false), d, plan.d_layout, d, plan.d_layout, &algo, workspace_,
+            (void) hipblasLtMatmul(handle_, plan.desc, scalar(true), a, plan.a_layout, b, plan.b_layout,
+                                   scalar(false), d, plan.d_layout, d, plan.d_layout, &algo, workspace_,
                                    kWorkspaceBytes, stream);
         }
         destroy_plan(plan);
@@ -313,9 +314,9 @@ bool Blas::gemm(const GemmType type, const void * a, const int64_t lda, const vo
         }
     }
     const hipblasStatus_t status =
-        hipblasLtMatmul(handle_, plan->desc, scalar(type, true), a, plan->a_layout, b, plan->b_layout,
-                        scalar(type, false), d, plan->d_layout, d, plan->d_layout, plan->tuned ? &plan->algo : nullptr,
-                        workspace_, plan->tuned ? kWorkspaceBytes : 0, stream_);
+        hipblasLtMatmul(handle_, plan->desc, scalar(true), a, plan->a_layout, b, plan->b_layout, scalar(false), d,
+                        plan->d_layout, d, plan->d_layout, plan->tuned ? &plan->algo : nullptr, workspace_,
+                        plan->tuned ? kWorkspaceBytes : 0, stream_);
     if (plan == &untimed) {
         destroy_plan(untimed);
     }

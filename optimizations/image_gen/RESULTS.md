@@ -51,6 +51,15 @@ The reference is the bf16 release weights on stock stable-diffusion.cpp with f32
 - The initial noise is stable-diffusion.cpp's, bit for bit (its Philox generator and Box-Muller transform), and so is er_sde's noise at each step.
 - Stock's own bf16 run with its default flash attention lands no closer than its int8 run, so on this card most of stock's error comes from its attention path, not from the int8 weights.
 
+## Run to run
+
+Requests no longer time kernels: with the text encoder on the R9700, a request's image depends only on the request, the tuning file, the GPU and hipBLASLt.
+
+- Three starts from one tuning file ran the same 62 requests: sizes from 256×256 to 4096×256, prompts of 11 to 3,397 tokens around the edges of the text-token blocks, CFG 1 and 2.5, both samplers and schedules, 1 to 20 steps, and batches of 2. With the text encoder on the R9700 they made the same 62 images on every start, a request repeated in one server made the same image, and the tuning file stayed byte-identical.
+- Before, the first request at a shape the warm-up had not tuned (another size, or a prompt past 256 tokens) timed hipBLASLt's candidates and kept the fastest, so its kernel, and with it the image's last bits, could change from one start to the next. Such a shape now takes hipBLASLt's own kernel, and its first image comes sooner: 2.55-2.58 s instead of 2.86 s at 1008×1008, and 2.65-2.69 s instead of 2.95-2.96 s at 768×1344 (generate_image, two starts of each build). The images after it take as long as before: 2.53-2.57 s against 2.55-2.56 s, and 2.59-2.62 s against 2.62-2.63 s. At the shapes the warm-up tunes, the images are the same as before, bit for bit.
+- With the text encoder on the APU, a prompt of more than 128 tokens can encode differently from one run to the next, and its image with it: over three starts, 3 of the 62 requests (prompts of 129, 139 and 191 tokens) changed. Encoding the same prompt again in one server gave another result now and then (2 of 40 encodings), and more often while another program used the GPU. Given the same encoder output, every image repeated.
+- `CHECK=1 ./bench.sh` compares every image with the md5s in `reference/`. On a second R9700, the previous build and this one both made the six stored images (three prompts at CFG 1 and 2.5) in all three rounds, at the same speed: 2.72 s at CFG 1 and 5.12 s at CFG 2.5 per request for each.
+
 ## Sampler and CFG
 
 - At 8 steps, Euler leaves images hazy on its discrete schedule as on the simple one; er_sde does not, on either. Both make one model call a step.
@@ -83,6 +92,7 @@ The same prompts, seed, size, steps, CFG and sampler on a DGX Spark (GB10), warm
 
 - `POST /memory/load` took 1.55-1.67 s for the 5,258 MiB of weights (3.3-3.6 GB/s). It needs room for them plus 1 GiB: beside the chat model about 4 GB stayed free with the weights on the card.
 - `POST /memory/release` gave back 12,500 MiB (weights and work buffers) in 6-7 ms. One sent 0.4 s into a load stopped it at the next 128 MiB piece. Released, the server held about 0.6 GB of the R9700, its context.
+- A release also stops a load still waiting for the GPU. With one load copying the weights and a second one queued behind it, a release sent 0.6 s in stopped both and answered in 25 ms; the previous build let the queued load copy all 5,258 MiB first, which held the release back 1.6 s.
 - Every image matched, bit for bit, the one a server without `--standby` made from the same seed, whether its weights were loaded, kept or copied during its first step, at CFG 1 and at CFG 2.5.
 - With a controller that releases the weights for each chat request and loads them again 2 s after the last one, an image asked for once the chat was idle took 2.98 s end to end over HTTP (3.22-3.27 s with the previous kernels), and one asked for right after a long chat reply, which took the weights off, 4.06-4.08 s. When a short text chat request alone on the card leaves the weights there, an image right after its reply took 2.92-3.02 s, instead of 4.32 s with the weights taken off and the previous kernels. Images back to back took 2.70 s for a repeated prompt and 2.80 s for a new one (medians of 5).
 

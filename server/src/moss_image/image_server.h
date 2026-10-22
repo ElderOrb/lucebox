@@ -11,7 +11,8 @@
 //
 //   GET  /memory                 {standby, weights "gpu" or "host", gpu_mib, host_mib, gpu_free_mib}
 //   POST /memory/release         {keep_weights}: frees the work buffers, and the weights unless keep_weights
-//   POST /memory/load            copies the weights back onto the GPU when it has room for them; a release stops it
+//   POST /memory/load            copies the weights back onto the GPU when it has room for them; a later release
+//                                stops it, also while it waits for the GPU
 //
 // A prompt may carry sd-server's per-request options as JSON between <sd_cpp_extra_args> and
 // </sd_cpp_extra_args>: seed, negative_prompt, width, height, batch_count and sample_params {sample_steps,
@@ -22,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -65,7 +67,7 @@ struct MemoryState {
     size_t gpu_free_bytes = 0;  // the GPU's free memory, for every process
 };
 
-// What the server drives: one image per call, calls never overlap. Only cancel_load() runs beside the others.
+// What the server drives: one image per call, calls never overlap.
 class Generator {
 public:
     virtual ~Generator() = default;
@@ -80,13 +82,11 @@ public:
         return false;
     }
     // Copies the weights back onto the GPU when it has room for them; false with `error` set when it has not, false
-    // with no error when cancel_load() stopped it.
-    virtual bool load_weights(std::string & error) {
+    // with no error once `stopped()` is true, which it asks before the copies and between them.
+    virtual bool load_weights(const std::function<bool()> & /*stopped*/, std::string & error) {
         error = "the server holds its GPU memory: start it with --standby";
         return false;
     }
-    // Stops a load_weights() in progress soon.
-    virtual void cancel_load() {}
 };
 
 struct ImageServerConfig {
