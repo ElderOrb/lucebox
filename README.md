@@ -1,9 +1,6 @@
 <p align="center">
   <a href="https://www.lucebox.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/logo-mark-white.png">
-      <img src="assets/logo-mark.png" alt="Lucebox" width="160">
-    </picture>
+    <img src="assets/logo-mark.png" alt="Lucebox" width="160">
   </a>
 </p>
 
