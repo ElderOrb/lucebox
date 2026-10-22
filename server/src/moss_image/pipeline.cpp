@@ -378,13 +378,12 @@ bool Pipeline::Impl::dit_layer(const DitLayer & layer, const float * mod, const 
     gemm_i8_gated_residual(layer.o.w, layer.o.scale, xq.as<int8_t>(), xs.as<float>(), active, kHidden, kHidden, gate1,
                            xf, stream);
     norm_quantize_i8(xf, active, kHidden, layer.norm2, scale2, shift2, kEps, xq.as<int8_t>(), xs.as<float>(), stream);
-    const bool ok = blas.gemm(GemmType::i8_i32, layer.up_gate.w, kHidden, xq.as<int8_t>(), kHidden,
-                              sums.as<int32_t>(), 2 * kFfn, 2 * kFfn, round_up(active, 4), kHidden);
+    gemm_i8_i32(layer.up_gate.w, xq.as<int8_t>(), active, kHidden, 2 * kFfn, sums.as<int32_t>(), stream);
     situ_quantize_i8(sums.as<int32_t>(), xs.as<float>(), layer.up_gate.scale, active, kFfn, hq.as<int8_t>(),
                      hs.as<float>(), stream);
     gemm_i8_gated_residual(layer.down.w, layer.down.scale, hq.as<int8_t>(), hs.as<float>(), active, kFfn, kHidden,
                            gate2, xf, stream);
-    return ok;
+    return true;
 }
 
 // The sampling loop: the latent state after the last step, in `state`.

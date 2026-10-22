@@ -152,6 +152,11 @@ void attention_d128(const float * q, const uint16_t * k, const uint16_t * v, int
 void gemm_i8_gated_residual(const int8_t * w, const float * w_scales, const int8_t * xq, const float * xs, int64_t rows,
                             int64_t k, int64_t n, const float * gate, float * x, hipStream_t stream);
 
+// The int32 sums of an int8 linear: w [n][k] int8 times xq [rows][k], sums [rows][n] (rows past rows not written).
+// n % 256 == 0, k % 64 == 0.
+void gemm_i8_i32(const int8_t * w, const int8_t * xq, int64_t rows, int64_t k, int64_t n, int32_t * sums,
+                 hipStream_t stream);
+
 // The FFN gate on the int32 sums of the up/gate linear and its convrot quantization for the down linear: sums
 // [rows][2 * nc] (any row stride padding past rows is ignored) with the activation scales xs [rows] and w_scales
 // [2 * nc]; up is the first half and the gate the second. dst [rows][nc] int8, dst_scales [rows]. nc is 4096 or 8192.

@@ -10,6 +10,7 @@
 #include "device_common.cuh"
 
 #include <initializer_list>
+#include <type_traits>
 
 namespace luce::moss_image {
 namespace {
@@ -42,17 +43,54 @@ struct params {
 #if defined(MOSS_GFX12)
 typedef _Float16 half8_t __attribute__((ext_vector_type(8)));
 typedef float    float8_t __attribute__((ext_vector_type(8)));
+typedef uint32_t u32x4_t __attribute__((ext_vector_type(4)));  // not uint4: an array of those structs lands in scratch
 
 constexpr int BK     = 32;      // input channels per K step
 constexpr int STRIDE = BK + 8;  // halves per LDS row, padded against bank conflicts
 
-template <bool UP>
-__device__ __forceinline__ uint4 load_pixel(const params & p, const bool in, const int iy, const int ix, const int ci) {
-    if (!in) {
-        return make_uint4(0, 0, 0, 0);
+// A barrier that orders LDS only: __syncthreads also invalidates the vector L0 cache at every K step.
+__device__ __forceinline__ void lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
+// The K step a block loads next: tap (ky, kx) = tap index, channels 32 cs .., advanced incrementally (uniform).
+struct kstep {
+    int cs = 0, tap = 0, ky = 0, kx = 0;
+
+    __device__ __forceinline__ void advance(const params & p, const int ci_steps) {
+        if (++cs == ci_steps) {
+            cs = 0;
+            ++tap;
+            if (++kx == p.KW) {
+                kx = 0;
+                ++ky;
+            }
+        }
     }
-    const int64_t pix = UP ? (int64_t) (iy / 2) * (p.IW / 2) + ix / 2 : (int64_t) iy * p.IW + ix;
-    return *(const uint4 *) (p.x + pix * p.IC + ci);
+};
+
+// One 16-byte chunk of B: channels lc .. lc + 7 of the step's 32 at output pixel (oy, ox), zero outside the input.
+// The per-pixel part of the address is b_off (bytes, without UP), the step's part a uniform pointer.
+template <bool UP>
+__device__ __forceinline__ u32x4_t load_pixel(const params & p, const kstep & k, const bool pv, const int oy,
+                                              const int ox, const uint32_t b_off, const int lc) {
+    const int  iy = oy + k.ky - p.PY;
+    const int  ix = ox + k.kx - p.PX;
+    const bool in = pv && (unsigned) iy < (unsigned) p.IH && (unsigned) ix < (unsigned) p.IW;
+    if (!in) {
+        return u32x4_t{ 0, 0, 0, 0 };
+    }
+    if constexpr (UP) {
+        // the nearest 2x upscale of a source of (IW / 2) x (IH / 2) pixels; every factor is below 2^24
+        const uint32_t off = __umul24((uint32_t) iy >> 1, (uint32_t) (p.IW / 2 * p.IC) * 2) +
+                             __umul24((uint32_t) ix >> 1, (uint32_t) p.IC * 2) + 2 * lc;
+        return *(const u32x4_t *) ((const char *) (p.x + k.cs * BK) + off);
+    } else {
+        const _Float16 * xs = p.x + ((int64_t) (k.ky - p.PY) * p.IW + (k.kx - p.PX)) * p.IC + k.cs * BK;
+        return *(const u32x4_t *) ((const char *) xs + b_off);
+    }
 }
 #endif // defined(MOSS_GFX12)
 
@@ -75,52 +113,62 @@ __global__ void __launch_bounds__(THREADS) conv2d_kernel(const params p) {
     // Every thread moves two 16-byte chunks of A and of B per step: rows lr and lr + 64, channels lc .. lc + 7.
     const int lr = threadIdx.x / 4;
     const int lc = 8 * (threadIdx.x % 4);
-    int       oy[2], ox[2];
-    bool      pv[2];
+    const int     ci_steps = p.IC / BK;
+    const int     steps    = p.KH * p.KW * ci_steps;
+    const int64_t w_row    = (int64_t) p.KH * p.KW * p.IC;
+    // The per-thread parts of the load addresses, in bytes. They fit in 32 bits: the largest f16 map, 1024 x 1024
+    // pixels of 256 channels, is 512 MiB. A row past OC loads row OC - 1: its sums are not stored.
+    int           oy[2], ox[2];
+    bool          pv[2];
+    uint32_t      a_off[2], b_off[2];
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
         const int pix = p0 + lr + 64 * r;
         pv[r]         = pix < OHW;
         oy[r]         = pix / p.OW;
         ox[r]         = pix % p.OW;
+        a_off[r]      = (uint32_t) (((int64_t) min(oc0 + lr + 64 * r, p.OC - 1) * w_row + lc) * 2);
+        b_off[r]      = (uint32_t) ((((int64_t) oy[r] * p.IW + ox[r]) * p.IC + lc) * 2);
     }
-    const int     ci_steps = p.IC / BK;
-    const int     steps    = p.KH * p.KW * ci_steps;
-    const int64_t w_row    = (int64_t) p.KH * p.KW * p.IC;
 
-    uint4 ra[2], rb[2];
-    auto  load = [&](const int t) {
-        const int tap = t / ci_steps;
-        const int ci  = (t % ci_steps) * BK + lc;
-        const int ky  = tap / p.KW;
-        const int kx  = tap % p.KW;
+    // Two register sets: a step's loads are issued two steps before its stores to shared memory, which wait for them
+    // (the input comes from DRAM, slower than one step of WMMAs).
+    u32x4_t ra[2][2], rb[2][2];
+    kstep   next;
+    auto    load = [&](const int set) {
+        const char * w_step = (const char *) (p.w + next.tap * p.IC + next.cs * BK);
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            const int oc = oc0 + lr + 64 * r;
-            ra[r] = oc < p.OC ? *(const uint4 *) (p.w + oc * w_row + tap * p.IC + ci) : make_uint4(0, 0, 0, 0);
-            const int  iy = oy[r] + ky - p.PY;
-            const int  ix = ox[r] + kx - p.PX;
-            const bool in = pv[r] && (unsigned) iy < (unsigned) p.IH && (unsigned) ix < (unsigned) p.IW;
-            rb[r] = load_pixel<UP>(p, in, iy, ix, ci);
+            ra[set][r] = *(const u32x4_t *) (w_step + a_off[r]);
+            rb[set][r] = load_pixel<UP>(p, next, pv[r], oy[r], ox[r], b_off[r], lc);
         }
     };
-    auto store = [&](const int buf) {
+    auto store = [&](const int set, const int buf) {
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            *(uint4 *) (sA[buf] + (lr + 64 * r) * STRIDE + lc) = ra[r];
-            *(uint4 *) (sB[buf] + (lr + 64 * r) * STRIDE + lc) = rb[r];
+            *(u32x4_t *) (sA[buf] + (lr + 64 * r) * STRIDE + lc) = ra[set][r];
+            *(u32x4_t *) (sB[buf] + (lr + 64 * r) * STRIDE + lc) = rb[set][r];
         }
     };
 
     float8_t acc[2][4] = {};
     load(0);
-    store(0);
-    __syncthreads();
-    for (int t = 0; t < steps; ++t) {
-        const int buf = t & 1;
-        if (t + 1 < steps) {
-            load(t + 1);
+    if (1 < steps) {
+        next.advance(p, ci_steps);
+    }
+    load(1);
+    store(0, 0);
+    lds_barrier();
+    // Step t: load step t + 2 into set t % 2 (stored at step t - 1), compute step t, store step t + 1 (set (t + 1) % 2).
+    // The stores are unconditional (past the last step they write a reloaded last step to the unused buffer): behind
+    // a branch the WMMAs get sunk below them, and they wait for the loads. Two steps per iteration keep the register
+    // sets and buffers static.
+    const auto step = [&](const int t, const auto buf_c) {
+        constexpr int buf = decltype(buf_c)::value;
+        if (t + 2 < steps) {
+            next.advance(p, ci_steps);
         }
+        load(buf);
 #pragma unroll
         for (int ks = 0; ks < BK; ks += 16) {
             half8_t a[2], b[4];
@@ -140,10 +188,23 @@ __global__ void __launch_bounds__(THREADS) conv2d_kernel(const params p) {
                 }
             }
         }
-        if (t + 1 < steps) {
-            store(buf ^ 1);
+        // The WMMAs stay above the stores, which wait for their loads: left to itself the compiler moves the stores
+        // above the WMMAs, or the WMMAs below the next step's branches.
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            asm volatile("" : : "v"(acc[i][0]), "v"(acc[i][1]), "v"(acc[i][2]), "v"(acc[i][3]));
         }
-        __syncthreads();
+        __builtin_amdgcn_sched_barrier(0);
+        store(buf ^ 1, buf ^ 1);
+        lds_barrier();
+    };
+    int t = 0;
+    for (; t + 1 < steps; t += 2) {
+        step(t, std::integral_constant<int, 0>());
+        step(t + 1, std::integral_constant<int, 1>());
+    }
+    if (t < steps) {
+        step(t, std::integral_constant<int, 0>());
     }
 
     // Result layout: lane holds pixel lane % 16 of a 16-pixel tile and output channels 8 hs .. 8 hs + 7 of a 16-channel tile.
@@ -195,53 +256,52 @@ __global__ void __launch_bounds__(NT) small_oc_kernel(const params p) {
     // B: rows lr + (NT / 4) r; A: row lr of threads 0 .. 63.
     const int lr = threadIdx.x / 4;
     const int lc = 8 * (threadIdx.x % 4);
-    int       oy[RB], ox[RB];
-    bool      pv[RB];
+    const int     ci_steps = p.IC / BK;
+    const int     steps    = p.KH * p.KW * ci_steps;
+    const int64_t w_row    = (int64_t) p.KH * p.KW * p.IC;
+    int           oy[RB], ox[RB];
+    bool          pv[RB];
+    uint32_t      b_off[RB];
 #pragma unroll
     for (int r = 0; r < RB; ++r) {
         const int pix = p0 + lr + (NT / 4) * r;
         pv[r]         = pix < OHW;
         oy[r]         = pix / p.OW;
         ox[r]         = pix % p.OW;
+        b_off[r]      = (uint32_t) ((((int64_t) oy[r] * p.IW + ox[r]) * p.IC + lc) * 2);
     }
-    const int     ci_steps = p.IC / BK;
-    const int     steps    = p.KH * p.KW * ci_steps;
-    const int64_t w_row    = (int64_t) p.KH * p.KW * p.IC;
+    // rows past OC (and the threads past the 16 A rows) load row OC - 1: those sums are not stored
+    const uint32_t a_off = (uint32_t) (((int64_t) min(lr, p.OC - 1) * w_row + lc) * 2);
 
-    uint4 ra, rb[RB];
-    auto  load = [&](const int t) {
-        const int tap = t / ci_steps;
-        const int ci  = (t % ci_steps) * BK + lc;
-        const int ky  = tap / p.KW;
-        const int kx  = tap % p.KW;
-        ra = lr < p.OC ? *(const uint4 *) (p.w + lr * w_row + tap * p.IC + ci) : make_uint4(0, 0, 0, 0);
+    u32x4_t ra, rb[RB];
+    kstep   next;
+    auto    load = [&]() {
+        ra = *(const u32x4_t *) ((const char *) (p.w + next.tap * p.IC + next.cs * BK) + a_off);
 #pragma unroll
         for (int r = 0; r < RB; ++r) {
-            const int  iy = oy[r] + ky - p.PY;
-            const int  ix = ox[r] + kx - p.PX;
-            const bool in = pv[r] && (unsigned) iy < (unsigned) p.IH && (unsigned) ix < (unsigned) p.IW;
-            rb[r] = load_pixel<false>(p, in, iy, ix, ci);
+            rb[r] = load_pixel<false>(p, next, pv[r], oy[r], ox[r], b_off[r], lc);
         }
     };
     auto store = [&](const int buf) {
         if (lr < SM_BM) {
-            *(uint4 *) (sA[buf] + lr * STRIDE + lc) = ra;
+            *(u32x4_t *) (sA[buf] + lr * STRIDE + lc) = ra;
         }
 #pragma unroll
         for (int r = 0; r < RB; ++r) {
-            *(uint4 *) (sB[buf] + (lr + (NT / 4) * r) * STRIDE + lc) = rb[r];
+            *(u32x4_t *) (sB[buf] + (lr + (NT / 4) * r) * STRIDE + lc) = rb[r];
         }
     };
 
     float8_t acc[JT] = {};
-    load(0);
+    load();
     store(0);
-    __syncthreads();
+    lds_barrier();
     for (int t = 0; t < steps; ++t) {
         const int buf = t & 1;
         if (t + 1 < steps) {
-            load(t + 1);
+            next.advance(p, ci_steps);
         }
+        load();
 #pragma unroll
         for (int ks = 0; ks < BK; ks += 16) {
             const half8_t a = *(const half8_t *) (sA[buf] + (lane % 16) * STRIDE + ks + 8 * hs);
@@ -255,10 +315,9 @@ __global__ void __launch_bounds__(NT) small_oc_kernel(const params p) {
                 acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b[j], acc[j]);
             }
         }
-        if (t + 1 < steps) {
-            store(buf ^ 1);
-        }
-        __syncthreads();
+        __builtin_amdgcn_sched_barrier(0);
+        store(buf ^ 1);
+        lds_barrier();
     }
 
 #pragma unroll
