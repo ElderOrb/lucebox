@@ -1,5 +1,10 @@
 <p align="center">
-  <a href="https://www.lucebox.com/"><img src="https://www.lucebox.com/lucebox-logo.png" alt="Lucebox" width="160"></a>
+  <a href="https://www.lucebox.com/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/logo-mark-white.png">
+      <img src="assets/logo-mark.png" alt="Lucebox" width="160">
+    </picture>
+  </a>
 </p>
 
 <p align="center">
