@@ -70,6 +70,20 @@ The same prompts, seed, size, steps, CFG and sampler on a DGX Spark (GB10), warm
 - ComfyUI per new-prompt image: text encoding 1.07 s, sampling 3.95 s (0.49 s a step), VAE 0.45 s, saving 0.12-0.29 s. luce_server: 0.03 s, 2.82 s (0.35 s a step), 0.18 s, and 0.03 s for the PNG and HTTP.
 - The shipped files trade quality for speed: in our poster test they garbled the word "LUCEBOX", which the 16-bit attention run kept readable (one prompt, one seed).
 
+## Standby
+
+`--standby` with the text encoder on the APU (`--text-encoder-device hip:1`), the R9700 behind its PCIe Gen3 x4 link, and a chat model (Qwen3.8 27B, 22.8 GB) on the same R9700 between the image requests. Seeds 71, 73 and 74 at CFG 1, seed 75 at CFG 2.5; generate_image per image:
+
+| Weights when the request arrives | CFG 1 | Sampling, CFG 1 | CFG 2.5 |
+|---|---:|---:|---:|
+| On the GPU, after `POST /memory/load` | 2.98-3.08 s | 2.80-2.81 s | 5.63 s |
+| In host memory, copied during the first step | 4.30-4.66 s | 4.11-4.14 s | 7.15 s |
+
+- `POST /memory/load` took 1.60-1.67 s for the 5,258 MiB of weights (3.3-3.5 GB/s). It needs room for them plus 1 GiB: beside the chat model about 4 GB stayed free with the weights on the card.
+- `POST /memory/release` gave back 12,500 MiB (weights and work buffers) in 6-7 ms. One sent 0.4 s into a load stopped it at the next 128 MiB piece. Released, the server held about 0.6 GB of the R9700, its context.
+- Every image matched, bit for bit, the one a server without `--standby` made from the same seed, whether its weights were loaded, kept or copied during its first step, at CFG 1 and at CFG 2.5.
+- With a controller that releases the weights for each chat request and loads them again 2 s after the last one, an image asked for once the chat was idle took 3.22-3.27 s end to end over HTTP, and one asked for right after a chat reply 4.32 s.
+
 ## Power
 
 The R9700 runs at its power limit during every request. These numbers use 330 W, the most the driver allows; the card ships at 300 W, which makes an image about 1% slower.

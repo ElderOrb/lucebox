@@ -3,15 +3,20 @@
 //
 // Large matrices keep their stored type: int8 with f32 per-row scales for the DiT layers, bf16 for the rest of the
 // DiT, f16 for the VAE convolutions. Norm weights, biases and scales are f32 on the device (bf16 to f32 is exact).
-// All of it lives in one device allocation.
+// All of it lives in one device allocation, laid out in the order a request uses it: what the DiT needs before its
+// first layer, the layers one after another, then the VAE decoder. A copy of that allocation can wait in pinned host
+// memory instead, and go onto the device when needed, while the first denoising step already runs on what arrived.
 
 #pragma once
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <vector>
 
 namespace luce::moss_image {
 
@@ -122,18 +127,40 @@ public:
     Weights(const Weights &) = delete;
     Weights & operator=(const Weights &) = delete;
 
+    // The parts upload() records an event after: everything before the first DiT layer, each layer, the VAE decoder.
+    static constexpr int kParts = kLayers + 2;
+
     // Reads the GGUF into the current device through pinned staging buffers, uploads on `stream`, and returns once
     // the uploads are done; false with `error` set.
     bool load(const std::string & path, hipStream_t stream, std::string & error);
 
-    size_t device_bytes() const { return bytes_; }
+    // Reads the GGUF into pinned host memory, laid out as on the device, and puts nothing on the device: upload()
+    // copies it there, as often as release() takes it away. False with `error` set.
+    bool read(const std::string & path, std::string & error);
+
+    // Queues the copy read() made onto the current device on `stream`: ready[0] is recorded once everything before the
+    // first DiT layer is there, ready[1 + l] once layer l is, ready[kLayers + 1] once the VAE decoder is, so that work
+    // on another stream can wait for each part alone. With `cancel`, it returns once the copies are done, and stops
+    // early when `cancel` is set: the device copy is then freed and the result is false with no error. A failed copy
+    // frees it too, with `error` set.
+    bool upload(hipStream_t stream, hipEvent_t * ready, const std::atomic<bool> * cancel, std::string & error);
+
+    // Frees the device copy; the work using it must be done.
+    void release();
+
+    bool   on_device() const { return device_ != nullptr; }
+    size_t device_bytes() const { return device_ != nullptr ? bytes_ : 0; }
+    size_t host_bytes() const { return host_ != nullptr ? bytes_ : 0; }
 
     DitWeights dit;
     VaeDecoder vae;
 
 private:
-    void * device_ = nullptr;
-    size_t bytes_  = 0;
+    void *                                      device_ = nullptr;
+    void *                                      host_   = nullptr;
+    size_t                                      bytes_  = 0;
+    size_t                                      part_end_[kParts] = {};  // byte offset where each part ends
+    std::vector<std::function<void(uint8_t *)>> bind_;  // points the fields above into a device copy
 };
 
 } // namespace luce::moss_image

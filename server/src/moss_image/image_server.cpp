@@ -388,9 +388,53 @@ private:
             } else {
                 generations(fd, body);
             }
+        } else if (req.path == "/memory" || req.path == "/memory/release" || req.path == "/memory/load") {
+            memory(fd, req);
         } else {
             respond(fd, 404, json{ { "error", "no route " + req.path } }.dump());
         }
+    }
+
+    // The GPU memory of a server in standby: where the weights are, and giving it back or taking the weights again.
+    void memory(const int fd, const HttpRequest & req) {
+        const bool release = req.path == "/memory/release";
+        const bool load    = req.path == "/memory/load";
+        if (req.method != (release || load ? "POST" : "GET")) {
+            respond(fd, 405, json{ { "error", release || load ? "use POST" : "use GET" } }.dump());
+            return;
+        }
+        bool keep_weights = false;
+        if (release && !req.body.empty()) {
+            const json body = json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                throw BadRequest{ "the body must be a JSON object" };
+            }
+            if (body.contains("keep_weights") && body["keep_weights"].is_boolean()) {
+                keep_weights = body["keep_weights"].get<bool>();
+            }
+        }
+        if (release) {
+            generator_.cancel_load();  // a load in progress lets go of the GPU soon
+        }
+        std::string error;
+        bool        ok = true;
+        MemoryState state;
+        {
+            std::lock_guard<std::mutex> lock(gpu_);
+            if (release) {
+                ok = generator_.release_memory(keep_weights, error);
+            } else if (load) {
+                ok = generator_.load_weights(error);
+            }
+            state = generator_.memory();
+        }
+        json out = { { "standby", state.standby },          { "weights", state.weights_on_gpu ? "gpu" : "host" },
+                     { "gpu_mib", state.gpu_bytes >> 20 },  { "host_mib", state.host_bytes >> 20 },
+                     { "gpu_free_mib", state.gpu_free_bytes >> 20 } };
+        if (!ok) {
+            out["error"] = error.empty() ? "a release stopped it" : error;
+        }
+        respond(fd, ok ? 200 : 409, out.dump());
     }
 
     void generations(const int fd, const json & body) {

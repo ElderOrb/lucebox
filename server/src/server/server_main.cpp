@@ -10,7 +10,8 @@
 //   luce_server <model.gguf> [--draft <draft.gguf>] [--port 8080]
 //                              [--host 0.0.0.0] [--max-ctx 131072]
 //                              [--max-tokens 4096] [--target-device auto:0]
-//   luce_server <moss-image.gguf> --text-encoder <Qwen3.5-9B.gguf> [--text-encoder-device hip:N] [--port 8080]
+//   luce_server <moss-image.gguf> --text-encoder <Qwen3.5-9B.gguf> [--text-encoder-device hip:N] [--standby]
+//                                 [--port 8080]
 
 #include "http_server.h"
 #include "admission.h"
@@ -139,6 +140,9 @@ static void print_usage(const char * prog) {
         "                       served with the images API; --host, --port and\n"
         "                       --model-name apply to it\n"
         "  --text-encoder-device hip:N  Run the moss-image text encoder on another GPU\n"
+        "  --standby            moss-image: share the GPU with another model. The weights\n"
+        "                       wait in host memory and the server gives its GPU memory\n"
+        "                       back on request (POST /memory/release, /memory/load)\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N|auto>   Max context length (default: 8192). auto: the model's\n"
@@ -2529,6 +2533,8 @@ static int run_moss_image(int argc, char ** argv) {
                 return 2;
             }
             pipeline_options.text_encoder_gpu = device.gpu;
+        } else if (std::strcmp(argv[i], "--standby") == 0) {
+            pipeline_options.standby = true;
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             config.host = argv[++i];
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {

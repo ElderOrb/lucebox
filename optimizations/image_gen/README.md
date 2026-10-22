@@ -49,6 +49,8 @@ The server is ready once both files are on the GPU, about 4.5 s from the page ca
 
 On a machine with a second GPU, `--text-encoder-device hip:N` runs the text encoder there and hands its output over through host memory, so the two GPUs need no peer access. Build for both (`-DLUCE_HIP_ARCHITECTURES="gfx1201;gfx1151"` for the R9700 beside a Ryzen AI Max+ 395): the encoder then runs on the APU's Radeon 8060S and the R9700 loads only the 5.5 GB model. With the R9700 behind a PCIe Gen3 x4 link, the server is ready in 2.0-2.1 s instead of about 4.5 s, and a new prompt's encoding takes 78-98 ms instead of 25-28 ms. The two GPUs round the encoder differently, so the images are close to the R9700-encoded ones, not byte-identical (see [RESULTS.md](RESULTS.md)).
 
+With `--standby` the server shares its GPU with another model, such as a chat model on the same card. The weights wait in pinned host memory. `POST /memory/release` gives back the GPU memory the server holds in under 10 ms, leaving its context (about 0.6 GB with the text encoder on a second GPU), and `POST /memory/load` copies the weights onto the GPU while the other model is idle, in 1.6 s over the Gen3 x4 link. A request that finds the weights in host memory copies them during its first step, each layer waiting only for its own weights: 4.3-4.7 s an image instead of 3.0-3.1 s, and the same image bit for bit.
+
 ```bash
 curl -s http://127.0.0.1:7860/v1/images/generations -H 'Content-Type: application/json' \
   -d '{"prompt": "a lovely cat holding a sign that says \"hello\"", "size": "1024x1024"}' |
@@ -62,6 +64,9 @@ curl -s http://127.0.0.1:7860/v1/images/generations -H 'Content-Type: applicatio
 | `POST /v1/images/generations` | OpenAI's `prompt`, `n` and `size`; PNG as `b64_json` |
 | `POST /sdapi/v1/txt2img` | AUTOMATIC1111's `prompt`, `negative_prompt`, `width`, `height`, `steps`, `cfg_scale`, `seed`, `batch_size`, `sampler_name`, `scheduler` |
 | `GET /v1/models` | the model, under `--model-name` (default `moss-image`) |
+| `GET /memory` | where the weights are (`gpu` or `host`), the MiB the server holds on the GPU and in pinned host memory, and the GPU's free MiB |
+| `POST /memory/release` | with `--standby`: frees the work buffers and the weights, or only the work buffers with `{"keep_weights": true}`; stops a load in progress |
+| `POST /memory/load` | with `--standby`: copies the weights onto the GPU; 409 with the reason when the GPU lacks room for them plus 1 GiB, or a release stops the copy |
 
 A request without settings gets 1024×1024, 8 steps of er_sde on the simple schedule (the sampler ComfyUI runs for this model), CFG 1 and a new seed. stable-diffusion.cpp's `<sd_cpp_extra_args>{...}</sd_cpp_extra_args>` in an OpenAI prompt sets the seed, negative prompt, size, image count and `sample_params` (`sample_steps`, `sample_method` `euler` or `er_sde`, `scheduler` `discrete` or `simple`, `guidance.txt_cfg`, `eta`, `flow_shift`), so clients written for `sd-server` work unchanged. Sides are multiples of 16 from 256, up to 1024×1024 pixels in all; up to 100 steps and 8 images a request, and prompts of up to 16 KiB.
 

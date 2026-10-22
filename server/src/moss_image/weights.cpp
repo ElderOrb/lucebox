@@ -5,8 +5,10 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <functional>
+#include <thread>
 #include <vector>
 
 namespace luce::moss_image {
@@ -62,6 +64,9 @@ public:
 
     const std::string & error() const { return error_; }
     size_t              total() const { return total_; }
+
+    // What bind() asked for, to point the fields at any later copy of the allocation.
+    std::vector<std::function<void(uint8_t *)>> take_binds() { return std::move(fixups_); }
 
     size_t reserve(const size_t bytes) {
         const size_t offset = total_;
@@ -206,6 +211,44 @@ public:
         conv(a.proj, name + ".proj_out", channels, channels, 1);
     }
 
+    // Every tensor into `host`, an allocation laid out as on the device, on a few threads.
+    bool read_into(const std::string & path, uint8_t * host) {
+        luce::common::ReadOnlyFile file;
+        if (!file.open(path, false, &error_)) {
+            return false;
+        }
+        constexpr size_t   kThreads = 4;
+        std::atomic<bool>  failed{ false };
+        std::vector<std::thread> threads;
+        for (size_t t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t] {
+                std::vector<uint8_t> staged;
+                for (size_t i = t; i < uploads_.size() && !failed; i += kThreads) {
+                    const Upload & u   = uploads_[i];
+                    uint8_t *      dst = host + u.dst_offset;
+                    if (u.convert != Convert::none) {
+                        staged.resize(u.file_bytes);
+                    }
+                    uint8_t * buf = u.convert != Convert::none ? staged.data() : dst;
+                    if (!file.read_at(u.file_offset, buf, u.file_bytes)) {
+                        failed = true;
+                        break;
+                    }
+                    if (u.convert != Convert::none) {
+                        convert(u, buf, dst);
+                    }
+                }
+            });
+        }
+        for (std::thread & t : threads) {
+            t.join();
+        }
+        if (failed) {
+            error_ = "cannot read " + path;
+        }
+        return !failed;
+    }
+
     bool upload(const std::string & path, uint8_t * device, hipStream_t stream) {
         luce::common::ReadOnlyFile file;
         if (!file.open(path, false, &error_)) {
@@ -307,7 +350,7 @@ private:
     std::vector<std::function<void(uint8_t *)>> fixups_;
 };
 
-void lay_out_dit(Loader & l, DitWeights & dit) {
+void lay_out_dit(Loader & l, DitWeights & dit, size_t * part_end) {
     l.linear(dit.text_proj, "dit.text_embedder.proj", kHidden, kTextHidden, true);
     for (int b = 0; b < kTextBlocks; ++b) {
         TextBlock &       blk = dit.text_blocks[b];
@@ -328,6 +371,7 @@ void lay_out_dit(Loader & l, DitWeights & dit) {
     l.linear(dit.head_modulation, "dit.video_head_modulation", 2 * kHidden, kHidden, true);
     l.bind(dit.final_norm, l.vector("dit.final_norm_video.weight", kHidden));
     l.linear(dit.final_linear, "dit.final_linear_video", kLatentChannels, kHidden, false);
+    part_end[0] = l.total();
     for (int i = 0; i < kLayers; ++i) {
         DitLayer &        layer = dit.layers[i];
         const std::string p     = "dit.layers." + std::to_string(i) + ".";
@@ -339,10 +383,11 @@ void lay_out_dit(Loader & l, DitWeights & dit) {
         l.bind(layer.norm2, l.vector(p + "norm2.weight", kHidden));
         l.bind(layer.q_norm, l.vector(p + "q_norm.weight", kHeadDim));
         l.bind(layer.k_norm, l.vector(p + "k_norm.weight", kHeadDim));
+        part_end[1 + i] = l.total();
     }
 }
 
-void lay_out_vae(Loader & l, VaeDecoder & vae) {
+void lay_out_vae(Loader & l, VaeDecoder & vae, size_t * part_end) {
     l.bind(vae.latents_mean, l.vector("vae.latents_mean", kLatentChannels));
     l.bind(vae.latents_std, l.vector("vae.latents_std", kLatentChannels));
     l.conv(vae.post_quant, "vae.decoder.post_quant_conv", 32, 32, 1);
@@ -364,7 +409,45 @@ void lay_out_vae(Loader & l, VaeDecoder & vae) {
     }
     l.group_norm(vae.norm_out, "vae.decoder.norm_out", 128);
     l.conv(vae.conv_out, "vae.decoder.conv_out", 3, 128, 3);
+    part_end[kLayers + 1] = l.total();
 }
+
+// The GGUF's metadata, freed with it; open() checks that it is a moss-image file.
+struct GgufFile {
+    ggml_context * meta = nullptr;
+    gguf_context * gguf = nullptr;
+
+    GgufFile() = default;
+    GgufFile(const GgufFile &) = delete;
+    GgufFile & operator=(const GgufFile &) = delete;
+
+    ~GgufFile() {
+        if (gguf != nullptr) {
+            gguf_free(gguf);
+        }
+        if (meta != nullptr) {
+            ggml_free(meta);
+        }
+    }
+
+    bool open(const std::string & path, std::string & error) {
+        gguf_init_params params{};
+        params.no_alloc = true;
+        params.ctx      = &meta;
+        gguf            = gguf_init_from_file(path.c_str(), params);
+        if (gguf == nullptr) {
+            error = "cannot read the GGUF " + path;
+            return false;
+        }
+        const int64_t arch = gguf_find_key(gguf, "general.architecture");
+        if (arch < 0 || gguf_get_kv_type(gguf, arch) != GGUF_TYPE_STRING ||
+            std::strcmp(gguf_get_val_str(gguf, arch), "moss-image") != 0) {
+            error = path + " is not a moss-image GGUF";
+            return false;
+        }
+        return true;
+    }
+};
 
 } // namespace
 
@@ -372,42 +455,110 @@ Weights::~Weights() {
     if (device_ != nullptr) {
         (void) hipFree(device_);
     }
+    if (host_ != nullptr) {
+        (void) hipHostFree(host_);
+    }
 }
 
 bool Weights::load(const std::string & path, hipStream_t stream, std::string & error) {
-    ggml_context *   meta = nullptr;
-    gguf_init_params params{};
-    params.no_alloc        = true;
-    params.ctx             = &meta;
-    gguf_context * gguf    = gguf_init_from_file(path.c_str(), params);
-    if (gguf == nullptr) {
-        error = "cannot read the GGUF " + path;
+    GgufFile file;
+    if (!file.open(path, error)) {
         return false;
     }
-    const int64_t arch = gguf_find_key(gguf, "general.architecture");
-    bool          ok   = arch >= 0 && gguf_get_kv_type(gguf, arch) == GGUF_TYPE_STRING &&
-                std::strcmp(gguf_get_val_str(gguf, arch), "moss-image") == 0;
-    if (!ok) {
-        error = path + " is not a moss-image GGUF";
-    } else {
-        Loader loader(gguf, meta);
-        lay_out_dit(loader, dit);
-        lay_out_vae(loader, vae);
-        ok = loader.error().empty();
-        if (ok && hipMalloc(&device_, loader.total()) != hipSuccess) {
-            error = "cannot allocate " + std::to_string(loader.total() >> 20) + " MiB for the weights";
-            ok    = false;
-        } else if (ok) {
-            bytes_ = loader.total();
-            ok     = loader.upload(path, static_cast<uint8_t *>(device_), stream);
+    Loader loader(file.gguf, file.meta);
+    lay_out_dit(loader, dit, part_end_);
+    lay_out_vae(loader, vae, part_end_);
+    if (!loader.error().empty()) {
+        error = loader.error();
+        return false;
+    }
+    bytes_ = loader.total();
+    if (hipMalloc(&device_, bytes_) != hipSuccess) {
+        device_ = nullptr;
+        error   = "cannot allocate " + std::to_string(bytes_ >> 20) + " MiB for the weights";
+        return false;
+    }
+    if (!loader.upload(path, static_cast<uint8_t *>(device_), stream)) {
+        error = loader.error();
+        return false;
+    }
+    bind_ = loader.take_binds();
+    return true;
+}
+
+bool Weights::read(const std::string & path, std::string & error) {
+    GgufFile file;
+    if (!file.open(path, error)) {
+        return false;
+    }
+    Loader loader(file.gguf, file.meta);
+    lay_out_dit(loader, dit, part_end_);
+    lay_out_vae(loader, vae, part_end_);
+    if (!loader.error().empty()) {
+        error = loader.error();
+        return false;
+    }
+    bytes_ = loader.total();
+    if (hipHostMalloc(&host_, bytes_, hipHostMallocDefault) != hipSuccess) {
+        host_ = nullptr;
+        error = "cannot pin " + std::to_string(bytes_ >> 20) + " MiB of host memory for the weights";
+        return false;
+    }
+    if (!loader.read_into(path, static_cast<uint8_t *>(host_))) {
+        error = loader.error();
+        return false;
+    }
+    bind_ = loader.take_binds();
+    return true;
+}
+
+bool Weights::upload(hipStream_t stream, hipEvent_t * ready, const std::atomic<bool> * cancel, std::string & error) {
+    if (host_ == nullptr) {
+        error = "the weights are not in host memory";
+        return false;
+    }
+    if (device_ == nullptr) {
+        if (hipMalloc(&device_, bytes_) != hipSuccess) {
+            device_ = nullptr;
+            error   = "out of GPU memory for the weights (" + std::to_string(bytes_ >> 20) + " MiB)";
+            return false;
         }
-        if (!ok && error.empty()) {
-            error = loader.error();
+        for (const auto & bind : bind_) {
+            bind(static_cast<uint8_t *>(device_));
         }
     }
-    gguf_free(gguf);
-    ggml_free(meta);
+    // Pieces of at most 128 MiB: with `cancel`, each one is waited for, so that a cancel stops the copies soon.
+    constexpr size_t kPiece = size_t(128) << 20;
+    const uint8_t *  host   = static_cast<const uint8_t *>(host_);
+    uint8_t *        device = static_cast<uint8_t *>(device_);
+    size_t           begin  = 0;
+    bool             ok     = true;
+    for (int part = 0; ok && part < kParts; ++part) {
+        while (ok && begin < part_end_[part]) {
+            if (cancel != nullptr && cancel->load()) {
+                release();
+                return false;
+            }
+            const size_t bytes = std::min(kPiece, part_end_[part] - begin);
+            ok = hipMemcpyAsync(device + begin, host + begin, bytes, hipMemcpyHostToDevice, stream) == hipSuccess &&
+                 (cancel == nullptr || hipStreamSynchronize(stream) == hipSuccess);
+            begin += bytes;
+        }
+        ok = ok && hipEventRecord(ready[part], stream) == hipSuccess;
+    }
+    if (!ok) {
+        (void) hipStreamSynchronize(stream);
+        release();
+        error = "copying the weights to the GPU failed";
+    }
     return ok;
+}
+
+void Weights::release() {
+    if (device_ != nullptr) {
+        (void) hipFree(device_);
+        device_ = nullptr;
+    }
 }
 
 } // namespace luce::moss_image
