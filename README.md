@@ -293,7 +293,7 @@ Video tutorials for each optimization and the harness setup.
 
 ## The Lucebox Machine
 
-Local AI should be the default, not a privilege. Private data, no per-token bill, no vendor lock-in. Lucebox pairs the R9700 with Strix Halo and ships this open engine ready to run.
+Local AI should be the default, not a privilege. Private data, no per-token bill, no vendor lock-in. Lucebox Zero 495 pairs the R9700 with the Ryzen AI MAX+ PRO 495 (128 or 192 GB) and ships this open engine ready to run.
 
 <p align="center">
   <a href="https://www.lucebox.com/"><img src="assets/lucebox.png" alt="Lucebox local AI PC" width="85%" /></a>
