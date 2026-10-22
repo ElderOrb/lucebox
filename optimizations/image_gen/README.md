@@ -9,10 +9,10 @@
 <h1 align="center">MOSS-Image on one R9700</h1>
 
 <p align="center">
-  <strong>A 1024×1024 image in 3.06 s on one Radeon AI PRO R9700, from the full 5B model, served by luce_server.</strong><br/>
-  MOSS-Image SFT, 8 steps of er_sde, int8 convrot weights, no distillation and no step caching; 5.78 s at CFG 2.5, as in the images above.<br/>
+  <strong>A 1024×1024 image in 2.74 s on one Radeon AI PRO R9700, from the full 5B model, served by luce_server.</strong><br/>
+  MOSS-Image SFT, 8 steps of er_sde, int8 convrot weights, no distillation and no step caching; 5.20 s at CFG 2.5, as in the images above.<br/>
   A native engine in luce_server with our own int8 GEMMs, attention, sampler and VAE kernels for RDNA4, closer to the bf16 model than stable-diffusion.cpp.<br/>
-  <strong>1.5×</strong> a DGX Spark running ComfyUI on the same diffusion weights and sampler, <strong>1.8×</strong> on a new prompt.
+  <strong>1.7×</strong> a DGX Spark running ComfyUI on the same diffusion weights and sampler, <strong>2.0×</strong> on a new prompt; 1.5× and 1.9× its faster ComfyUI setup, with int8 attention and the small VAE.
 </p>
 
 ---
@@ -20,7 +20,7 @@
 ```
 MOSS-Image SFT · 1024×1024 · 8 steps of er_sde · CFG 1 · warm server · median per image
 
-  R9700, luce_server                      ██████                            3.06 s
+  R9700, luce_server                      █████                             2.74 s
   DGX Spark, ComfyUI, same prompt again   █████████                         4.54 s
   DGX Spark, ComfyUI, new prompt          ███████████                       5.60 s
   R9700, stable-diffusion.cpp             ████████████████████████         12.19 s
@@ -49,7 +49,7 @@ The server is ready once both files are on the GPU, about 4.5 s from the page ca
 
 On a machine with a second GPU, `--text-encoder-device hip:N` runs the text encoder there and hands its output over through host memory, so the two GPUs need no peer access. Build for both (`-DLUCE_HIP_ARCHITECTURES="gfx1201;gfx1151"` for the R9700 beside a Ryzen AI Max+ 395): the encoder then runs on the APU's Radeon 8060S and the R9700 loads only the 5.5 GB model. With the R9700 behind a PCIe Gen3 x4 link, the server is ready in 2.0-2.1 s instead of about 4.5 s, and a new prompt's encoding takes 78-98 ms instead of 25-28 ms. The two GPUs round the encoder differently, so the images are close to the R9700-encoded ones, not byte-identical (see [RESULTS.md](RESULTS.md)).
 
-With `--standby` the server shares its GPU with another model, such as a chat model on the same card. The weights wait in pinned host memory. `POST /memory/release` gives back the GPU memory the server holds in under 10 ms, leaving its context (about 0.6 GB with the text encoder on a second GPU), and `POST /memory/load` copies the weights onto the GPU while the other model is idle, in 1.6 s over the Gen3 x4 link. A request that finds the weights in host memory copies them during its first step, each layer waiting only for its own weights: 4.3-4.7 s an image instead of 3.0-3.1 s, and the same image bit for bit.
+With `--standby` the server shares its GPU with another model, such as a chat model on the same card. The weights wait in pinned host memory. `POST /memory/release` gives back the GPU memory the server holds in under 10 ms, leaving its context (about 0.6 GB with the text encoder on a second GPU), and `POST /memory/load` copies the weights onto the GPU while the other model is idle, in 1.6 s over the Gen3 x4 link. A request that finds the weights in host memory copies them during its first step, each layer waiting only for its own weights: 3.9 s an image instead of 2.8 s, and the same image bit for bit.
 
 ```bash
 curl -s http://127.0.0.1:7860/v1/images/generations -H 'Content-Type: application/json' \
@@ -70,7 +70,7 @@ curl -s http://127.0.0.1:7860/v1/images/generations -H 'Content-Type: applicatio
 
 A request without settings gets 1024×1024, 8 steps of er_sde on the simple schedule (the sampler ComfyUI runs for this model), CFG 1 and a new seed. stable-diffusion.cpp's `<sd_cpp_extra_args>{...}</sd_cpp_extra_args>` in an OpenAI prompt sets the seed, negative prompt, size, image count and `sample_params` (`sample_steps`, `sample_method` `euler` or `er_sde`, `scheduler` `discrete` or `simple`, `guidance.txt_cfg`, `eta`, `flow_shift`), so clients written for `sd-server` work unchanged. Sides are multiples of 16 from 256, up to 1024×1024 pixels in all; up to 100 steps and 8 images a request, and prompts of up to 16 KiB.
 
-CFG 1 runs the model once a step (3.06 s an image), and at 8 steps some of its images come out misshapen: by eye, 4 of 8 in a check of two prompts with four seeds each, against 1 of 8 at CFG 2.5, where each step runs the model twice (5.78 s). Euler leaves 8-step images hazy on either schedule; er_sde does not.
+CFG 1 runs the model once a step (2.74 s an image), and at 8 steps some of its images come out misshapen: by eye, 4 of 8 in a check of two prompts with four seeds each, against 1 of 8 at CFG 2.5, where each step runs the model twice (5.20 s). Euler leaves 8-step images hazy on either schedule; er_sde does not.
 
 ## How it works
 
