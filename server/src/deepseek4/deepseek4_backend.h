@@ -366,6 +366,14 @@ private:
     bool encode_image_request(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,
                               std::string & error);
     bool begin_staged_prefill(StagedPrefill & item);
+    // A finished (or failed) staged prompt: retire the staging cache's
+    // prefill arenas and the device pools' cached temporaries, as the
+    // single-request path does after its prefill.
+    void release_staged_prefill_scratch(DeepSeek4Cache & staging);
+    // Before a long prompt's first staged chunk, or after a long-context slot
+    // retires: drop the cached gathered decode graphs (live slots rebuild
+    // theirs on their next step) and the pools' cached temporaries.
+    void release_paged_decode_graphs();
     // Starts one shared pass over the ready, unfinished items, about
     // `row_budget` rows in total (a whole image block may exceed it); `rows`
     // gets each item's share. False when no item is ready (or all failed).

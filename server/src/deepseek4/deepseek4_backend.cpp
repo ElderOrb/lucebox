@@ -1465,6 +1465,23 @@ DeepSeek4Cache * DeepSeek4Backend::image_staging_cache(int slot) {
     return image_staging_caches_[size_t(slot) - 1].get();
 }
 
+static void ds4_trim_device_pools(ggml_backend_t backend, const MoeHybridStorage * moe_hybrid) {
+    ggml_backend_cuda_trim_pool(backend);
+    if (moe_hybrid && moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend) {
+        ggml_backend_cuda_trim_pool(moe_hybrid->cold_backend);
+    }
+}
+
+void DeepSeek4Backend::release_staged_prefill_scratch(DeepSeek4Cache & staging) {
+    deepseek4_release_prefill_scratch(staging, moe_hybrid_.get());
+    ds4_trim_device_pools(backend_, moe_hybrid_.get());
+}
+
+void DeepSeek4Backend::release_paged_decode_graphs() {
+    deepseek4_release_paged_gathered_graphs(paged_cache_);
+    ds4_trim_device_pools(backend_, moe_hybrid_.get());
+}
+
 bool DeepSeek4Backend::begin_staged_prefill(StagedPrefill & item) {
     // Without images the item is a text prompt (sparse text staging).
     const auto * images = item.images
