@@ -324,13 +324,23 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
             staged_pass_.reset();
         }
     }
+    // A shared pass still in flight keeps its members' staging caches; any
+    // other request's can be released between its slices (each slice builds
+    // its graphs anew, and the pass's hidden state is its own buffer).
+    const auto in_staged_pass = [&](const PendingImage & pending) {
+        if (!staged_pass_) return false;
+        for (const auto & member : staged_pass_->members) {
+            if (member.slot == pending.slot && member.request_id == pending.staged.request_id) return true;
+        }
+        return false;
+    };
     for (auto & pending : pending_images_) {
         DeepSeek4StagedPrefill & staged = pending.staged;
         if (!staged.staging) continue;
         if (!staged.error.empty()) {
-            // Failed: its arenas go now (the slot is failed when planned); a
-            // shared pass still in flight keeps them until it completes.
-            if (!staged_pass_) {
+            // Failed: its arenas go now (the slot is failed when planned),
+            // or once the shared pass holding them completes.
+            if (!in_staged_pass(pending)) {
                 b_.release_staged_prefill_scratch(*staged.staging);
                 staged.staging = nullptr;
             }
@@ -346,8 +356,10 @@ void DeepSeek4SeqEngine::advance_pending_images(bool decoding, bool idle) {
         // The prompt is in the paged slot: its batch-width prefill arenas
         // (above 1 GiB after a 40K-token prompt) and the pools' cached
         // temporaries would otherwise stay until this staging cache's next
-        // prompt, and another slot's long prompt then runs out of memory.
-        if (!staged_pass_) b_.release_staged_prefill_scratch(*staged.staging);
+        // prompt, and another slot's long prompt then runs out of memory. A
+        // finished prompt is never in the pass still in flight (members count
+        // their rows when their pass completes), so this runs beside one too.
+        b_.release_staged_prefill_scratch(*staged.staging);
         // Copied (or failed): the staging cache is free for the next request.
         staged.staging = nullptr;
     }
