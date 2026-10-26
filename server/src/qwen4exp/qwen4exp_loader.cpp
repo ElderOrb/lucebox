@@ -280,11 +280,17 @@ bool Qwen4ExpPleReader::gather(const int32_t * rows, int64_t n, float * dst) con
                 size_t got = 0;
                 while (got < row_size_) {
 #if defined(_WIN32)
-                    if (_lseeki64(fd_, at + static_cast<int64_t>(got), SEEK_SET) < 0) {
-                        throw std::runtime_error("qwen4exp: shard-2 seek failed");
+                    // One shared descriptor: keep the seek+read pair atomic so a
+                    // concurrent gather() caller cannot move the offset under us.
+                    int r = 0;
+                    {
+                        std::lock_guard<std::mutex> guard(io_mutex_);
+                        if (_lseeki64(fd_, at + static_cast<int64_t>(got), SEEK_SET) < 0) {
+                            throw std::runtime_error("qwen4exp: shard-2 seek failed");
+                        }
+                        r = _read(fd_, buf + got,
+                                  static_cast<unsigned>(row_size_ - got));
                     }
-                    const int r = _read(fd_, buf + got,
-                                        static_cast<unsigned>(row_size_ - got));
 #else
                     const ssize_t r = ::pread(fd_, buf + got, row_size_ - got,
                                               static_cast<off_t>(at) + static_cast<off_t>(got));
