@@ -721,14 +721,14 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         out.mtp_eh_proj   = layer_tensor(n_layer, "nextn.eh_proj.weight");
         // Some converters emit the MTP HC head as the sidecar's own top-level
         // output_hc_* tensors instead of blk.<n>.nextn.hc_head_*. Prefer the
-        // scoped name, then look inside the sidecar shard only, so the trunk's
-        // identically named output head is never picked by mistake.
+        // scoped name, then look strictly inside the sidecar shard - never the
+        // trunk, whose own output head carries identical names.
+        const ShardSource * mtp_shard =
+            (!shards.empty() && shards.back().path == mtp_path) ? &shards.back() : nullptr;
         auto mtp_head = [&](const char * scoped, const char * flat) -> ggml_tensor * {
             if (ggml_tensor * value = layer_tensor(n_layer, scoped)) return value;
-            for (auto it = shards.rbegin(); it != shards.rend(); ++it) {
-                if (ggml_tensor * value = ggml_get_tensor(it->meta, flat)) return value;
-            }
-            return nullptr;
+            if (!mtp_shard) return nullptr;
+            return ggml_get_tensor(mtp_shard->meta, flat);
         };
         out.mtp_head_norm = mtp_head("nextn.hc_head_norm.weight", "output_hc_norm.weight");
         out.mtp_head_down = mtp_head("nextn.hc_head_down.weight", "output_hc_down.weight");
