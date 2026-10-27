@@ -4360,16 +4360,65 @@ private:
 
 }  // namespace
 
-bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
-                                       int & status, std::string & body) {
+namespace {
+
+// shutdown() half-close that means "no more sending" on each platform.
 #if defined(_WIN32)
-    (void) request; (void) admission;
-    status = 501;
-    body = json({{"error", {{"message", "tool checks need socketpair"}}}}).dump();
+constexpr int kShutdownWrite = SD_SEND;
+#else
+constexpr int kShutdownWrite = SHUT_WR;
+#endif
+
+// A connected, blocking socket pair for an in-process round trip. POSIX has
+// socketpair(2); Windows does not, so a loopback listener stands in: the
+// writer and the reader only ever talk to each other.
+bool create_socket_pair(SocketHandle pair[2]) {
+#if defined(_WIN32)
+    SOCKET listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) return false;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    int addr_len = static_cast<int>(sizeof(addr));
+    bool ok = ::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0 &&
+              ::listen(listener, 1) == 0 &&
+              ::getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &addr_len) == 0;
+    SOCKET writer = INVALID_SOCKET;
+    SOCKET reader = INVALID_SOCKET;
+    if (ok) {
+        writer = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        ok = writer != INVALID_SOCKET &&
+             ::connect(writer, reinterpret_cast<sockaddr *>(&addr), addr_len) == 0;
+    }
+    if (ok) {
+        reader = ::accept(listener, nullptr, nullptr);
+        ok = reader != INVALID_SOCKET;
+    }
+    ::closesocket(listener);
+    if (!ok) {
+        if (writer != INVALID_SOCKET) ::closesocket(writer);
+        if (reader != INVALID_SOCKET) ::closesocket(reader);
+        return false;
+    }
+    pair[0] = writer;
+    pair[1] = reader;
     return true;
 #else
-    int pair[2];
-    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+    int fd[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0) return false;
+    pair[0] = fd[0];
+    pair[1] = fd[1];
+    return true;
+#endif
+}
+
+}  // namespace
+
+bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
+                                       int & status, std::string & body) {
+    SocketHandle pair[2];
+    if (!create_socket_pair(pair)) {
         status = 500;
         body = json({{"error", {{"message", std::string("socketpair: ") + sock_strerror()}}}}).dump();
         return true;
@@ -4394,7 +4443,7 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
     } catch (const std::exception & e) {
         send_error(pair[0], 500, e.what());
     }
-    ::shutdown(pair[0], SHUT_WR);
+    ::shutdown(pair[0], kShutdownWrite);
     reader.join();
     socket_close(pair[0]);
     socket_close(pair[1]);
@@ -4406,7 +4455,6 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
     status = raw.size() > 12 && raw.rfind("HTTP/1.1 ", 0) == 0 ? std::atoi(raw.c_str() + 9) : 500;
     body = head_end == std::string::npos ? raw : raw.substr(head_end + 4);
     return true;
-#endif
 }
 
 bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
