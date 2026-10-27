@@ -941,6 +941,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 "request_id=%s format=%d bytes=%zu text='%s'\n",
                 request_id_.c_str(), (int)format_, tool_buffer_.size(),
                 escaped.c_str());
+            dropped_tool_call_ = true;
 
             if (tool_from_reasoning_) {
                 size_t think_close = find_top_level_think_close(tool_buffer_, tools_);

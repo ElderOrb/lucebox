@@ -4208,12 +4208,10 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
                                       bool count_tokens_only,
                                       RoutingAdmission * admission) {
-#if !defined(_WIN32)
     if (!count_tokens_only && req.format == ApiFormat::OPENAI_CHAT &&
         tool_checks::requested(req.raw_body, config_.tool_checks)) {
         return serve_with_tool_checks(fd, req, admission);
     }
-#endif
     try {
         const json & body = req.raw_body;
         if (!parse_common_request_fields(fd, body, req)) return true;
@@ -4361,16 +4359,16 @@ private:
 }  // namespace
 
 bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
-                                       int & status, std::string & body) {
+                                       int & status, std::string & body,
+                                       bool * dropped_tool_call) {
 #if defined(_WIN32)
-    (void) request; (void) admission;
+    (void) request; (void) admission; (void) dropped_tool_call;
     status = 501;
     body = json({{"error", {{"message", "tool checks need socketpair"}}}}).dump();
     return true;
 #else
     int pair[2];
-    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
-        status = 500;
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {        status = 500;
         body = json({{"error", {{"message", std::string("socketpair: ") + sock_strerror()}}}}).dump();
         return true;
     }
@@ -4390,7 +4388,10 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         inner.raw_body = request;
         inner.output_format = http_detail::request_output_format(request.dump());
         parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
+        auto dropped = std::make_shared<bool>(false);
+        inner.dropped_tool_call_out = dropped;
         handle_model_request(pair[0], inner, false, admission ? &outcome : nullptr);
+        if (dropped_tool_call) *dropped_tool_call = *dropped;
     } catch (const std::exception & e) {
         send_error(pair[0], 500, e.what());
     }
@@ -4434,20 +4435,21 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     if (!admission) open_stream();
 
     // A pass that fails leaves the reply it would have replaced.
-    auto pass = [&](const json & body, json & response) {
+    auto pass = [&](const json & body, json & response, bool * dropped = nullptr) {
         if (http_detail::inspect_peer_socket(fd) == http_detail::PeerSocketState::Disconnected) {
             return false;
         }
         int status = 0;
         std::string raw;
-        if (!inner_chat_completion(body, nullptr, status, raw) || status != 200) return false;
+        if (!inner_chat_completion(body, nullptr, status, raw, dropped) || status != 200) return false;
         response = json::parse(raw, nullptr, false);
         return !response.is_discarded() && tc::reply_message(response) != nullptr;
     };
 
     int status = 0;
     std::string raw;
-    if (!inner_chat_completion(request, admission, status, raw)) return true;
+    bool dropped_tool_call = false;
+    if (!inner_chat_completion(request, admission, status, raw, &dropped_tool_call)) return true;
     json response = json::parse(raw, nullptr, false);
     json * reply = status == 200 && !response.is_discarded() ? tc::reply_message(response) : nullptr;
     if (!reply) {
@@ -4483,6 +4485,27 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
             tool_free = "dropped";
         }
     }
+    // A call to a tool the request never declared is dropped by the parser, so
+    // the turn would go out as prose and the work would never start. Re-ask
+    // once, naming the tools that do exist.
+    const char * undeclared = "-";
+    if (!tools_off && dropped_tool_call &&
+        (!reply->contains("tool_calls") || (*reply)["tool_calls"].empty())) {
+        json again;
+        bool again_dropped = false;
+        if (pass(tc::with_note(request, *reply, tc::undeclared_note(request)), again,
+                 &again_dropped)) {
+            json * again_reply = tc::reply_message(again);
+            if (again_reply && again_reply->contains("tool_calls") &&
+                !(*again_reply)["tool_calls"].empty()) {
+                response = std::move(again);
+                reply = again_reply;
+                undeclared = "replanned";
+            } else {
+                undeclared = "kept";
+            }
+        }
+    }
     if (!tools_off && tc::needs_replan(*reply)) {
         json again;
         json * again_reply = pass(tc::with_note(request, *reply, tc::kReplanNote), again)
@@ -4508,8 +4531,10 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
             final_check = "more_work";
         }
     }
-    std::fprintf(stderr, "[tool-checks] %s tool_free=%s replan=%s final_check=%s ms=%lld\n",
-                 response.value("id", std::string()).c_str(), tool_free, replan, final_check,
+    std::fprintf(stderr,
+                 "[tool-checks] %s tool_free=%s undeclared=%s replan=%s final_check=%s ms=%lld\n",
+                 response.value("id", std::string()).c_str(), tool_free, undeclared, replan,
+                 final_check,
                  (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - started).count());
 
@@ -10101,6 +10126,11 @@ void HttpServer::send_nonstream_response(
 
     const json response = build_non_streaming_response(
         req, result, n_gen_cap, gen_timings, counts, emitter, &tokenizer_);
+    // The tool buffer is parsed while the response is built, so the flag is
+    // only readable now.
+    if (req.dropped_tool_call_out && emitter.dropped_tool_call()) {
+        *req.dropped_tool_call_out = true;
+    }
 
     const std::string body = response.dump() + "\n";
     if (send_buffer) {
@@ -10463,6 +10493,11 @@ void HttpServer::process_job(ServerJob * job) {
     } else if (!req.stream && !client_disconnected) {
         const json response = build_non_streaming_response(
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+        // The tool buffer is parsed while the response is built, so the flag is
+        // only readable now.
+        if (req.dropped_tool_call_out && emitter.dropped_tool_call()) {
+            *req.dropped_tool_call_out = true;
+        }
         remember_agent_turn(
             req, prepared, cache, result, emitter, completion_tokens,
             visible_output_seen, client_disconnected,

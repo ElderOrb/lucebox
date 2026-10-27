@@ -71,6 +71,12 @@ json agent_request(const json & body, const std::string & effort);
 
 // `request` continued with the model's `reply` and a note from the server.
 json with_note(const json & request, const json & reply, const char * note);
+json with_note(const json & request, const json & reply, const std::string & note);
+
+// Note for a turn whose tool call was dropped because it named a tool the
+// request never declared: lists the tools that do exist and asks for a call
+// that can run.
+std::string undeclared_note(const json & request);
 
 // The assistant message of a chat.completion response, or nullptr.
 json * reply_message(json & response);
