@@ -45,6 +45,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <memory>
 #include <climits>
 #include <cctype>
 #include <cmath>
@@ -4432,7 +4433,8 @@ bool create_socket_pair(SocketHandle pair[2]) {
 }  // namespace
 
 bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * admission,
-                                       int & status, std::string & body) {
+                                       int & status, std::string & body,
+                                       bool * dropped_tool_call) {
     SocketHandle pair[2];
     if (!create_socket_pair(pair)) {
         status = 500;
@@ -4455,7 +4457,10 @@ bool HttpServer::inner_chat_completion(const json & request, RoutingAdmission * 
         inner.raw_body = request;
         inner.output_format = http_detail::request_output_format(request.dump());
         parse_endpoint_request("/v1/chat/completions", inner.raw_body, inner, count_only);
+        auto dropped = std::make_shared<bool>(false);
+        inner.dropped_tool_call_out = dropped;
         handle_model_request(pair[0], inner, false, admission ? &outcome : nullptr);
+        if (dropped_tool_call) *dropped_tool_call = *dropped;
     } catch (const std::exception & e) {
         send_error(pair[0], 500, e.what());
     }
@@ -4498,20 +4503,23 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     if (!admission) open_stream();
 
     // A pass that fails leaves the reply it would have replaced.
-    auto pass = [&](const json & body, json & response) {
+    auto pass = [&](const json & body, json & response, bool * dropped = nullptr) {
         if (http_detail::inspect_peer_socket(fd) == http_detail::PeerSocketState::Disconnected) {
             return false;
         }
         int status = 0;
         std::string raw;
-        if (!inner_chat_completion(body, nullptr, status, raw) || status != 200) return false;
+        bool dropped_here = false;
+        if (!inner_chat_completion(body, nullptr, status, raw, &dropped_here) || status != 200) return false;
+        if (dropped) *dropped = dropped_here;
         response = json::parse(raw, nullptr, false);
         return !response.is_discarded() && tc::reply_message(response) != nullptr;
     };
 
     int status = 0;
     std::string raw;
-    if (!inner_chat_completion(request, admission, status, raw)) return true;
+    bool dropped_call = false;
+    if (!inner_chat_completion(request, admission, status, raw, &dropped_call)) return true;
     json response = json::parse(raw, nullptr, false);
     json * reply = status == 200 && !response.is_discarded() ? tc::reply_message(response) : nullptr;
     if (!reply) {
@@ -4547,7 +4555,31 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
             tool_free = "dropped";
         }
     }
-    if (!tools_off && tc::needs_replan(*reply)) {
+    // A reply whose tool-call syntax produced no callable call has had that
+    // text dropped, so the turn would go out as prose and the work would never
+    // start. Re-ask once: the note names the tools this session has and asks
+    // for a call that can run. A dropped call is usually a call to a tool that
+    // does not exist here, but it can also be a declared tool whose arguments
+    // did not parse, so the note covers both without claiming which.
+    const char * dropped = "-";
+    if (!tools_off && dropped_call &&
+        (!reply->contains("tool_calls") || (*reply)["tool_calls"].empty())) {
+        // Record the attempt up front: a failed pass keeps the first reply, and
+        // the log still has to show that recovery was tried.
+        dropped = "kept";
+        json again;
+        bool again_dropped = false;
+        if (pass(tc::with_note(request, *reply, tc::dropped_call_note(request)), again,
+                 &again_dropped)) {
+            json * again_reply = tc::reply_message(again);
+            if (again_reply && again_reply->contains("tool_calls") &&
+                !(*again_reply)["tool_calls"].empty()) {
+                response = std::move(again);
+                reply = again_reply;
+                dropped = "replanned";
+            }
+        }
+    }    if (!tools_off && tc::needs_replan(*reply)) {
         json again;
         json * again_reply = pass(tc::with_note(request, *reply, tc::kReplanNote), again)
             ? tc::reply_message(again) : nullptr;
@@ -4572,8 +4604,10 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
             final_check = "more_work";
         }
     }
-    std::fprintf(stderr, "[tool-checks] %s tool_free=%s replan=%s final_check=%s ms=%lld\n",
-                 response.value("id", std::string()).c_str(), tool_free, replan, final_check,
+    std::fprintf(stderr,
+                 "[tool-checks] %s tool_free=%s dropped=%s replan=%s final_check=%s ms=%lld\n",
+                 response.value("id", std::string()).c_str(), tool_free, dropped, replan,
+                 final_check,
                  (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - started).count());
 
@@ -10281,6 +10315,11 @@ void HttpServer::send_nonstream_response(
 
     const json response = build_non_streaming_response(
         req, result, n_gen_cap, gen_timings, counts, emitter, &tokenizer_);
+    // The tool buffer is parsed while the response is built, so the flag is
+    // only readable now.
+    if (req.dropped_tool_call_out && emitter.dropped_tool_call()) {
+        *req.dropped_tool_call_out = true;
+    }
 
     const std::string body = response.dump() + "\n";
     if (send_buffer) {
@@ -10643,6 +10682,11 @@ void HttpServer::process_job(ServerJob * job) {
     } else if (!req.stream && !client_disconnected) {
         const json response = build_non_streaming_response(
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+        // The tool buffer is parsed while the response is built, so the flag is
+        // only readable now.
+        if (req.dropped_tool_call_out && emitter.dropped_tool_call()) {
+            *req.dropped_tool_call_out = true;
+        }
         remember_agent_turn(
             req, prepared, cache, result, emitter, completion_tokens,
             visible_output_seen, client_disconnected,

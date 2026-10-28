@@ -740,9 +740,20 @@ bool load_qwen4exp_gguf(const std::string & path, ggml_backend_t backend,
         out.mtp_enorm     = layer_tensor(n_layer, "nextn.enorm.weight");
         out.mtp_hnorm     = layer_tensor(n_layer, "nextn.hnorm.weight");
         out.mtp_eh_proj   = layer_tensor(n_layer, "nextn.eh_proj.weight");
-        out.mtp_head_norm = layer_tensor(n_layer, "nextn.hc_head_norm.weight");
-        out.mtp_head_down = layer_tensor(n_layer, "nextn.hc_head_down.weight");
-        out.mtp_head_up   = layer_tensor(n_layer, "nextn.hc_head_up.weight");
+        // Some converters emit the MTP HC head as the sidecar's own top-level
+        // output_hc_* tensors instead of blk.<n>.nextn.hc_head_*. Prefer the
+        // scoped name, then look strictly inside the sidecar shard - never the
+        // trunk, whose own output head carries identical names.
+        const ShardSource * mtp_shard =
+            (!shards.empty() && shards.back().path == mtp_path) ? &shards.back() : nullptr;
+        auto mtp_head = [&](const char * scoped, const char * flat) -> ggml_tensor * {
+            if (ggml_tensor * value = layer_tensor(n_layer, scoped)) return value;
+            if (!mtp_shard) return nullptr;
+            return ggml_get_tensor(mtp_shard->meta, flat);
+        };
+        out.mtp_head_norm = mtp_head("nextn.hc_head_norm.weight", "output_hc_norm.weight");
+        out.mtp_head_down = mtp_head("nextn.hc_head_down.weight", "output_hc_down.weight");
+        out.mtp_head_up   = mtp_head("nextn.hc_head_up.weight", "output_hc_up.weight");
         const Qwen4ExpLayer * full = nullptr;
         for (const Qwen4ExpLayer & layer : out.layers) if (layer.is_full_attention) { full = &layer; break; }
         if (!out.mtp_enorm || !out.mtp_hnorm || !out.mtp_eh_proj || !out.mtp_head_norm ||
