@@ -4208,12 +4208,10 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
                                       bool count_tokens_only,
                                       RoutingAdmission * admission) {
-#if !defined(_WIN32)
     if (!count_tokens_only && req.format == ApiFormat::OPENAI_CHAT &&
         tool_checks::requested(req.raw_body, config_.tool_checks)) {
         return serve_with_tool_checks(fd, req, admission);
     }
-#endif
     try {
         const json & body = req.raw_body;
         if (!parse_common_request_fields(fd, body, req)) return true;
@@ -4392,8 +4390,28 @@ bool create_socket_pair(SocketHandle pair[2]) {
              ::connect(writer, reinterpret_cast<sockaddr *>(&addr), addr_len) == 0;
     }
     if (ok) {
-        reader = ::accept(listener, nullptr, nullptr);
-        ok = reader != INVALID_SOCKET;
+        // Only the socket connected above may be accepted: another local
+        // process could otherwise win this accept race on our listener.
+        sockaddr_in expect{};
+        int expect_len = static_cast<int>(sizeof(expect));
+        ok = ::getsockname(writer, reinterpret_cast<sockaddr *>(&expect), &expect_len) == 0;
+        for (int attempt = 0; ok && attempt < 8 && reader == INVALID_SOCKET; ++attempt) {
+            sockaddr_in peer{};
+            int peer_len = static_cast<int>(sizeof(peer));
+            SOCKET candidate = ::accept(listener, reinterpret_cast<sockaddr *>(&peer), &peer_len);
+            if (candidate == INVALID_SOCKET) {
+                ok = false;
+                break;
+            }
+            if (peer.sin_family == expect.sin_family &&
+                peer.sin_port == expect.sin_port &&
+                peer.sin_addr.s_addr == expect.sin_addr.s_addr) {
+                reader = candidate;
+            } else {
+                ::closesocket(candidate);
+            }
+        }
+        ok = ok && reader != INVALID_SOCKET;
     }
     ::closesocket(listener);
     if (!ok) {
