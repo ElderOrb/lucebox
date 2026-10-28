@@ -4208,10 +4208,12 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
                                       bool count_tokens_only,
                                       RoutingAdmission * admission) {
+#if !defined(_WIN32)
     if (!count_tokens_only && req.format == ApiFormat::OPENAI_CHAT &&
         tool_checks::requested(req.raw_body, config_.tool_checks)) {
         return serve_with_tool_checks(fd, req, admission);
     }
+#endif
     try {
         const json & body = req.raw_body;
         if (!parse_common_request_fields(fd, body, req)) return true;
@@ -4491,6 +4493,9 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
     const char * undeclared = "-";
     if (!tools_off && dropped_tool_call &&
         (!reply->contains("tool_calls") || (*reply)["tool_calls"].empty())) {
+        // Record the attempt up front: a failed pass keeps the first reply,
+        // and the log still has to show that recovery was tried.
+        undeclared = "kept";
         json again;
         bool again_dropped = false;
         if (pass(tc::with_note(request, *reply, tc::undeclared_note(request)), again,
@@ -4501,8 +4506,6 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
                 response = std::move(again);
                 reply = again_reply;
                 undeclared = "replanned";
-            } else {
-                undeclared = "kept";
             }
         }
     }

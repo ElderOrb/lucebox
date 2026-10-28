@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -26,6 +27,58 @@ static bool starts_with_potential_bare_json_tool(const std::string & text,
     if (!has_request_tools(tools)) return false;
     size_t first = text.find_first_not_of(" \t\n\r");
     return first != std::string::npos && text[first] == '{';
+}
+
+// The buffered tool syntax names a tool the request never declared. A declared
+// tool with malformed arguments is a different failure: telling the model the
+// tool is unavailable would be false, so it does not qualify.
+static bool buffer_names_undeclared_tool(const std::string & buffer,
+                                         const json & tools) {
+    if (!has_request_tools(tools)) return false;
+    std::string candidate;
+    const size_t key = buffer.find("\"name\"");
+    if (key != std::string::npos) {
+        const size_t colon = buffer.find(':', key + 6);
+        if (colon != std::string::npos) {
+            const size_t open = buffer.find('"', colon + 1);
+            if (open != std::string::npos) {
+                const size_t close = buffer.find('"', open + 1);
+                if (close != std::string::npos) {
+                    candidate = buffer.substr(open + 1, close - open - 1);
+                }
+            }
+        }
+    }
+    if (candidate.empty()) {
+        static const char kOpen[] = "<tool_call>";
+        const size_t at = buffer.find(kOpen);
+        if (at != std::string::npos) {
+            size_t first = at + sizeof(kOpen) - 1;
+            const size_t last = buffer.find("</tool_call>", first);
+            if (last != std::string::npos) {
+                while (first < last &&
+                       std::isspace(static_cast<unsigned char>(buffer[first]))) {
+                    ++first;
+                }
+                size_t end = first;
+                while (end < last &&
+                       !std::isspace(static_cast<unsigned char>(buffer[end])) &&
+                       buffer[end] != '{' && buffer[end] != '<') {
+                    ++end;
+                }
+                candidate = buffer.substr(first, end - first);
+            }
+        }
+    }
+    if (candidate.empty()) return false;
+    for (const auto & tool : tools) {
+        const json & fn = tool.is_object() && tool.contains("function")
+            ? tool["function"] : tool;
+        if (fn.is_object() && fn.value("name", std::string()) == candidate) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static std::string gen_item_id() {
@@ -941,7 +994,9 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
                 "request_id=%s format=%d bytes=%zu text='%s'\n",
                 request_id_.c_str(), (int)format_, tool_buffer_.size(),
                 escaped.c_str());
-            dropped_tool_call_ = true;
+            if (buffer_names_undeclared_tool(tool_buffer_, tools_)) {
+                dropped_tool_call_ = true;
+            }
 
             if (tool_from_reasoning_) {
                 size_t think_close = find_top_level_think_close(tool_buffer_, tools_);
