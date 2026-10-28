@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -116,7 +117,8 @@ public:
     int64_t row_bytes() const { return row_size_; }
 
     // Fill dst[slot*head_dim, (slot+1)*head_dim) with row `rows[slot]`
-    // dequantized to F32. Thread-safe.
+    // dequantized to F32. Thread-safe: POSIX reads with pread, Windows has one
+    // descriptor and serializes its seek+read pair with an internal mutex.
     bool gather(const int32_t * rows, int64_t n, float * dst) const;
 
 private:
@@ -126,6 +128,7 @@ private:
     int64_t          n_rows_    = 0;
     int64_t          head_dim_  = 0;
     int              n_threads_ = 4;
+    mutable std::mutex io_mutex_;   // guards the Windows seek+read pair
     ggml_type        type_      = GGML_TYPE_COUNT;
     ggml_to_float_t  to_float_  = nullptr;
 };
