@@ -149,14 +149,21 @@ std::vector<std::string> discover_shard_paths(const std::string & primary) {
 
 // ─── Qwen4ExpPleReader ──────────────────────────────────────────────────
 
+#if defined(_WIN32)
+#include <io.h>
+#include <fcntl.h>
+#endif
+
 Qwen4ExpPleReader::~Qwen4ExpPleReader() { close(); }
 
 void Qwen4ExpPleReader::close() {
-#if !defined(_WIN32)
     if (fd_ >= 0) {
+#if defined(_WIN32)
+        _close(fd_);
+#else
         ::close(fd_);
-    }
 #endif
+    }
     fd_ = -1;
     to_float_ = nullptr;
 }
@@ -219,7 +226,18 @@ bool Qwen4ExpPleReader::open(const std::string & path, const char * tensor_name,
 
     n_threads_ = std::max(1, n_threads);
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    fd_ = _open(path.c_str(), _O_RDONLY | _O_BINARY);
+    if (fd_ < 0) {
+        out_error = "qwen4exp: open shard 2 failed on Windows";
+        to_float_ = nullptr;
+        gguf_free(gctx);
+        if (meta_ctx) ggml_free(meta_ctx);
+        return false;
+    }
+    // _lseeki64 + _read cannot be interleaved across threads on one descriptor.
+    n_threads_ = 1;
+#else
     fd_ = ::open(path.c_str(), O_RDONLY);
     if (fd_ < 0) {
         out_error = "qwen4exp: open shard 2 failed: " + std::string(std::strerror(errno));
@@ -228,12 +246,6 @@ bool Qwen4ExpPleReader::open(const std::string & path, const char * tensor_name,
         if (meta_ctx) ggml_free(meta_ctx);
         return false;
     }
-#else
-    out_error = "qwen4exp: lazy direct PLE reads are not supported on Windows";
-    to_float_ = nullptr;
-    gguf_free(gctx);
-    if (meta_ctx) ggml_free(meta_ctx);
-    return false;
 #endif
 
     gguf_free(gctx);
@@ -242,10 +254,6 @@ bool Qwen4ExpPleReader::open(const std::string & path, const char * tensor_name,
 }
 
 bool Qwen4ExpPleReader::gather(const int32_t * rows, int64_t n, float * dst) const {
-#if defined(_WIN32)
-    (void) rows; (void) n; (void) dst;
-    return false;
-#else
     if (fd_ < 0 || to_float_ == nullptr || n <= 0) return false;
 
     std::vector<std::pair<int32_t, int32_t>> pairs;
@@ -266,14 +274,28 @@ bool Qwen4ExpPleReader::gather(const int32_t * rows, int64_t n, float * dst) con
             uint8_t * buf = scratch.data() + static_cast<size_t>(begin) *
                             static_cast<size_t>(row_size_);
             for (int64_t k = begin; k < end; ++k, buf += row_size_) {
-                const off_t at = static_cast<off_t>(base_) +
-                                 static_cast<off_t>(pairs[static_cast<size_t>(k)].first) *
-                                 static_cast<off_t>(row_size_);
+                const int64_t at = static_cast<int64_t>(base_) +
+                                   static_cast<int64_t>(pairs[static_cast<size_t>(k)].first) *
+                                   static_cast<int64_t>(row_size_);
                 size_t got = 0;
                 while (got < row_size_) {
+#if defined(_WIN32)
+                    // One shared descriptor: keep the seek+read pair atomic so a
+                    // concurrent gather() caller cannot move the offset under us.
+                    int r = 0;
+                    {
+                        std::lock_guard<std::mutex> guard(io_mutex_);
+                        if (_lseeki64(fd_, at + static_cast<int64_t>(got), SEEK_SET) < 0) {
+                            throw std::runtime_error("qwen4exp: shard-2 seek failed");
+                        }
+                        r = _read(fd_, buf + got,
+                                  static_cast<unsigned>(row_size_ - got));
+                    }
+#else
                     const ssize_t r = ::pread(fd_, buf + got, row_size_ - got,
-                                              at + static_cast<off_t>(got));
-                    if (r <= 0) throw std::runtime_error("qwen4exp: shard-2 pread failed");
+                                              static_cast<off_t>(at) + static_cast<off_t>(got));
+#endif
+                    if (r <= 0) throw std::runtime_error("qwen4exp: shard-2 read failed");
                     got += static_cast<size_t>(r);
                 }
                 to_float_(reinterpret_cast<const void *>(buf),
@@ -305,7 +327,6 @@ bool Qwen4ExpPleReader::gather(const int32_t * rows, int64_t n, float * dst) con
         if (e) return false;
     }
     return true;
-#endif
 }
 
 // ─── Loader ─────────────────────────────────────────────────────────────
