@@ -226,12 +226,19 @@ static bool is_strict_prefix(const std::vector<int32_t> & a,
 
 int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru,
                                const std::vector<bool> * protected_lru,
-                               int skip_index) {
+                               int skip_index,
+                               const std::vector<bool> * held_lru) {
     const int n = (int)ids_lru.size();
     if (n <= 0) return 0;
     auto is_protected = [&](int i) {
         return protected_lru && i >= 0 && i < (int)protected_lru->size() &&
                (*protected_lru)[(size_t)i];
+    };
+    // Never a victim, like the restore source, but still an ancestor or a
+    // descendant of the others.
+    auto is_skipped = [&](int i) {
+        return i == skip_index ||
+               (held_lru && i < (int)held_lru->size() && (*held_lru)[(size_t)i]);
     };
     auto is_ancestor = [&](int i) {
         for (int j = 0; j < n; j++) {
@@ -250,14 +257,14 @@ int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> &
     // A turn kept between a conversation's head and its newest snapshot only
     // serves an edit of the last message: it goes first.
     for (int i = 0; i < n; i++) {
-        if (i == skip_index || is_protected(i)) continue;
+        if (is_skipped(i) || is_protected(i)) continue;
         if (is_ancestor(i) && has_ancestor(i)) return i;
     }
     // Oldest-first scan: prefer an unprotected leaf so sticky tools pins
     // survive. skip_index (the in-flight restore source) is never a victim.
     int oldest_protected_leaf = -1;
     for (int i = 0; i < n; i++) {
-        if (i == skip_index) continue;
+        if (is_skipped(i)) continue;
         if (is_ancestor(i)) continue;
         if (!is_protected(i)) return i;  // oldest unprotected leaf
         if (oldest_protected_leaf < 0) oldest_protected_leaf = i;
@@ -271,7 +278,7 @@ int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> &
         // pin, never the restore source.
         int shallowest_ancestor = -1;
         for (int i = 0; i < n; i++) {
-            if (i == skip_index || is_protected(i)) continue;
+            if (is_skipped(i) || is_protected(i)) continue;
             if (!is_ancestor(i)) continue;
             if (shallowest_ancestor < 0 ||
                 ids_lru[i]->size() < ids_lru[(size_t)shallowest_ancestor]->size()) {
@@ -279,22 +286,25 @@ int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> &
             }
         }
         if (shallowest_ancestor >= 0) return shallowest_ancestor;
-        // Only the restore source and/or protected pins remain: destroying
-        // either would throw away the stable tools head or the in-flight
-        // restore, so there is no safe victim.
-        return -1;
     }
+    // Every other leaf is a pin. Give up the least recently used one: its
+    // head costs one re-prefill, while refusing leaves the restored
+    // conversation unable to save any later turn. A leaf is never an
+    // ancestor of the restore source.
     if (oldest_protected_leaf >= 0) return oldest_protected_leaf;
-    return 0;  // unreachable (the longest entry is always a leaf); pure-LRU fallback
+    // Only the restore source, held entries and their ancestors remain.
+    // Without either this is unreachable: the longest entry is always a leaf.
+    return skip_index >= 0 || held_lru ? -1 : 0;
 }
 
 int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru,
                                const std::vector<bool> * protected_lru,
-                               int skip_index) {
+                               int skip_index,
+                               const std::vector<bool> * held_lru) {
     std::vector<const std::vector<int32_t> *> ptrs;
     ptrs.reserve(ids_lru.size());
     for (const auto & v : ids_lru) ptrs.push_back(&v);
-    return select_inline_evict_victim(ptrs, protected_lru, skip_index);
+    return select_inline_evict_victim(ptrs, protected_lru, skip_index, held_lru);
 }
 
 int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
@@ -769,6 +779,15 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         if (!active.has_victim) ++reserved_free_slots;
         pending_bytes += active.bytes;
     }
+    const auto log_no_slot = [&](const char * reason) {
+        int pins = 0;
+        for (const auto & entry : entries_) pins += entry.protect ? 1 : 0;
+        std::fprintf(stderr,
+            "[pc] inline snap skipped, %s: entries=%zu protected=%d "
+            "in_flight=%zu cap=%d restore_slot=%d cut=%d\n",
+            reason, entries_.size(), pins, active_reservations_.size(), cap_,
+            restore_source_slot, target_cut);
+    };
     if ((int)entries_.size() + reserved_free_slots >= cap_) {
         // At capacity — reserve a slot without evicting yet. Prefix-aware: prefer
         // the oldest leaf so shared ancestor prefixes (reused by later branches)
@@ -779,9 +798,10 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         const int victim = pick_evict_victim(
             restore_source_slot >= 0 ? find_slot_entry(restore_source_slot) : -1);
         if (victim < 0) {
-            // Nothing safe to evict (only the restore source and/or protected
-            // pins remain). Skip this snapshot; the restore point stays put
-            // rather than being destroyed.
+            // Only the restore source, entries captures in flight hold and
+            // their pinned ancestors remain. Skip this snapshot; the restore
+            // point stays put rather than being destroyed.
+            log_no_slot("no evictable entry");
             return {};
         }
         victim_key = entries_[(size_t)victim].hash;
@@ -809,7 +829,10 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
             slot = candidate;
             break;
         }
-        if (slot < 0) return {};
+        if (slot < 0) {
+            log_no_slot("no free slot");
+            return {};
+        }
         next_slot_ = (slot + 1) % cap_;
     }
 
@@ -1120,16 +1143,17 @@ int PrefixCache::pick_evict_victim(int skip_index) const {
     if (entries_.empty()) return -1;
     std::vector<const std::vector<int32_t> *> ids_lru;
     std::vector<bool> protected_lru;
+    std::vector<bool> held_lru;
     ids_lru.reserve(entries_.size());
     protected_lru.reserve(entries_.size());
+    held_lru.reserve(entries_.size());
     for (const auto & entry : entries_) {
         ids_lru.push_back(&entry.ids);
+        protected_lru.push_back(entry.protect);
         // A capture in flight writes over its victim's slot: never a second victim.
-        protected_lru.push_back(entry.protect || slot_reserved(entry.slot));
+        held_lru.push_back(slot_reserved(entry.slot));
     }
-    const int victim = select_inline_evict_victim(ids_lru, &protected_lru, skip_index);
-    return victim >= 0 && victim < (int)entries_.size() &&
-        slot_reserved(entries_[(size_t)victim].slot) ? -1 : victim;
+    return select_inline_evict_victim(ids_lru, &protected_lru, skip_index, &held_lru);
 }
 
 std::vector<int> PrefixCache::superseded_entries(
@@ -1209,7 +1233,8 @@ std::vector<int> PrefixCache::enforce_resident_budget(
         const int keep = find_slot_entry(keep_slot);
         if (keep < 0) break;
         // Oldest unprotected leaf first, then the shallowest unprotected
-        // ancestor; never the new entry or a protected pin.
+        // ancestor, then the oldest pin that is a leaf; never the new entry
+        // or a pinned ancestor of it.
         const int victim = pick_evict_victim(keep);
         if (victim < 0) break;
         const int slot = entries_[(size_t)victim].slot;

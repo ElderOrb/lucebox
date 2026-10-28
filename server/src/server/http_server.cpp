@@ -9920,15 +9920,23 @@ bool HttpServer::save_generated_turn(
     if (matched <= prompt_len) return false;
 
     // Keep this request's own checkpoints: they are the fallback when the
-    // next request diverges inside the generated turn.
+    // next request diverges inside the generated turn. A live restore
+    // consumes its source, which leaves nothing to keep in that slot.
     const int keep_slot = cache.snap_prepared ? cache.snap_slot
-        : cache.using_restore && !cache.disk_hit ? cache.cache_slot : -1;
+        : cache.using_restore && !cache.disk_hit &&
+          backend_.snapshot_used(cache.cache_slot) ? cache.cache_slot : -1;
     auto reservation = prefix_cache_.reserve_inline_snap(
         canonical, prompt_len, false, matched, keep_slot,
         [this](int target_cut) {
             return backend_.snapshot_bytes_estimate(target_cut);
         });
     if (!reservation.active() || reservation.target_cut() != matched) {
+        const auto stats = prefix_cache_.stats();
+        std::fprintf(stderr,
+            "[agent-turn-cache] generated turn not saved: prefix=%d "
+            "reserved_cut=%d keep_slot=%d entries=%d cap=%d\n",
+            matched, reservation.target_cut(), keep_slot, stats.in_use,
+            stats.capacity);
         return false;
     }
     const int slot = reservation.slot();
@@ -9939,6 +9947,10 @@ bool HttpServer::save_generated_turn(
     const bool saved = backend_.snapshot_save_deferred(slot);
     const int saved_pos = saved ? backend_.snapshot_cur_pos(slot) : 0;
     if (saved_pos <= prompt_len || saved_pos > matched) {
+        std::fprintf(stderr,
+            "[agent-turn-cache] generated turn not saved: snapshot slot=%d "
+            "saved=%d pos=%d outside (prompt=%d, prefix=%d]\n",
+            slot, saved ? 1 : 0, saved_pos, prompt_len, matched);
         backend_.snapshot_free(slot);
         reservation.abort();
         return false;

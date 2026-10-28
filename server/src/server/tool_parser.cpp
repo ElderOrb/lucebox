@@ -23,11 +23,21 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <random>
 #include <regex>
 #include <sstream>
+#if defined(_WIN32)
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 namespace luce::common {
 
@@ -1169,7 +1179,8 @@ static std::string normalize_dsml_tags(const std::string & text) {
 
 // ─── Main parser ────────────────────────────────────────────────────────
 
-ToolParseResult parse_tool_calls(const std::string & raw_text, const json & tools) {
+static ToolParseResult parse_tool_calls_on_this_stack(const std::string & raw_text,
+                                                     const json & tools) {
     const std::string text = normalize_dsml_tags(raw_text);
     ToolParseResult result;
     std::vector<Span> removals;
@@ -1875,6 +1886,108 @@ ToolParseResult parse_tool_calls(const std::string & raw_text, const json & tool
     }
 
     return result;
+}
+
+// ─── Stack for the regex matcher ───────────────────────────────────────
+//
+// libstdc++'s std::regex matches by recursion: every character a
+// `[\s\S]*?` group spans costs one more level, roughly 150 bytes of stack
+// in a release build and 300 in a debug one. A tool call that writes a file
+// spans tens of KB, more than a thread's default stack holds (2 MiB when the
+// stack rlimit is unlimited), and the overflow kills the server with
+// SIGSEGV and no log line. Every text is parsed on a thread whose stack is
+// sized to it, since the caller's stack size is unknown (512 KiB for a macOS
+// secondary thread). A text too long for the largest stack, or one whose
+// thread cannot start, is returned unparsed rather than risk the overflow.
+
+namespace {
+
+constexpr size_t kParseStackBaseBytes = 8u << 20;
+constexpr size_t kParseStackPerTextByte = 1024;
+constexpr size_t kParseStackMaxBytes = size_t(1) << 30;
+// Longest text the largest stack still covers.
+constexpr size_t kParseMaxTextBytes =
+    (kParseStackMaxBytes - kParseStackBaseBytes) / kParseStackPerTextByte;
+
+struct StackJob {
+    void (*run)(void *);
+    void * arg;
+};
+
+#if defined(_WIN32)
+DWORD WINAPI run_stack_job(LPVOID p) {
+    auto * job = static_cast<StackJob *>(p);
+    job->run(job->arg);
+    return 0;
+}
+#else
+void * run_stack_job(void * p) {
+    auto * job = static_cast<StackJob *>(p);
+    job->run(job->arg);
+    return nullptr;
+}
+#endif
+
+// Runs job on a new thread with a stack of stack_bytes and waits for it.
+// False when the thread could not be created; job did not run.
+bool run_with_stack(size_t stack_bytes, StackJob & job) {
+#if defined(_WIN32)
+    HANDLE thread = CreateThread(nullptr, stack_bytes, run_stack_job, &job,
+                                 STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (thread == nullptr) return false;
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    return true;
+#else
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return false;
+    pthread_t thread;
+    const bool started =
+        pthread_attr_setstacksize(&attr, stack_bytes) == 0 &&
+        pthread_create(&thread, &attr, run_stack_job, &job) == 0;
+    pthread_attr_destroy(&attr);
+    if (!started) return false;
+    pthread_join(thread, nullptr);
+    return true;
+#endif
+}
+
+}  // namespace
+
+ToolParseResult parse_tool_calls(const std::string & raw_text, const json & tools) {
+    // Text no stack is sized for is returned unparsed: the caller treats it
+    // as a failed parse instead of the matcher overflowing the stack.
+    ToolParseResult unparsed{raw_text, {}};
+    if (raw_text.size() > kParseMaxTextBytes) {
+        std::fprintf(stderr,
+            "[server] tool_call text of %zu bytes exceeds the %zu-byte parse "
+            "limit; not parsed\n", raw_text.size(), kParseMaxTextBytes);
+        return unparsed;
+    }
+    struct Call {
+        const std::string & text;
+        const json & tools;
+        ToolParseResult result;
+        std::exception_ptr error;
+    } call{raw_text, tools, {}, nullptr};
+    StackJob job{[](void * p) {
+        auto * c = static_cast<Call *>(p);
+        try {
+            c->result = parse_tool_calls_on_this_stack(c->text, c->tools);
+        } catch (...) {
+            c->error = std::current_exception();
+        }
+    }, &call};
+    const size_t stack_bytes =
+        kParseStackBaseBytes + raw_text.size() * kParseStackPerTextByte;
+    if (!run_with_stack(stack_bytes, job)) {
+        std::fprintf(stderr,
+            "[server] tool_call parse thread with a %zu-byte stack could not "
+            "start; %zu bytes not parsed\n", stack_bytes, raw_text.size());
+        return unparsed;
+    }
+    if (call.error) std::rethrow_exception(call.error);
+    return std::move(call.result);
 }
 
 }  // namespace luce::common
