@@ -71,6 +71,12 @@ nlohmann::json responses_output_items(const std::string & message_id,
                                       const std::string & text,
                                       const std::vector<ToolCall> & calls);
 
+// Sets a Responses API response object's terminal status. A turn that hit
+// the output-token cap is "incomplete" with incomplete_details.reason
+// "max_output_tokens" (the OpenAI Responses contract; clients retry on it),
+// any other turn is "completed".
+void set_responses_status(nlohmann::json & response, bool hit_output_cap);
+
 // Manages SSE streaming for a single request.
 class SseEmitter {
 public:
@@ -112,6 +118,10 @@ public:
 
     // Check if a stop sequence was hit (signals caller to stop generation).
     bool stop_hit() const { return stop_hit_; }
+
+    // Whether generation ran into generation_cap (after emit_finish): not
+    // ended by EOS or a stop sequence. A reply with tool calls can hit it too.
+    bool hit_output_cap() const { return hit_output_cap_; }
 
     // Get accumulated content (for non-streaming).
     const std::string & accumulated_text() const { return accumulated_content_; }
@@ -223,6 +233,7 @@ private:
     std::vector<std::string> stop_sequences_;
     size_t       stop_holdback_ = 0;  // max length of any stop sequence
     bool         stop_hit_ = false;
+    bool         hit_output_cap_ = false;
 
     int64_t      created_at_;
     std::string  finish_reason_ = "stop";

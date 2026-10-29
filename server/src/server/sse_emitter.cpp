@@ -114,6 +114,16 @@ json responses_output_items(const std::string & message_id,
     return items;
 }
 
+void set_responses_status(json & response, bool hit_output_cap) {
+    if (hit_output_cap) {
+        response["status"] = "incomplete";
+        response["incomplete_details"] = {{"reason", "max_output_tokens"}};
+    } else {
+        response["status"] = "completed";
+        response["incomplete_details"] = nullptr;
+    }
+}
+
 // ─── Constructor ────────────────────────────────────────────────────────
 
 SseEmitter::SseEmitter(ApiFormat format,
@@ -963,10 +973,9 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
     }
 
-    if (fr == "stop" && !stop_hit_ && !ended_on_eos &&
-        generation_cap >= 0 && completion_tokens >= generation_cap) {
-        fr = "length";
-    }
+    hit_output_cap_ = !stop_hit_ && !ended_on_eos &&
+        generation_cap >= 0 && completion_tokens >= generation_cap;
+    if (fr == "stop" && hit_output_cap_) fr = "length";
     finish_reason_ = fr;
 
     // Format-specific final events
@@ -1079,7 +1088,8 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             }));
         }
 
-        // response.completed
+        // response.completed, or response.incomplete when the turn hit the
+        // output-token cap, tool calls or not.
         json resp_usage = {
             {"input_tokens", prompt_tokens_},
             {"output_tokens", completion_tokens},
@@ -1091,13 +1101,16 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
         }
         json shell = {
             {"id", request_id_}, {"object", "response"},
-            {"created_at", created_at_}, {"status", "completed"},
+            {"created_at", created_at_},
             {"model", model_name_},
             {"output", final_output},
             {"output_text", accumulated_content_},
             {"usage", resp_usage}
         };
-        out.push_back(format_responses_event("response.completed", {{"response", shell}}));
+        set_responses_status(shell, hit_output_cap_);
+        out.push_back(format_responses_event(
+            hit_output_cap_ ? "response.incomplete" : "response.completed",
+            {{"response", shell}}));
         break;
     }
 

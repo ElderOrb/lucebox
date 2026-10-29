@@ -4705,7 +4705,7 @@ TokenDelivery classify_generated_token(
 
 CompletionTokenCounts feed_non_streaming_tokens(
         const std::vector<int32_t> & tokens, Tokenizer & tokenizer,
-        SseEmitter & emitter) {
+        SseEmitter & emitter, int generation_cap) {
     for (int32_t token : tokens) {
         std::string text;
         const TokenDelivery delivery =
@@ -4720,7 +4720,10 @@ CompletionTokenCounts feed_non_streaming_tokens(
 
     CompletionTokenCounts counts;
     counts.total = (int) tokens.size();
-    emitter.emit_finish(counts.total);
+    const bool is_eos = !tokens.empty() &&
+        (tokens.back() == tokenizer.eos_id() ||
+         tokens.back() == tokenizer.eos_chat_id());
+    emitter.emit_finish(counts.total, nullptr, generation_cap, is_eos);
 
     // Split reasoning vs content at the emitter's REASONING→CONTENT
     // transition; see first_content_token_index() in sse_emitter.h.
@@ -4933,14 +4936,15 @@ json build_responses_api_response(
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
     };
-    return {
+    json response = {
         {"id", req.response_id},
         {"object", "response"},
-        {"status", "completed"},
         {"model", req.model},
         {"output", output},
         {"usage", usage},
     };
+    set_responses_status(response, emitter.hit_output_cap());
+    return response;
 }
 
 json build_non_streaming_response(
@@ -4968,7 +4972,7 @@ json build_non_streaming_response(
         int generation_cap, const GenTimings & timings, Tokenizer & tokenizer,
         SseEmitter & emitter) {
     const CompletionTokenCounts counts = feed_non_streaming_tokens(
-        result.tokens, tokenizer, emitter);
+        result.tokens, tokenizer, emitter, generation_cap);
     return build_non_streaming_response(
         req, result, generation_cap, timings, counts, emitter, &tokenizer);
 }
