@@ -4570,16 +4570,22 @@ bool HttpServer::serve_with_tool_checks(SocketHandle fd, ParsedRequest & req,
         json again;
         bool again_dropped = false;
         if (pass(tc::with_note(request, *reply, tc::dropped_call_note(request)), again,
-                 &again_dropped)) {
+                 &again_dropped) && !again_dropped) {
+            // The first reply's tool text was suppressed, so keeping it would
+            // hand the client empty content. Any retry whose own call did not
+            // also drop is better: a tool call, or a plain answer.
             json * again_reply = tc::reply_message(again);
-            if (again_reply && again_reply->contains("tool_calls") &&
-                !(*again_reply)["tool_calls"].empty()) {
+            if (again_reply) {
+                const bool retried_with_call =
+                    again_reply->contains("tool_calls") &&
+                    !(*again_reply)["tool_calls"].empty();
                 response = std::move(again);
-                reply = again_reply;
-                dropped = "replanned";
+                reply = tc::reply_message(response);
+                dropped = retried_with_call ? "replanned" : "answered";
             }
         }
-    }    if (!tools_off && tc::needs_replan(*reply)) {
+    }
+    if (!tools_off && tc::needs_replan(*reply)) {
         json again;
         json * again_reply = pass(tc::with_note(request, *reply, tc::kReplanNote), again)
             ? tc::reply_message(again) : nullptr;
